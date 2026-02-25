@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "organelle_profiler"
+version = "0.1.0"
+description = "Organelle segmentation, geometric feature extraction, and clustering"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+authors = [
+    { name = "Gav Sturm", email = "gav.sturm@czbiohub.org" },
+    { name = "Alex Hillsley", email = "alexander.hillsley@czbiohub.org" },
+    { name = "Mark Potts", email = "mark.potts@czbiohub.org" },
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "zarr",
+    "iohub==0.3.0a6",
+    "pyyaml",
+    "tqdm",
+    "joblib",
+    "click",
+    "scipy",
+    "scikit-image",
+    "scikit-learn",
+    "matplotlib",
+    "seaborn",
+    "anndata",
+    "scanpy",
+    "tensorstore",
+    "tifffile",
+    "pyarrow",
+    "submitit",
+    "dask",
+    "statsmodels",
+]
+
+[project.optional-dependencies]
+interactive = [
+    "plotly",
+    "dash",
+    "umap-learn",
+    "hdbscan",
+    "leidenalg",
+]
+all = [
+    "organelle_profiler[interactive]",
+]
+
+# Hatch config
+[tool.hatch.build.targets.wheel]
+only-include = ["src"]
+sources = ["src"]
