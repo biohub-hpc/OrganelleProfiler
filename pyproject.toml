@@ -35,6 +35,7 @@ dependencies = [
     "submitit",
     "dask",
     "statsmodels",
+    "copairs",
 ]
 
 [project.optional-dependencies]
@@ -45,8 +46,12 @@ interactive = [
     "hdbscan",
     "leidenalg",
 ]
+rapids = [
+    "cucim-cu12>=25.6",
+    "cuml-cu12>=25.6",
+]
 all = [
-    "organelle_profiler[interactive]",
+    "organelle_profiler[interactive,rapids]",
 ]
 
 # Hatch config
