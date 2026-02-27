@@ -103,10 +103,23 @@ class CPChallengeStage(BaseStage):
     experiment's cell-level data, filters to the single matching organelle's
     features on each side, downsamples to equal cell counts, aggregates to
     guide level, and runs phenotypic activity assessment.
+
+    Supports two feature modes:
+    - "orgprofiler" (default): CellProfiler organelle features from monolithic h5ad
+    - "dino": DinoV3 embeddings from per-channel h5ad files
     """
 
     STAGE_NUMBER = 12
     STAGE_NAME = "cp_challenge"
+
+    # Base OPS directory for finding dino h5ad files
+    _OPS_BASE = Path("/hpc/projects/intracellular_dashboard/ops")
+
+    def __init__(self, *args, feature_mode: str = "orgprofiler", **kwargs):
+        super().__init__(*args, **kwargs)
+        if feature_mode not in ("orgprofiler", "dino"):
+            raise ValueError(f"Unknown feature_mode: {feature_mode!r}")
+        self.feature_mode = feature_mode
 
     def run(self) -> StageResult:
         """Run CP vs live-cell challenge comparisons."""
@@ -129,72 +142,137 @@ class CPChallengeStage(BaseStage):
         shutil.copy2(DEFAULT_CONFIG_PATH, config_copy_path)
         result.add_file(config_copy_path)
 
-        # Load CP experiment cell-level data
+        # Load CP experiment data and prepare comparison tasks
         cp_experiment = config["cp_experiment"]
+        dino_config = config.get("dino", {})
+        dino_feature_dir = dino_config.get("feature_dir", "dino_features_v1")
         logger.info(f"CP experiment: {cp_experiment}")
-        cp_cell_adata = self._load_cell_adata(cp_experiment)
-        if cp_cell_adata is None:
-            result.add_error(f"Could not load cell-level data for CP experiment {cp_experiment}")
-            return result
+        logger.info(f"Feature mode: {self.feature_mode}")
 
-        # Discover CP organelle names
-        cp_organelles = self._discover_organelles(cp_cell_adata)
-        logger.info(f"CP experiment organelles: {sorted(cp_organelles.keys())}")
-
-        # Pre-discover CP phase2d_tubular features for control comparisons
-        cp_ctrl_name, cp_ctrl_cols = self._match_organelle(cp_organelles, CONTROL_PATTERN)
-        if cp_ctrl_name is None:
-            logger.warning(
-                f"No CP control features matching '{CONTROL_PATTERN}' — "
-                f"control comparisons will be skipped"
-            )
-        else:
-            logger.info(
-                f"CP control organelle: {cp_ctrl_name} ({len(cp_ctrl_cols)} features)"
-            )
-
-        # Prepare comparison tasks (shared across normalization methods)
         comparisons = config.get("comparisons", {})
         comparison_tasks = []
         discovery_records = []
 
-        for organelle_name, organelle_config in comparisons.items():
-            cp_pattern = organelle_config["cp_organelle_pattern"]
+        if self.feature_mode == "dino":
+            # Dino mode: no monolithic CP h5ad — each comparison loads per-channel
+            cp_cell_adata = None  # loaded per-comparison
+            cp_ctrl_name = None
+            cp_ctrl_cols = []
 
-            # Find matching CP organelle features
-            cp_org_name, cp_feat_cols = self._match_organelle(
-                cp_organelles, cp_pattern
+            # Pre-load CP control channel (Phase2D dino embeddings)
+            ctrl_channel = dino_config.get("control_channel", "Phase2D")
+            cp_ctrl_adata = self._load_dino_cell_adata(
+                cp_experiment, ctrl_channel, dino_feature_dir
             )
-            if cp_org_name is None:
+            if cp_ctrl_adata is not None:
+                cp_ctrl_name = f"dino_{ctrl_channel}"
+                cp_ctrl_cols = list(cp_ctrl_adata.var_names)
+                logger.info(f"CP dino control: {ctrl_channel} ({len(cp_ctrl_cols)} features)")
+            else:
                 logger.warning(
-                    f"No CP organelle matching '{cp_pattern}' found in {cp_experiment}. "
-                    f"Available: {sorted(cp_organelles.keys())}"
+                    f"Could not load dino control channel '{ctrl_channel}' — "
+                    f"control comparisons will be skipped"
                 )
-                result.add_error(f"No CP organelle matching '{cp_pattern}'")
-                continue
 
-            logger.info(
-                f"\n{'='*60}\n  {organelle_name.upper()}: CP organelle = {cp_org_name} "
-                f"({len(cp_feat_cols)} features)\n{'='*60}"
-            )
-            discovery_records.append({
-                "organelle_type": organelle_name,
-                "side": "cell_painting",
-                "experiment": cp_experiment,
-                "matched_organelle": cp_org_name,
-                "n_features": len(cp_feat_cols),
-            })
+            for organelle_name, organelle_config in comparisons.items():
+                cp_channel = organelle_config.get("cp_dino_channel")
+                if not cp_channel:
+                    logger.warning(
+                        f"No cp_dino_channel for '{organelle_name}' — skipping in dino mode"
+                    )
+                    result.add_error(f"Missing cp_dino_channel for '{organelle_name}'")
+                    continue
 
-            # Collect tasks
-            for live_entry in organelle_config.get("live_cell", []):
-                comparison_tasks.append({
-                    "cp_org_name": cp_org_name,
-                    "cp_feat_cols": cp_feat_cols,
-                    "live_experiment": live_entry["experiment"],
-                    "live_pattern": live_entry["organelle_pattern"],
-                    "organelle_name": organelle_name,
-                    "notes": live_entry.get("notes", ""),
+                # Load CP dino h5ad for this organelle
+                cp_adata = self._load_dino_cell_adata(
+                    cp_experiment, cp_channel, dino_feature_dir
+                )
+                if cp_adata is None:
+                    result.add_error(
+                        f"Could not load dino features for CP {cp_experiment}/{cp_channel}"
+                    )
+                    continue
+
+                cp_org_name = f"dino_{cp_channel}"
+                cp_feat_cols = list(cp_adata.var_names)
+
+                logger.info(
+                    f"\n{'='*60}\n  {organelle_name.upper()}: CP dino channel = {cp_channel} "
+                    f"({len(cp_feat_cols)} features)\n{'='*60}"
+                )
+                discovery_records.append({
+                    "organelle_type": organelle_name,
+                    "side": "cell_painting",
+                    "experiment": cp_experiment,
+                    "matched_organelle": cp_org_name,
+                    "n_features": len(cp_feat_cols),
                 })
+
+                for live_entry in organelle_config.get("live_cell", []):
+                    comparison_tasks.append({
+                        "cp_cell_adata": cp_adata,
+                        "cp_org_name": cp_org_name,
+                        "cp_feat_cols": cp_feat_cols,
+                        "live_experiment": live_entry["experiment"],
+                        "live_pattern": live_entry.get("dino_channel", live_entry["organelle_pattern"]),
+                        "organelle_name": organelle_name,
+                        "notes": live_entry.get("notes", ""),
+                    })
+        else:
+            # OrgProfiler mode: load monolithic CP h5ad and discover organelles
+            cp_cell_adata = self._load_cell_adata(cp_experiment)
+            if cp_cell_adata is None:
+                result.add_error(f"Could not load cell-level data for CP experiment {cp_experiment}")
+                return result
+
+            cp_organelles = self._discover_organelles(cp_cell_adata)
+            logger.info(f"CP experiment organelles: {sorted(cp_organelles.keys())}")
+
+            cp_ctrl_name, cp_ctrl_cols = self._match_organelle(cp_organelles, CONTROL_PATTERN)
+            if cp_ctrl_name is None:
+                logger.warning(
+                    f"No CP control features matching '{CONTROL_PATTERN}' — "
+                    f"control comparisons will be skipped"
+                )
+            else:
+                logger.info(
+                    f"CP control organelle: {cp_ctrl_name} ({len(cp_ctrl_cols)} features)"
+                )
+
+            for organelle_name, organelle_config in comparisons.items():
+                cp_pattern = organelle_config["cp_organelle_pattern"]
+                cp_org_name, cp_feat_cols = self._match_organelle(
+                    cp_organelles, cp_pattern
+                )
+                if cp_org_name is None:
+                    logger.warning(
+                        f"No CP organelle matching '{cp_pattern}' found in {cp_experiment}. "
+                        f"Available: {sorted(cp_organelles.keys())}"
+                    )
+                    result.add_error(f"No CP organelle matching '{cp_pattern}'")
+                    continue
+
+                logger.info(
+                    f"\n{'='*60}\n  {organelle_name.upper()}: CP organelle = {cp_org_name} "
+                    f"({len(cp_feat_cols)} features)\n{'='*60}"
+                )
+                discovery_records.append({
+                    "organelle_type": organelle_name,
+                    "side": "cell_painting",
+                    "experiment": cp_experiment,
+                    "matched_organelle": cp_org_name,
+                    "n_features": len(cp_feat_cols),
+                })
+
+                for live_entry in organelle_config.get("live_cell", []):
+                    comparison_tasks.append({
+                        "cp_org_name": cp_org_name,
+                        "cp_feat_cols": cp_feat_cols,
+                        "live_experiment": live_entry["experiment"],
+                        "live_pattern": live_entry["organelle_pattern"],
+                        "organelle_name": organelle_name,
+                        "notes": live_entry.get("notes", ""),
+                    })
 
         # Save organelle discovery table (shared)
         if discovery_records:
@@ -226,8 +304,12 @@ class CPChallengeStage(BaseStage):
                 org_output_dir = norm_output_dir / "per_organelle" / task["organelle_name"]
                 org_output_dir.mkdir(parents=True, exist_ok=True)
 
+                # In dino mode each task carries its own CP adata (per-channel);
+                # in orgprofiler mode the shared monolithic CP adata is used.
+                task_cp_adata = task.get("cp_cell_adata", cp_cell_adata)
+
                 comp_result = self._run_single_comparison(
-                    cp_cell_adata=cp_cell_adata,
+                    cp_cell_adata=task_cp_adata,
                     cp_org_name=task["cp_org_name"],
                     cp_feat_cols=task["cp_feat_cols"],
                     live_experiment=task["live_experiment"],
@@ -275,15 +357,23 @@ class CPChallengeStage(BaseStage):
                         f"\n  [CONTROL] {CONTROL_PATTERN}: "
                         f"CP vs {live_exp}"
                     )
+                    # For dino control, use the pre-loaded Phase2D adata;
+                    # for orgprofiler, use the shared monolithic CP adata.
+                    ctrl_cp_adata = cp_ctrl_adata if self.feature_mode == "dino" else cp_cell_adata
+                    ctrl_live_pattern = (
+                        dino_config.get("control_channel", "Phase2D")
+                        if self.feature_mode == "dino"
+                        else CONTROL_PATTERN
+                    )
                     ctrl_result = self._run_single_comparison(
-                        cp_cell_adata=cp_cell_adata,
+                        cp_cell_adata=ctrl_cp_adata,
                         cp_org_name=cp_ctrl_name,
                         cp_feat_cols=cp_ctrl_cols,
                         live_experiment=live_exp,
-                        live_pattern=CONTROL_PATTERN,
+                        live_pattern=ctrl_live_pattern,
                         organelle_name=live_short,
                         org_output_dir=ctrl_output_dir,
-                        notes=f"CONTROL: {CONTROL_PATTERN}",
+                        notes=f"CONTROL: {ctrl_live_pattern}",
                         norm_method=norm_method,
                     )
                     for err in ctrl_result.get("errors", []):
@@ -403,6 +493,36 @@ class CPChallengeStage(BaseStage):
         except Exception as e:
             logger.error(f"Failed to load cell data for {experiment}: {e}")
             return None
+
+    def _load_dino_cell_adata(
+        self, experiment: str, channel: str, feature_dir: str = "dino_features_v1"
+    ) -> Optional[ad.AnnData]:
+        """Load a per-channel DinoV3 h5ad for an experiment.
+
+        Filenames use the microscope channel name directly (e.g.
+        features_processed_CP1_nuclei_Hoechst.h5ad), matching how
+        evaluate_dinov3.py saves them (filename_suffix = channel).
+        """
+        exp_short = experiment.split("_")[0]
+
+        # Find experiment directory
+        exp_dirs = list(self._OPS_BASE.glob(f"{exp_short}*"))
+        if not exp_dirs:
+            logger.error(f"Dino: experiment dir not found: {self._OPS_BASE}/{exp_short}*")
+            return None
+        exp_dir = exp_dirs[0]
+
+        anndata_dir = exp_dir / "3-assembly" / feature_dir / "anndata_objects"
+        h5ad_path = anndata_dir / f"features_processed_{channel}.h5ad"
+
+        if not h5ad_path.exists():
+            logger.error(f"Dino h5ad not found: {h5ad_path}")
+            return None
+
+        logger.info(f"Loading dino features from: {h5ad_path}")
+        adata = ad.read_h5ad(h5ad_path)
+        logger.info(f"  Loaded {adata.n_obs} cells, {adata.n_vars} dino features")
+        return adata
 
     # -------------------------------------------------------------------------
     # Organelle discovery and matching
@@ -745,44 +865,63 @@ class CPChallengeStage(BaseStage):
 
         logger.info(f"\n  [{organelle_name.upper()}] Comparing CP vs {live_experiment}")
 
-        # Load live-cell data
-        live_adata = self._load_cell_adata(live_experiment)
-        if live_adata is None:
-            errors.append(f"Could not load {live_experiment}")
-            return _empty
+        if self.feature_mode == "dino":
+            # Dino mode: load per-channel h5ad, use all features
+            dino_config = self._load_config().get("dino", {})
+            dino_feature_dir = dino_config.get("feature_dir", "dino_features_v1")
 
-        # Discover live-cell organelles and match
-        live_organelles = self._discover_organelles(live_adata)
-        live_org_name, live_feat_cols = self._match_organelle(
-            live_organelles, live_pattern
-        )
-        if live_org_name is None:
-            errors.append(
-                f"No organelle matching '{live_pattern}' in {live_experiment}. "
-                f"Available: {sorted(live_organelles.keys())}"
+            live_adata = self._load_dino_cell_adata(
+                live_experiment, live_pattern, dino_feature_dir
             )
-            return _empty
+            if live_adata is None:
+                errors.append(f"Could not load dino features for {live_experiment}/{live_pattern}")
+                return _empty
 
-        logger.info(
-            f"  Live-cell organelle: {live_org_name} ({len(live_feat_cols)} features)"
-        )
+            live_org_name = f"dino_{live_pattern}"
+            live_feat_cols = list(live_adata.var_names)
 
-        # Filter to common features by metric name — a measurement type must
-        # be present in BOTH groups (feature names differ by organelle prefix,
-        # but the underlying metric in adata.var["metric"] is comparable)
-        cp_feat_cols, live_feat_cols = self._match_features_by_metric(
-            cp_cell_adata, cp_feat_cols, live_adata, live_feat_cols,
-        )
-        if len(cp_feat_cols) == 0:
-            errors.append(
-                f"No common metrics between CP ({cp_org_name}) "
-                f"and live-cell ({live_org_name}) for {organelle_name}"
+            logger.info(
+                f"  Live dino channel: {live_pattern} ({len(live_feat_cols)} features)"
             )
-            return _empty
 
-        # Build cell DataFrames with ONLY the organelle features + metadata
-        cp_cell_df = self._build_cell_df(cp_cell_adata, cp_feat_cols)
-        live_cell_df = self._build_cell_df(live_adata, live_feat_cols)
+            # No metric matching for dino — both sides are 1024-dim embeddings
+            cp_cell_df = self._build_cell_df(cp_cell_adata, cp_feat_cols)
+            live_cell_df = self._build_cell_df(live_adata, live_feat_cols)
+        else:
+            # OrgProfiler mode: load monolithic h5ad, discover and match organelles
+            live_adata = self._load_cell_adata(live_experiment)
+            if live_adata is None:
+                errors.append(f"Could not load {live_experiment}")
+                return _empty
+
+            live_organelles = self._discover_organelles(live_adata)
+            live_org_name, live_feat_cols = self._match_organelle(
+                live_organelles, live_pattern
+            )
+            if live_org_name is None:
+                errors.append(
+                    f"No organelle matching '{live_pattern}' in {live_experiment}. "
+                    f"Available: {sorted(live_organelles.keys())}"
+                )
+                return _empty
+
+            logger.info(
+                f"  Live-cell organelle: {live_org_name} ({len(live_feat_cols)} features)"
+            )
+
+            # Filter to common features by metric name
+            cp_feat_cols, live_feat_cols = self._match_features_by_metric(
+                cp_cell_adata, cp_feat_cols, live_adata, live_feat_cols,
+            )
+            if len(cp_feat_cols) == 0:
+                errors.append(
+                    f"No common metrics between CP ({cp_org_name}) "
+                    f"and live-cell ({live_org_name}) for {organelle_name}"
+                )
+                return _empty
+
+            cp_cell_df = self._build_cell_df(cp_cell_adata, cp_feat_cols)
+            live_cell_df = self._build_cell_df(live_adata, live_feat_cols)
 
         # Find common genes
         cp_genes = set(cp_cell_df["gene_name"].dropna().unique())
@@ -1276,6 +1415,9 @@ class CPChallengeStage(BaseStage):
         """
         Build a cell-level DataFrame with only the specified organelle features + metadata.
         Includes NTC normalization matching feature_extraction_slurm.py.
+
+        Handles both orgprofiler (gene_name, barcode, NCBI_ID) and dino
+        (perturbation, no barcode/NCBI_ID) obs schemas.
         """
         # Get feature matrix for this organelle only
         valid_cols = [c for c in feature_cols if c in adata.var_names]
@@ -1292,13 +1434,23 @@ class CPChallengeStage(BaseStage):
         )
 
         # Add metadata (convert categoricals to plain types to avoid groupby issues)
-        meta_cols = ["gene_name", "sgRNA", "barcode", "NCBI_ID"]
+        meta_cols = ["gene_name", "perturbation", "label_str", "sgRNA", "barcode", "NCBI_ID"]
         meta = adata.obs[[c for c in meta_cols if c in adata.obs.columns]].reset_index(drop=True)
         for col in meta.columns:
             if hasattr(meta[col], "cat"):
                 meta[col] = meta[col].astype(str)
 
         cell_df = pd.concat([meta, features_df], axis=1)
+
+        # Normalise column naming across data sources:
+        #   - orgprofiler: "gene_name"
+        #   - dino CP data: "perturbation"
+        #   - dino live cell data: "label_str"
+        if "gene_name" not in cell_df.columns:
+            if "perturbation" in cell_df.columns:
+                cell_df["gene_name"] = cell_df["perturbation"]
+            elif "label_str" in cell_df.columns:
+                cell_df["gene_name"] = cell_df["label_str"]
 
         # NTC normalization (matching canonical lines 1390-1396)
         if "gene_name" in cell_df.columns and "NCBI_ID" in cell_df.columns:
@@ -2411,6 +2563,7 @@ def run_single_comparison_job(
     output_dir: str,
     norm_method: str = "global",
     is_control: bool = False,
+    feature_mode: str = "orgprofiler",
 ) -> str:
     """
     Run a single CP vs live-cell comparison as a standalone SLURM job.
@@ -2453,20 +2606,30 @@ def run_single_comparison_job(
             data_context=data_shim,
             config=config_shim,
             level="guide",
+            feature_mode=feature_mode,
         )
         # Override output_dir to avoid BaseStage double-nesting
         stage._output_dir = output_dir
 
         # Load CP cell-level data
-        cp_cell_adata = stage._load_cell_adata(cp_resolved)
-        if cp_cell_adata is None:
-            return f"[ERROR] Could not load CP cell data for {cp_resolved}"
-
-        # Discover CP organelles and match
-        cp_organelles = stage._discover_organelles(cp_cell_adata)
-        cp_org_name, cp_feat_cols = stage._match_organelle(cp_organelles, cp_pattern)
-        if cp_org_name is None:
-            return f"[ERROR] No CP organelle matching '{cp_pattern}' in {cp_resolved}"
+        if feature_mode == "dino":
+            dino_cfg = stage._load_config().get("dino", {})
+            dino_feature_dir = dino_cfg.get("feature_dir", "dino_features_v1")
+            cp_cell_adata = stage._load_dino_cell_adata(
+                cp_resolved, cp_pattern, dino_feature_dir
+            )
+            if cp_cell_adata is None:
+                return f"[ERROR] Could not load dino features for CP {cp_resolved}/{cp_pattern}"
+            cp_org_name = f"dino_{cp_pattern}"
+            cp_feat_cols = list(cp_cell_adata.var_names)
+        else:
+            cp_cell_adata = stage._load_cell_adata(cp_resolved)
+            if cp_cell_adata is None:
+                return f"[ERROR] Could not load CP cell data for {cp_resolved}"
+            cp_organelles = stage._discover_organelles(cp_cell_adata)
+            cp_org_name, cp_feat_cols = stage._match_organelle(cp_organelles, cp_pattern)
+            if cp_org_name is None:
+                return f"[ERROR] No CP organelle matching '{cp_pattern}' in {cp_resolved}"
 
         logger.info(f"CP organelle: {cp_org_name} ({len(cp_feat_cols)} features)")
 
@@ -2696,6 +2859,8 @@ def main():
 
     parser.add_argument("--aggregate", action="store_true",
                         help="Only run aggregation (summary table + plots) on existing per-comparison CSVs")
+    parser.add_argument("--dino", action="store_true",
+                        help="Use DinoV3 embeddings instead of CellProfiler organelle features")
 
     args = parser.parse_args()
 
@@ -2714,15 +2879,20 @@ def main():
         graph_output = dataset.results_fast / "feature_extraction" / "graphs"
     graph_output.mkdir(parents=True, exist_ok=True)
 
+    feature_mode = "dino" if args.dino else "orgprofiler"
+
+    # Use a dino-specific output subdirectory to keep results separate
+    stage_subdir = "12_cp_challenge_dino" if args.dino else "12_cp_challenge"
+
     # --- Aggregate-only mode: re-run summary tables + plots from existing CSVs ---
     if args.aggregate:
-        cp_challenge_dir = graph_output / "2_guide_level" / "12_cp_challenge"
+        cp_challenge_dir = graph_output / "2_guide_level" / stage_subdir
         _run_aggregate_only(experiment, cp_challenge_dir)
         return
 
     # --- SLURM mode: submit each comparison as a separate job ---
     if args.slurm:
-        _run_slurm_mode(args, experiment, graph_output)
+        _run_slurm_mode(args, experiment, graph_output, feature_mode=feature_mode)
         return
 
     # --- Local mode: run all comparisons sequentially ---
@@ -2738,7 +2908,11 @@ def main():
         data_context=data_shim,
         config=config_shim,
         level="guide",
+        feature_mode=feature_mode,
     )
+    # Override stage name for dino to get separate output directory
+    if args.dino:
+        stage.STAGE_NAME = "cp_challenge_dino"
     result = stage.run()
 
     # Report
@@ -2750,7 +2924,7 @@ def main():
             print(f"  - {err}")
 
 
-def _run_slurm_mode(args, experiment: str, graph_output: Path) -> None:
+def _run_slurm_mode(args, experiment: str, graph_output: Path, feature_mode: str = "orgprofiler") -> None:
     """Submit each comparison as a separate SLURM job."""
     from ops_utils.hpc.slurm_batch_utils import submit_parallel_jobs
 
@@ -2766,6 +2940,8 @@ def _run_slurm_mode(args, experiment: str, graph_output: Path) -> None:
     comparisons = config.get("comparisons", {})
 
     # Build job list: one job per (comparison x norm_method)
+    dino_config = config.get("dino", {})
+    stage_subdir = "12_cp_challenge_dino" if feature_mode == "dino" else "12_cp_challenge"
     norm_methods = ["global", "ntc"]
     jobs_to_submit = []
     control_seen = set()  # deduplicate controls by (live_experiment, norm_method)
@@ -2777,9 +2953,13 @@ def _run_slurm_mode(args, experiment: str, graph_output: Path) -> None:
             for live_entry in organelle_config.get("live_cell", []):
                 live_exp = live_entry["experiment"]
                 live_pattern = live_entry["organelle_pattern"]
+                # For dino mode, use dino_channel fields from config
+                if feature_mode == "dino":
+                    cp_pattern = organelle_config.get("cp_dino_channel", cp_pattern)
+                    live_pattern = live_entry.get("dino_channel", live_pattern)
                 notes = live_entry.get("notes", "")
                 live_short = live_exp.split("_")[0] if "_" in live_exp else live_exp
-                out_dir = str(graph_output / f"2_guide_level/12_cp_challenge/{norm_label}")
+                out_dir = str(graph_output / f"2_guide_level/{stage_subdir}/{norm_label}")
 
                 # Main organelle comparison job
                 jobs_to_submit.append({
@@ -2794,6 +2974,7 @@ def _run_slurm_mode(args, experiment: str, graph_output: Path) -> None:
                         "notes": notes,
                         "output_dir": out_dir,
                         "norm_method": norm_method,
+                        "feature_mode": feature_mode,
                     },
                     "metadata": {
                         "organelle": organelle_name,
@@ -2805,11 +2986,15 @@ def _run_slurm_mode(args, experiment: str, graph_output: Path) -> None:
                     },
                 })
 
-                # Control comparison job (phase2d_tubular on both sides)
-                # Deduplicate: control only depends on live experiment, not organelle
+                # Control comparison job
                 ctrl_key = (live_exp, norm_method)
                 if ctrl_key not in control_seen:
                     control_seen.add(ctrl_key)
+                    ctrl_pattern = (
+                        dino_config.get("control_channel", "Phase2D")
+                        if feature_mode == "dino"
+                        else CONTROL_PATTERN
+                    )
                     jobs_to_submit.append({
                         "name": f"CTRL_{norm_label}_{live_short}",
                         "func": run_single_comparison_job,
@@ -2817,12 +3002,13 @@ def _run_slurm_mode(args, experiment: str, graph_output: Path) -> None:
                             "cp_experiment": cp_experiment,
                             "live_experiment": live_exp,
                             "organelle_name": live_short,
-                            "cp_pattern": CONTROL_PATTERN,
-                            "live_pattern": CONTROL_PATTERN,
-                            "notes": f"CONTROL: {CONTROL_PATTERN}",
+                            "cp_pattern": ctrl_pattern,
+                            "live_pattern": ctrl_pattern,
+                            "notes": f"CONTROL: {ctrl_pattern}",
                             "output_dir": out_dir,
                             "norm_method": norm_method,
                             "is_control": True,
+                            "feature_mode": feature_mode,
                         },
                         "metadata": {
                             "organelle": live_short,

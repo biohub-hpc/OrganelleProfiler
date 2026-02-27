@@ -1,0 +1,116 @@
+# Cell Painting Challenge Configuration
+# Compares Cell Painting (fixed) organelle features against live-cell fluorescent channel features
+# to assess which modality better discriminates gene knockout perturbations via mAP scoring.
+#
+# Each comparison uses ONLY the single matching organelle's features on each side.
+# The CP experiment provides the fixed-staining reference; live-cell experiments each provide
+# one fluorescent channel targeting the same organelle.
+#
+# NOTE: Live-cell experiments label fluorescent channel features generically as "gfp" or "mcherry"
+# (not by the specific organelle they target). The organelle_pattern must match what's in the h5ad.
+
+cp_experiment: ops0094_20251217
+
+# DinoV3 embedding settings (used with --dino flag)
+# cp_channel: microscope channel name used for dino extraction on the CP experiment
+# dino_channel: microscope channel name used for dino extraction on the live-cell experiment
+# feature_dir: directory name under 3-assembly containing dino anndata_objects
+dino:
+  feature_dir: dino_features_v1
+  control_channel: Phase2D
+
+comparisons:
+  nuclei:
+    cp_organelle_pattern: "cp1_nuclei"
+    cp_dino_channel: "CP1_nuclei_Hoechst"
+    live_cell:
+      - experiment: ops0120_20260204
+        organelle_pattern: "mcherry"
+        dino_channel: "mCherry"
+        notes: "mCherry NucleoLIVE live cell dye"
+      - experiment: ops0121_20260210
+        organelle_pattern: "mcherry"
+        dino_channel: "mCherry"
+        notes: "mCherry NucleoLIVE Live Cell dye"
+      - experiment: ops0124_20260218
+        organelle_pattern: "mcherry"
+        dino_channel: "mCherry"
+        notes: "mCherry H2BC21"
+
+  mitochondria:
+    cp_organelle_pattern: "cp1_mitochondria"
+    cp_dino_channel: "CP1_mitochondria_TOMM20"
+    live_cell:
+      - experiment: ops0122_20260211
+        organelle_pattern: "mcherry"
+        dino_channel: "mCherry"
+        notes: "mCherry ChromaLIVE 561 excitation"
+      - experiment: ops0052_20250702
+        organelle_pattern: "gfp"
+        dino_channel: "GFP"
+        notes: "GFP TOMM70A"
+
+  plasma_membrane:
+    cp_organelle_pattern: "cp1_plasma_membrane"
+    cp_dino_channel: "CP1_plasma_membrane_WGA"
+    live_cell:
+      - experiment: ops0071_20250828
+        organelle_pattern: "gfp"
+        dino_channel: "GFP"
+        notes: "GFP ATP1B3"
+      - experiment: ops0118_20260129
+        organelle_pattern: "gfp"
+        dino_channel: "GFP"
+        notes: "GFP VAMP3"
+
+  f_actin:
+    cp_organelle_pattern: "cp1_f_actin"
+    cp_dino_channel: "CP1_f_actin_Phalloidin"
+    live_cell:
+      - experiment: ops0125_20260219
+        organelle_pattern: "mcherry"
+        dino_channel: "mCherry"
+        notes: "mCherry FastAct_SPY555 live cell dye"
+      - experiment: ops0076_20250917
+        organelle_pattern: "mcherry"
+        dino_channel: "mCherry"
+        notes: "mCherry FastAct_SPY555 live cell dye"
+
+  nucleoli:
+    cp_organelle_pattern: "cp2_nucleoli"
+    cp_dino_channel: "CP2_nucleoli_NPM1"
+    live_cell:
+      - experiment: ops0117_20260128
+        organelle_pattern: "gfp"
+        dino_channel: "GFP"
+        notes: "GFP NPM3"
+      - experiment: ops0091_20251117
+        organelle_pattern: "gfp"
+        dino_channel: "GFP"
+        notes: "GFP FBL"
+      - experiment: ops0121_20260210
+        organelle_pattern: "gfp"
+        dino_channel: "GFP"
+        notes: "GFP nucleolus-DFC, FBL"
+
+  microtubules:
+    cp_organelle_pattern: "cp2_microtub"
+    cp_dino_channel: "CP2_microtubules_Tubulin"
+    live_cell:
+      - experiment: ops0100_20251218
+        organelle_pattern: "gfp"
+        dino_channel: "GFP"
+        notes: "GFP MAP4"
+
+  er:
+    cp_organelle_pattern: "cp2_er"
+    cp_dino_channel: "CP2_ER_ConA"
+    live_cell:
+      - experiment: ops0106_20251204
+        organelle_pattern: "gfp"
+        dino_channel: "GFP"
+        notes: "GFP NCLN"
+      - experiment: ops0031_20250424
+        organelle_pattern: "mcherry"
+        dino_channel: "mCherry"
+        notes: "mCherry SEC61B"
