@@ -12,7 +12,7 @@ For each organelle type (e.g., mitochondria), this stage:
 4. Runs copairs mAP phenotypic activity assessment on both
 5. Compares active gene counts, mAP distributions, and overlap
 
-Configuration is read from ops_process/ops_analysis/configs/cp_challenge_config.yaml.
+Configuration is read from organelle_profiler/configs/cp_challenge_config.yaml.
 
 Usage:
   # Local mode — runs all comparisons sequentially in the current process:
@@ -34,7 +34,7 @@ SLURM options:
   --no-wait             Don't wait for SLURM jobs to complete (fire-and-forget)
   --yes, -y             Skip confirmation prompt
   --quiet, -q           Reduce output verbosity
-  --slurm-memory        Memory per SLURM job (default: 128GB)
+  --slurm-memory        Memory per SLURM job (default: 256GB)
   --slurm-time          Time limit per SLURM job in minutes (default: 60)
   --slurm-cpus          CPUs per SLURM job (default: 16)
 
@@ -60,28 +60,26 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import logging
 
+from ops_utils.analysis.map_scores import (
+    phenotypic_activity_assesment,
+    phenotypic_distinctivness,
+    phenotypic_consistency_corum,
+    phenotypic_consistency_manual_annotation,
+    compute_auc_score,
+    compute_threshold_sweep_auc,
+)
+from ops_utils.analysis.normalization import (
+    zscore_normalize,
+    df_to_adata,
+)
+from ops_utils.analysis.map_umap import plot_metric_umap
+
 try:
     from .fe_graphs_stage_base import BaseStage, StageResult
     from ..plotting.fe_graphs_utils import save_figure
-    from ..analysis.fe_graphs_map_analysis import (
-        phenotypic_activity_assesment,
-        phenotypic_distinctivness,
-        phenotypic_consistency_corum,
-        phenotypic_consistency_manual_annotation,
-        compute_auc_score,
-        compute_threshold_sweep_auc,
-    )
 except ImportError:
     from organelle_profiler.fe_graphs.stages.fe_graphs_stage_base import BaseStage, StageResult
     from organelle_profiler.fe_graphs.plotting.fe_graphs_utils import save_figure
-    from organelle_profiler.fe_graphs.analysis.fe_graphs_map_analysis import (
-        phenotypic_activity_assesment,
-        phenotypic_distinctivness,
-        phenotypic_consistency_corum,
-        phenotypic_consistency_manual_annotation,
-        compute_auc_score,
-        compute_threshold_sweep_auc,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -499,24 +497,66 @@ class CPChallengeStage(BaseStage):
     ) -> Optional[ad.AnnData]:
         """Load a per-channel DinoV3 h5ad for an experiment.
 
+        Searches fast_ops first, then falls back to the ops partition.
         Filenames use the microscope channel name directly (e.g.
         features_processed_CP1_nuclei_Hoechst.h5ad), matching how
         evaluate_dinov3.py saves them (filename_suffix = channel).
         """
+        from ops_utils.data.filesystem import resolve_experiment_name
+        from ops_utils.data.experiment import OpsDataset
+
         exp_short = experiment.split("_")[0]
 
-        # Find experiment directory
+        # Build ordered list of candidate anndata dirs: fast_ops first, then ops partition
+        candidate_dirs: list[Path] = []
+
+        # 1. fast_ops via OpsDataset.results_fast
+        try:
+            resolved = resolve_experiment_name(experiment, allow_interactive=False, autoselect=True)
+            dataset = OpsDataset(resolved)
+            candidate_dirs.append(dataset.results_fast / feature_dir / "anndata_objects")
+        except Exception:
+            pass
+
+        # 2. ops partition via glob on _OPS_BASE
         exp_dirs = list(self._OPS_BASE.glob(f"{exp_short}*"))
-        if not exp_dirs:
-            logger.error(f"Dino: experiment dir not found: {self._OPS_BASE}/{exp_short}*")
+        if exp_dirs:
+            candidate_dirs.append(exp_dirs[0] / "3-assembly" / feature_dir / "anndata_objects")
+
+        if not candidate_dirs:
+            logger.error(
+                f"Dino: experiment dir not found in fast_ops or ops: {exp_short}"
+            )
             return None
-        exp_dir = exp_dirs[0]
 
-        anndata_dir = exp_dir / "3-assembly" / feature_dir / "anndata_objects"
-        h5ad_path = anndata_dir / f"features_processed_{channel}.h5ad"
+        def _find_h5ad(anndata_dir: Path) -> Optional[Path]:
+            h5ad_path = anndata_dir / f"features_processed_{channel}.h5ad"
+            if h5ad_path.exists():
+                return h5ad_path
+            # Fallback: Phase2D <-> Phase (naming varies across experiments)
+            if channel == "Phase2D":
+                alt = anndata_dir / "features_processed_Phase.h5ad"
+                if alt.exists():
+                    logger.info(f"Dino: {channel} not found, falling back to Phase")
+                    return alt
+            elif channel == "Phase":
+                alt = anndata_dir / "features_processed_Phase2D.h5ad"
+                if alt.exists():
+                    logger.info(f"Dino: {channel} not found, falling back to Phase2D")
+                    return alt
+            return None
 
-        if not h5ad_path.exists():
-            logger.error(f"Dino h5ad not found: {h5ad_path}")
+        h5ad_path = None
+        for anndata_dir in candidate_dirs:
+            h5ad_path = _find_h5ad(anndata_dir)
+            if h5ad_path is not None:
+                break
+
+        if h5ad_path is None:
+            logger.error(
+                f"Dino h5ad not found in any candidate dir: "
+                f"{[str(d) for d in candidate_dirs]}"
+            )
             return None
 
         logger.info(f"Loading dino features from: {h5ad_path}")
@@ -756,82 +796,6 @@ class CPChallengeStage(BaseStage):
 
         return gene_df, agg_feature_cols
 
-    def _zscore_normalize(
-        self, guide_df: pd.DataFrame, feature_cols: List[str],
-        method: str = "global",
-    ) -> pd.DataFrame:
-        """
-        Z-score normalize features.
-
-        Parameters
-        ----------
-        method : str
-            "global" (default) — use all-sample mean/std. Better for
-            inter-perturbation comparisons (distinctiveness, consistency).
-            "ntc" — use NTC-only mean/std. Centers relative to negative
-            control baseline.
-        """
-        if method == "ntc":
-            ntc_mask = guide_df["perturbation"] == "NTC"
-            n_ref = ntc_mask.sum()
-            if n_ref < 2:
-                logger.warning(f"  Only {n_ref} NTC guides - falling back to global z-score")
-                ref_mask = pd.Series(True, index=guide_df.index)
-                n_ref = len(guide_df)
-                label = "all samples (NTC fallback)"
-            else:
-                ref_mask = ntc_mask
-                label = f"{n_ref} NTC guides"
-        else:
-            ref_mask = pd.Series(True, index=guide_df.index)
-            n_ref = len(guide_df)
-            label = f"all {n_ref} samples"
-
-        ref_features = guide_df.loc[ref_mask, feature_cols].values.astype(np.float64)
-        means = np.nanmean(ref_features, axis=0)
-        stds = np.nanstd(ref_features, axis=0, ddof=1)
-        stds[stds == 0] = 1.0  # avoid division by zero
-
-        guide_df = guide_df.copy()
-        guide_df[feature_cols] = (
-            (guide_df[feature_cols].values.astype(np.float64) - means) / stds
-        ).astype(np.float32)
-
-        logger.info(
-            f"  Z-score normalized using {label} "
-            f"(mean range: {means.min():.2f} to {means.max():.2f})"
-        )
-        return guide_df
-
-    def _df_to_adata(
-        self, df: pd.DataFrame, feature_cols: List[str], obs_cols: List[str]
-    ) -> ad.AnnData:
-        """
-        Convert a DataFrame to AnnData for copairs mAP functions.
-        Filters out zero-variance features that add noise to cosine similarity.
-        """
-        obs = df[[c for c in obs_cols if c in df.columns]].copy()
-        obs.index = obs.index.astype(str)
-
-        X = df[feature_cols].values.astype(np.float32)
-        X = np.nan_to_num(X, nan=0.0)
-
-        # Drop zero-variance features
-        variances = np.var(X, axis=0)
-        keep = variances > 0
-        n_dropped = (~keep).sum()
-        if n_dropped > 0:
-            logger.info(f"  Dropped {n_dropped}/{len(feature_cols)} zero-variance features")
-            X = X[:, keep]
-            feature_cols = [f for f, k in zip(feature_cols, keep) if k]
-
-        adata = ad.AnnData(
-            X=X,
-            obs=obs.reset_index(drop=True),
-            var=pd.DataFrame(index=feature_cols),
-        )
-        return adata
-
     # -------------------------------------------------------------------------
     # Single comparison
     # -------------------------------------------------------------------------
@@ -984,19 +948,19 @@ class CPChallengeStage(BaseStage):
 
         # Z-score normalize features
         logger.info(f"  Z-score normalization method: {norm_method}")
-        cp_guide_df = self._zscore_normalize(cp_guide_df, cp_guide_feat_cols, method=norm_method)
-        live_guide_df = self._zscore_normalize(live_guide_df, live_guide_feat_cols, method=norm_method)
-        cp_gene_df = self._zscore_normalize(cp_gene_df, cp_gene_feat_cols, method=norm_method)
-        live_gene_df = self._zscore_normalize(live_gene_df, live_gene_feat_cols, method=norm_method)
+        cp_guide_df = zscore_normalize(cp_guide_df, cp_guide_feat_cols, method=norm_method)
+        live_guide_df = zscore_normalize(live_guide_df, live_guide_feat_cols, method=norm_method)
+        cp_gene_df = zscore_normalize(cp_gene_df, cp_gene_feat_cols, method=norm_method)
+        live_gene_df = zscore_normalize(live_gene_df, live_gene_feat_cols, method=norm_method)
 
         # Convert to AnnData for guide and gene levels
         guide_obs_cols = ["perturbation", "sgRNA", "n_cells"]
         gene_obs_cols = ["perturbation", "n_cells", "n_guides"]
 
-        cp_guide_adata = self._df_to_adata(cp_guide_df, cp_guide_feat_cols, guide_obs_cols)
-        live_guide_adata = self._df_to_adata(live_guide_df, live_guide_feat_cols, guide_obs_cols)
-        cp_gene_adata = self._df_to_adata(cp_gene_df, cp_gene_feat_cols, gene_obs_cols)
-        live_gene_adata = self._df_to_adata(live_gene_df, live_gene_feat_cols, gene_obs_cols)
+        cp_guide_adata = df_to_adata(cp_guide_df, cp_guide_feat_cols, guide_obs_cols)
+        live_guide_adata = df_to_adata(live_guide_df, live_guide_feat_cols, guide_obs_cols)
+        cp_gene_adata = df_to_adata(cp_gene_df, cp_gene_feat_cols, gene_obs_cols)
+        live_gene_adata = df_to_adata(live_gene_df, live_gene_feat_cols, gene_obs_cols)
 
         # Determine short experiment name for filenames
         live_short = live_experiment.split("_")[0] if "_" in live_experiment else live_experiment
@@ -1117,44 +1081,50 @@ class CPChallengeStage(BaseStage):
             live_activity.to_csv(live_act_path, index=False)
             files.extend([cp_act_path, live_act_path])
 
-            # Generate activity plots immediately
+        except Exception as e:
+            logger.error(f"  Activity assessment failed: {e}")
+            errors.append(f"Activity mAP failed for {organelle_name} vs {live_experiment}: {e}")
+            return _empty
+
+        # Activity plots (separate try so plot failures don't discard valid results)
+        try:
             self._plot_step_scatter(
                 cp_activity, live_activity, cp_active_ratio, live_active_ratio,
                 "activity", organelle_name, cp_org_name, live_org_name,
                 live_experiment, org_output_dir, live_short, notes, files,
                 n_cells_used=n_cells_used,
             )
+        except Exception as e_plot:
+            logger.warning(f"  Activity scatter plot failed (non-fatal): {e_plot}")
+
+        try:
+            overlap_path = self._plot_active_gene_overlap(
+                cp_activity, live_activity,
+                organelle_name, live_experiment,
+                org_output_dir, live_short, notes=notes,
+                n_cells_used=n_cells_used,
+            )
+            if overlap_path:
+                files.append(overlap_path)
+        except Exception as e_plot:
+            logger.warning(f"  Overlap plot failed (non-fatal): {e_plot}")
+
+        for side_label, side_adata, side_map in [
+            ("CP", cp_guide_adata, cp_activity),
+            ("Live", live_guide_adata, live_activity),
+        ]:
             try:
-                overlap_path = self._plot_active_gene_overlap(
-                    cp_activity, live_activity,
-                    organelle_name, live_experiment,
-                    org_output_dir, live_short, notes=notes,
-                    n_cells_used=n_cells_used,
+                umap_path = plot_metric_umap(
+                    side_adata, side_map, "activity", org_output_dir,
+                    f"{side_label.lower()}_{live_short}_activity_umap.png",
+                    title=f"{side_label} {organelle_name}",
+                    subtitle=notes if notes else live_short,
+                    save_fn=save_figure,
                 )
-                if overlap_path:
-                    files.append(overlap_path)
-            except Exception as e_plot:
-                logger.warning(f"  Overlap plot failed (non-fatal): {e_plot}")
-
-            # Activity UMAPs
-            for side_label, side_adata, side_map in [
-                ("CP", cp_guide_adata, cp_activity),
-                ("Live", live_guide_adata, live_activity),
-            ]:
-                try:
-                    umap_path = self._plot_metric_umap(
-                        side_adata, side_map, "activity", side_label,
-                        organelle_name, org_output_dir, live_short, notes,
-                    )
-                    if umap_path:
-                        files.append(umap_path)
-                except Exception as e_umap:
-                    logger.warning(f"  {side_label} activity UMAP failed (non-fatal): {e_umap}")
-
-        except Exception as e:
-            logger.error(f"  Activity assessment failed: {e}")
-            errors.append(f"Activity mAP failed for {organelle_name} vs {live_experiment}: {e}")
-            return _empty
+                if umap_path:
+                    files.append(umap_path)
+            except Exception as e_umap:
+                logger.warning(f"  {side_label} activity UMAP failed (non-fatal): {e_umap}")
 
         # --- 2. Phenotypic Distinctiveness (guide level) ---
         try:
@@ -1191,29 +1161,6 @@ class CPChallengeStage(BaseStage):
             live_distinct.to_csv(live_dist_path, index=False)
             files.extend([cp_dist_path, live_dist_path])
 
-            # Generate distinctiveness plot immediately
-            self._plot_step_scatter(
-                cp_distinct, live_distinct, cp_distinct_ratio, live_distinct_ratio,
-                "distinctiveness", organelle_name, cp_org_name, live_org_name,
-                live_experiment, org_output_dir, live_short, notes, files,
-                n_cells_used=n_cells_used,
-            )
-
-            # Distinctiveness UMAPs
-            for side_label, side_adata, side_map in [
-                ("CP", cp_guide_adata, cp_distinct),
-                ("Live", live_guide_adata, live_distinct),
-            ]:
-                try:
-                    umap_path = self._plot_metric_umap(
-                        side_adata, side_map, "distinctiveness", side_label,
-                        organelle_name, org_output_dir, live_short, notes,
-                    )
-                    if umap_path:
-                        files.append(umap_path)
-                except Exception as e_umap:
-                    logger.warning(f"  {side_label} distinctiveness UMAP failed (non-fatal): {e_umap}")
-
         except Exception as e:
             logger.warning(f"  Distinctiveness failed (non-fatal): {e}")
             comparison.update({
@@ -1222,6 +1169,35 @@ class CPChallengeStage(BaseStage):
                 "cp_auc_distinctiveness": np.nan, "live_auc_distinctiveness": np.nan,
                 "cp_sweep_auc_distinctiveness": np.nan, "live_sweep_auc_distinctiveness": np.nan,
             })
+
+        # Distinctiveness plots (separate try so plot failures don't discard valid results)
+        if pd.notna(comparison.get("cp_distinctive_ratio")):
+            try:
+                self._plot_step_scatter(
+                    cp_distinct, live_distinct, cp_distinct_ratio, live_distinct_ratio,
+                    "distinctiveness", organelle_name, cp_org_name, live_org_name,
+                    live_experiment, org_output_dir, live_short, notes, files,
+                    n_cells_used=n_cells_used,
+                )
+            except Exception as e_plot:
+                logger.warning(f"  Distinctiveness plot failed (non-fatal): {e_plot}")
+
+            for side_label, side_adata, side_map in [
+                ("CP", cp_guide_adata, cp_distinct),
+                ("Live", live_guide_adata, live_distinct),
+            ]:
+                try:
+                    umap_path = plot_metric_umap(
+                        side_adata, side_map, "distinctiveness", org_output_dir,
+                        f"{side_label.lower()}_{live_short}_distinctiveness_umap.png",
+                        title=f"{side_label} {organelle_name}",
+                        subtitle=notes if notes else live_short,
+                        save_fn=save_figure,
+                    )
+                    if umap_path:
+                        files.append(umap_path)
+                except Exception as e_umap:
+                    logger.warning(f"  {side_label} distinctiveness UMAP failed (non-fatal): {e_umap}")
 
         # --- 3. Phenotypic Consistency - CORUM (gene level) ---
         try:
@@ -1258,14 +1234,6 @@ class CPChallengeStage(BaseStage):
             live_corum.to_csv(live_cor_path, index=False)
             files.extend([cp_cor_path, live_cor_path])
 
-            # Generate CORUM plot immediately
-            self._plot_step_scatter(
-                cp_corum, live_corum, cp_corum_ratio, live_corum_ratio,
-                "corum", organelle_name, cp_org_name, live_org_name,
-                live_experiment, org_output_dir, live_short, notes, files,
-                n_cells_used=n_cells_used,
-            )
-
         except Exception as e:
             logger.warning(f"  CORUM consistency failed (non-fatal): {e}")
             comparison.update({
@@ -1274,6 +1242,18 @@ class CPChallengeStage(BaseStage):
                 "cp_auc_corum": np.nan, "live_auc_corum": np.nan,
                 "cp_sweep_auc_corum": np.nan, "live_sweep_auc_corum": np.nan,
             })
+
+        # CORUM plot (separate try so plot failures don't discard valid results)
+        if pd.notna(comparison.get("cp_consistency_corum_ratio")):
+            try:
+                self._plot_step_scatter(
+                    cp_corum, live_corum, cp_corum_ratio, live_corum_ratio,
+                    "corum", organelle_name, cp_org_name, live_org_name,
+                    live_experiment, org_output_dir, live_short, notes, files,
+                    n_cells_used=n_cells_used,
+                )
+            except Exception as e_plot:
+                logger.warning(f"  CORUM plot failed (non-fatal): {e_plot}")
 
         # --- 4. Phenotypic Consistency - CHAD Annotations (gene level) ---
         try:
@@ -1310,14 +1290,6 @@ class CPChallengeStage(BaseStage):
             live_manual.to_csv(live_man_path, index=False)
             files.extend([cp_man_path, live_man_path])
 
-            # Generate CHAD annotation plot immediately
-            self._plot_step_scatter(
-                cp_manual, live_manual, cp_manual_ratio, live_manual_ratio,
-                "manual", organelle_name, cp_org_name, live_org_name,
-                live_experiment, org_output_dir, live_short, notes, files,
-                n_cells_used=n_cells_used,
-            )
-
         except Exception as e:
             logger.warning(f"  CHAD consistency failed (non-fatal): {e}")
             comparison.update({
@@ -1326,6 +1298,18 @@ class CPChallengeStage(BaseStage):
                 "cp_auc_manual": np.nan, "live_auc_manual": np.nan,
                 "cp_sweep_auc_manual": np.nan, "live_sweep_auc_manual": np.nan,
             })
+
+        # CHAD plot (separate try so plot failures don't discard valid results)
+        if pd.notna(comparison.get("cp_consistency_manual_ratio")):
+            try:
+                self._plot_step_scatter(
+                    cp_manual, live_manual, cp_manual_ratio, live_manual_ratio,
+                    "manual", organelle_name, cp_org_name, live_org_name,
+                    live_experiment, org_output_dir, live_short, notes, files,
+                    n_cells_used=n_cells_used,
+                )
+            except Exception as e_plot:
+                logger.warning(f"  CHAD plot failed (non-fatal): {e_plot}")
 
         # Determine winner based on activity
         comparison["winner_activity"] = (
@@ -2339,144 +2323,6 @@ class CPChallengeStage(BaseStage):
         path = save_figure(fig, self.output_dir / filename)
         result.add_file(path)
 
-    def _plot_metric_umap(
-        self,
-        adata: ad.AnnData,
-        metric_map: pd.DataFrame,
-        metric_name: str,
-        side_label: str,
-        organelle_name: str,
-        output_dir: Path,
-        live_short: str,
-        notes: str = "",
-    ) -> Optional[Path]:
-        """
-        Compute UMAP on the adata and visualize mAP metric scores.
-
-        Adapted from alex_map_og.py metric_umap. Creates a 2-panel figure:
-          - Top: UMAP colored by mAP (significant points only, others grey)
-          - Bottom: UMAP colored by -log10(p-value)
-
-        Parameters
-        ----------
-        adata : AnnData
-            Guide- or gene-level AnnData (features in .X, 'perturbation' in .obs).
-        metric_map : DataFrame
-            Output from copairs mAP functions with columns:
-            'perturbation', 'mean_average_precision', 'corrected_p_value',
-            'below_corrected_p'.
-        metric_name : str
-            Short name like "activity", "distinctiveness", "corum", "chad".
-        side_label : str
-            "CP" or "Live" for title labeling.
-        organelle_name : str
-            Organelle name for title.
-        output_dir : Path
-            Directory to save figure.
-        live_short : str
-            Short live experiment name for filename.
-        notes : str
-            Optional annotation for subtitle.
-
-        Returns
-        -------
-        Path or None
-        """
-        import scanpy as sc
-
-        if adata.n_obs < 10:
-            logger.warning(f"  Too few observations ({adata.n_obs}) for UMAP, skipping")
-            return None
-
-        # Compute UMAP (copy to avoid modifying the original)
-        adata_umap = adata.copy()
-        try:
-            sc.pp.neighbors(adata_umap, n_neighbors=min(15, adata_umap.n_obs - 1), use_rep="X")
-            sc.tl.umap(adata_umap)
-        except Exception as e:
-            logger.warning(f"  UMAP computation failed: {e}")
-            return None
-
-        umap_coords = adata_umap.obsm["X_umap"]
-
-        # Add -log10(p-value) to metric_map if missing
-        if "-log10(p-value)" not in metric_map.columns:
-            metric_map = metric_map.copy()
-            metric_map["-log10(p-value)"] = -metric_map["corrected_p_value"].apply(np.log10)
-
-        # Map metric values to adata.obs
-        metric_dict = metric_map.set_index("perturbation")[
-            ["mean_average_precision", "-log10(p-value)", "below_corrected_p"]
-        ].to_dict("index")
-
-        obs = adata_umap.obs
-        obs["mAP"] = obs["perturbation"].map(
-            lambda x: metric_dict.get(x, {}).get("mean_average_precision", np.nan)
-        )
-        obs["log10p"] = obs["perturbation"].map(
-            lambda x: metric_dict.get(x, {}).get("-log10(p-value)", np.nan)
-        )
-        obs["significant"] = obs["perturbation"].map(
-            lambda x: metric_dict.get(x, {}).get("below_corrected_p", False)
-        )
-        obs["is_NTC"] = obs["perturbation"] == "NTC"
-
-        ntc_mask = obs["is_NTC"].values
-        significant_mask = (obs["significant"] == True).values & ~ntc_mask
-        nonsig_mask = ~significant_mask & ~ntc_mask
-
-        metric_title = metric_name.replace("_", " ").title()
-        subtitle = f"{notes}" if notes else f"{live_short}"
-        n_ntc = ntc_mask.sum()
-
-        fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-
-        for panel_idx, (ax, color_col, cmap_name, cbar_label, panel_title_suffix) in enumerate([
-            (axes[0], "mAP", "viridis", "Mean Average Precision", "mAP"),
-            (axes[1], "log10p", "plasma", "-log10(p-value)", "-log10(p)"),
-        ]):
-            # Layer 1: non-significant (grey, behind)
-            if nonsig_mask.any():
-                ax.scatter(
-                    umap_coords[nonsig_mask, 0], umap_coords[nonsig_mask, 1],
-                    c="lightgrey", s=20, alpha=0.5, label="Not significant",
-                )
-            # Layer 2: significant (colored)
-            if significant_mask.any():
-                sc = ax.scatter(
-                    umap_coords[significant_mask, 0], umap_coords[significant_mask, 1],
-                    c=obs.loc[significant_mask, color_col], s=30, alpha=0.8,
-                    cmap=cmap_name, edgecolors="black", linewidths=0.3,
-                    label="Significant",
-                )
-                plt.colorbar(sc, ax=ax, label=cbar_label, shrink=0.8)
-            # Layer 3: NTC (red diamonds, on top)
-            if ntc_mask.any():
-                ax.scatter(
-                    umap_coords[ntc_mask, 0], umap_coords[ntc_mask, 1],
-                    c="#E03030", s=50, alpha=0.9, marker="D",
-                    edgecolors="black", linewidths=0.5,
-                    label=f"NTC ({n_ntc})", zorder=5,
-                )
-            ax.set_xlabel("UMAP 1", fontsize=11)
-            ax.set_ylabel("UMAP 2", fontsize=11)
-            ax.set_title(f"{side_label} {organelle_name} — {metric_title}: {panel_title_suffix}",
-                         fontsize=12, fontweight="bold")
-            ax.legend(fontsize=9, loc="best")
-
-        n_sig = significant_mask.sum()
-        n_total = len(obs) - obs["is_NTC"].sum()
-        fig.suptitle(
-            f"{metric_title} UMAP — {subtitle}\n"
-            f"{n_sig}/{n_total} significant perturbations ({100*n_sig/max(n_total,1):.1f}%)",
-            fontsize=13, fontweight="bold", y=1.02,
-        )
-        plt.tight_layout()
-
-        fname = f"{side_label.lower()}_{live_short}_{metric_name}_umap.png"
-        path = save_figure(fig, output_dir / fname)
-        return path
-
 
 def _print_summary_table(summary_df: pd.DataFrame, norm_label: str, use_logger: bool = True) -> None:
     """
@@ -2850,8 +2696,8 @@ def main():
                              help="Skip confirmation prompt")
     slurm_group.add_argument("--quiet", "-q", action="store_true",
                              help="Reduce output verbosity")
-    slurm_group.add_argument("--slurm-memory", type=str, default="128GB",
-                             help="Memory per SLURM job (default: 128GB)")
+    slurm_group.add_argument("--slurm-memory", type=str, default="256GB",
+                             help="Memory per SLURM job (default: 256GB)")
     slurm_group.add_argument("--slurm-time", type=int, default=60,
                              help="Time limit per SLURM job in minutes (default: 60)")
     slurm_group.add_argument("--slurm-cpus", type=int, default=16,
