@@ -1,0 +1,48 @@
+# Organelle Attribution Configuration
+# Leave-one-out mAP analysis on cross-experiment dino coembedding.
+#
+# Combines dino features from ALL channels across ALL good experiments
+# into a single biology-aware coembedding, runs the 4 copairs mAP metrics,
+# then systematically removes one channel label at a time and measures
+# how mAP scores drop. The delta reveals each organelle's contribution.
+
+# Storage roots to search for dino features (in priority order)
+storage_roots:
+  - /hpc/projects/icd.fast.ops
+  - /hpc/projects/intracellular_dashboard/ops
+  - /hpc/projects/icd.ops
+
+# Directory name under 3-assembly containing dino anndata objects
+feature_dir: dino_features_v1
+
+# Combination strategy: biology-aware uses concatenate_experiments_comprehensive
+# to pool same-biology channels vertically, then horizontally concat different ones.
+combination_method: biology_aware
+
+# Feature type for the combiner
+feature_type: dinov3
+
+# Ablation granularity: "per_label" removes the specific channel label
+# from ops_channel_maps.yaml (e.g., "nucleolus-DFC, FBL" is separate from
+# "nucleolus-GC, NPM3"). Each unique label is one ablation run.
+ablation_granularity: per_label
+
+# Normalization method for z-scoring before mAP
+# "global" = use all-sample mean/std
+# "ntc" = use NTC-only mean/std (centers relative to negative control)
+norm_method: ntc
+
+# Join strategy for combining experiments ("inner" or "outer")
+# "inner" = only perturbations present in ALL experiments
+# "outer" = union of all perturbations (fills missing with NaN)
+join: inner
+
+# Minimum number of guides per perturbation for mAP computation
+min_guides_per_perturbation: 2
+
+# SLURM settings for cluster execution
+slurm:
+  partition: cpu
+  mem: 256GB
+  cpus_per_task: 16
+  time_min: 120

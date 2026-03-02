@@ -26,11 +26,11 @@ comparisons:
     live_cell:
       - experiment: ops0120_20260204
         organelle_pattern: "mcherry"
-        dino_channel: "mCherry"
+        dino_channel: "NucleoLIVE_Live_Cell_dye"
         notes: "mCherry NucleoLIVE live cell dye"
       - experiment: ops0121_20260210
         organelle_pattern: "mcherry"
-        dino_channel: "mCherry"
+        dino_channel: "NucleoLIVE_Live_Cell_dye"
         notes: "mCherry NucleoLIVE Live Cell dye"
       - experiment: ops0124_20260218
         organelle_pattern: "mcherry"
@@ -43,7 +43,7 @@ comparisons:
     live_cell:
       - experiment: ops0122_20260211
         organelle_pattern: "mcherry"
-        dino_channel: "mCherry"
+        dino_channel: "ChromaLIVE_561_excitation"
         notes: "mCherry ChromaLIVE 561 excitation"
       - experiment: ops0052_20250702
         organelle_pattern: "gfp"
@@ -60,7 +60,7 @@ comparisons:
         notes: "GFP ATP1B3"
       - experiment: ops0118_20260129
         organelle_pattern: "gfp"
-        dino_channel: "GFP"
+        dino_channel: "VAMP3"
         notes: "GFP VAMP3"
 
   f_actin:
@@ -90,7 +90,7 @@ comparisons:
         notes: "GFP FBL"
       - experiment: ops0121_20260210
         organelle_pattern: "gfp"
-        dino_channel: "GFP"
+        dino_channel: "FBL"
         notes: "GFP nucleolus-DFC, FBL"
 
   microtubules:
@@ -112,5 +112,5 @@ comparisons:
         notes: "GFP NCLN"
       - experiment: ops0031_20250424
         organelle_pattern: "mcherry"
-        dino_channel: "mCherry"
+        dino_channel: "SEC61B"
         notes: "mCherry SEC61B"
