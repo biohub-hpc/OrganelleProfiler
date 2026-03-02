@@ -20,6 +20,7 @@ from .stages.fe_graphs_embedding_stage import EmbeddingStage
 from .stages.fe_graphs_embedding_visualization_stage import EmbeddingVisualizationStage
 from .stages.fe_graphs_clustering_stage import ClusteringStage
 from .stages.fe_graphs_differential_stage import DifferentialStage
+from .stages.fe_graphs_volcano_enrichment_stage import VolcanoEnrichmentStage
 from .stages.fe_graphs_summary_stage import SummaryStage
 from .stages.fe_graphs_organelle_discrimination_stage import OrganelleDiscriminationStage
 from .stages.fe_graphs_positive_controls_stage import PositiveControlsStage
@@ -93,6 +94,7 @@ class LevelPipeline:
         ("positive_controls", PositiveControlsStage),  # Early: validate known clusters on UMAP
         ("clustering", ClusteringStage),
         ("differential", DifferentialStage),
+        ("volcano_enrichment", VolcanoEnrichmentStage),  # Per-gene volcano + Enrichr GO
         ("organelle_discrimination", OrganelleDiscriminationStage),  # Cell/guide/gene level
         ("gene_relationships", GeneRelationshipsStage),  # Gene level only - PHATE clustering
         ("cp_comparison", CPComparisonStage),  # Cell Painting vs non-CP comparison (only when --just-cp)

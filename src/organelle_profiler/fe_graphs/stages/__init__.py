@@ -22,6 +22,7 @@ from .fe_graphs_embedding_stage import EmbeddingStage
 from .fe_graphs_embedding_visualization_stage import EmbeddingVisualizationStage
 from .fe_graphs_clustering_stage import ClusteringStage
 from .fe_graphs_differential_stage import DifferentialStage
+from .fe_graphs_volcano_enrichment_stage import VolcanoEnrichmentStage
 from .fe_graphs_summary_stage import SummaryStage
 from .fe_graphs_organelle_discrimination_stage import OrganelleDiscriminationStage
 from .fe_graphs_positive_controls_stage import PositiveControlsStage
@@ -37,6 +38,7 @@ __all__ = [
     "EmbeddingVisualizationStage",
     "ClusteringStage",
     "DifferentialStage",
+    "VolcanoEnrichmentStage",
     "SummaryStage",
     "OrganelleDiscriminationStage",
     "PositiveControlsStage",

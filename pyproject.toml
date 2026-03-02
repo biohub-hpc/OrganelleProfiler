@@ -36,6 +36,7 @@ dependencies = [
     "dask",
     "statsmodels",
     "copairs",
+    "maayanlab-bioinformatics",
 ]
 
 [project.optional-dependencies]

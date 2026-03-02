@@ -68,6 +68,7 @@ def list_available_options():
     print("  5. positive_controls         - Validate using known gene clusters (all levels) [early!]")
     print("  6. clustering                - Unsupervised clustering (HDBSCAN, KMeans, Leiden)")
     print("  7. differential              - NTC comparison (z-scores, volcano plots)")
+    print("  7.5 volcano_enrichment       - Per-gene volcano plots + Enrichr GO enrichment")
     print("  8. organelle_discrimination  - Compare organelle discrimination power")
     print("  9. gene_relationships        - PHATE clustering & hierarchical analysis (gene level)")
     print(" 10. cp_comparison             - Cell Painting vs non-CP comparison (with --just-cp)")
@@ -185,14 +186,14 @@ Examples:
         "--stages",
         nargs="+",
         type=str,
-        choices=["qc", "spatial_drift", "embedding", "embedding_visualization", "clustering", "differential", "organelle_discrimination", "positive_controls", "gene_relationships", "cp_comparison", "cp_challenge", "summary"],
+        choices=["qc", "spatial_drift", "embedding", "embedding_visualization", "clustering", "differential", "volcano_enrichment", "organelle_discrimination", "positive_controls", "gene_relationships", "cp_comparison", "cp_challenge", "summary"],
         help="Specific stages to run. Example: --stages embedding clustering gene_relationships",
     )
     parser.add_argument(
         "--skip-stages",
         nargs="+",
         type=str,
-        choices=["qc", "spatial_drift", "embedding", "embedding_visualization", "clustering", "differential", "organelle_discrimination", "positive_controls", "gene_relationships", "cp_comparison", "cp_challenge", "summary"],
+        choices=["qc", "spatial_drift", "embedding", "embedding_visualization", "clustering", "differential", "volcano_enrichment", "organelle_discrimination", "positive_controls", "gene_relationships", "cp_comparison", "cp_challenge", "summary"],
         help="Stages to skip. Example: --skip-stages qc",
     )
     

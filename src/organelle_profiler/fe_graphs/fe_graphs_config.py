@@ -155,7 +155,17 @@ class AnalysisConfig:
     # Differential analysis thresholds
     zscore_threshold: float = 2.0
     pvalue_threshold: float = 0.05
-    
+
+    # Volcano enrichment stage
+    volcano_enrichment_n_top_features: int = 20
+    volcano_enrichment_min_genes: int = 5
+    enrichr_libraries: List[str] = field(default_factory=lambda: [
+        "GO_Biological_Process_2025",
+        "GO_Cellular_Component_2025",
+        "KEGG_2026",
+        "Reactome_2022",
+    ])
+
     # Guide/gene QC thresholds
     min_cells_per_guide: int = 10
     min_guides_per_gene: int = 2
