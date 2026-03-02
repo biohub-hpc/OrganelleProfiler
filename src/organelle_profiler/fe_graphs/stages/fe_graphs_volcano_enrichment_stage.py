@@ -94,6 +94,14 @@ class VolcanoEnrichmentStage(BaseStage):
             self._generate_enrichment_summary_table(all_enrichment, summary_dir, result)
             result.data["enrichment_results"] = all_enrichment
 
+        # Step 6: Positive control cluster analysis
+        # For each cluster, find top-3 discriminating features, make volcanos + enrichment
+        pc_dir = self.output_dir / "positive_controls"
+        pc_dir.mkdir(exist_ok=True)
+        self._run_positive_controls_analysis(
+            features, df, ntc_mask, all_genes, pc_dir, result
+        )
+
         self.log_complete(result)
         return result
 
@@ -272,14 +280,19 @@ class VolcanoEnrichmentStage(BaseStage):
                     c="#4575b4", alpha=0.8, s=50, label=f"Down ({sig_down.sum()})",
                 )
 
-            # Label top significant genes
-            sig_genes = feat_data[sig_up | sig_down].nlargest(15, "neg_log10_padj")
-            for _, row in sig_genes.iterrows():
+            # Label top-20 genes by |fold-change| (regardless of significance)
+            feat_data["abs_log2fc"] = feat_data["log2_fold_change"].abs()
+            top_genes = feat_data.nlargest(20, "abs_log2fc")
+            from matplotlib import patheffects
+            for _, row in top_genes.iterrows():
                 ax.annotate(
                     row["gene_name"],
                     (row["log2_fold_change"], row["neg_log10_padj"]),
-                    fontsize=7, alpha=0.8,
+                    fontsize=7, alpha=0.9, fontweight="bold",
                     xytext=(5, 5), textcoords="offset points",
+                    path_effects=[
+                        patheffects.withStroke(linewidth=2, foreground="white"),
+                    ],
                 )
 
             # Threshold lines
@@ -308,11 +321,24 @@ class VolcanoEnrichmentStage(BaseStage):
         background_genes: List[str],
         output_dir: Path,
         result: StageResult,
+        num_workers: int = 8,
     ) -> Optional[pd.DataFrame]:
         """Run Enrichr GO enrichment for up/down gene lists per feature."""
         try:
-            from maayanlab_bioinformatics.api.speedrichr import speedenrich
-        except ImportError:
+            # Load speedrichr.py directly to bypass maayanlab_bioinformatics'
+            # top-level __init__.py which eagerly imports dge (requires pydeseq2).
+            import importlib.util, sys
+            for search_path in sys.path:
+                _candidate = Path(search_path) / "maayanlab_bioinformatics" / "api" / "speedrichr.py"
+                if _candidate.exists():
+                    _spec = importlib.util.spec_from_file_location("_speedrichr", _candidate)
+                    _mod = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    speedenrich = _mod.speedenrich
+                    break
+            else:
+                raise ImportError("speedrichr.py not found")
+        except (ImportError, ModuleNotFoundError):
             logger.warning(
                 "maayanlab-bioinformatics not installed — skipping GO enrichment. "
                 "Install with: pip install 'maayanlab-bioinformatics@git+https://github.com/MaayanLab/maayanlab-bioinformatics.git'"
@@ -320,55 +346,62 @@ class VolcanoEnrichmentStage(BaseStage):
             result.add_metric("enrichment_skipped", True)
             return None
 
-        p_thresh = self.analysis_config.volcano_p_threshold
-        fc_thresh = self.analysis_config.volcano_log2fc_threshold
         min_genes = self.analysis_config.volcano_enrichment_min_genes
+        n_top_enrich = 20  # Top-N genes per direction for enrichment
         libraries = self.analysis_config.enrichr_libraries
 
+        # Build all enrichment jobs: (feature, direction, gene_list)
+        jobs = []
+        for feat in top_features:
+            feat_data = stats_df[stats_df["feature"] == feat].copy()
+            positive_fc = feat_data[feat_data["log2_fold_change"] > 0].nlargest(
+                n_top_enrich, "log2_fold_change"
+            )
+            negative_fc = feat_data[feat_data["log2_fold_change"] < 0].nsmallest(
+                n_top_enrich, "log2_fold_change"
+            )
+            for direction, gene_list in [
+                ("up", positive_fc["gene_name"].tolist()),
+                ("down", negative_fc["gene_name"].tolist()),
+            ]:
+                if len(gene_list) >= min_genes:
+                    jobs.append((feat, direction, gene_list))
+
+        logger.info(f"Running {len(jobs)} enrichment queries with {num_workers} workers")
+
+        def _run_single_enrichment(args):
+            feat, direction, gene_list = args
+            try:
+                enr_df = speedenrich(
+                    userlist=gene_list,
+                    libraries=libraries,
+                    background=background_genes,
+                )
+                if enr_df is not None and not enr_df.empty:
+                    enr_df["feature"] = feat
+                    enr_df["direction"] = direction
+                    enr_df["n_genes_in_list"] = len(gene_list)
+                    return enr_df
+            except Exception as e:
+                logger.warning(f"Enrichr failed for {feat} ({direction}): {e}")
+            return None
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         all_enrichment = []
-
-        for feat in tqdm(top_features, desc="Running GO enrichment"):
-            feat_data = stats_df[stats_df["feature"] == feat]
-
-            # Extract up/down gene lists
-            up_genes = feat_data[
-                (feat_data["pvalue_adj"] < p_thresh)
-                & (feat_data["log2_fold_change"] > fc_thresh)
-            ]["gene_name"].tolist()
-
-            down_genes = feat_data[
-                (feat_data["pvalue_adj"] < p_thresh)
-                & (feat_data["log2_fold_change"] < -fc_thresh)
-            ]["gene_name"].tolist()
-
-            for direction, gene_list in [("up", up_genes), ("down", down_genes)]:
-                if len(gene_list) < min_genes:
-                    continue
-
-                try:
-                    enr_df = speedenrich(
-                        userlist=gene_list,
-                        libraries=libraries,
-                        background=background_genes,
-                    )
-
-                    if enr_df is not None and not enr_df.empty:
-                        enr_df["feature"] = feat
-                        enr_df["direction"] = direction
-                        enr_df["n_genes_in_list"] = len(gene_list)
-                        all_enrichment.append(enr_df)
-
-                        # Save per-feature-direction CSV
-                        safe_name = feat[:50].replace("/", "_").replace(" ", "_")
-                        csv_path = output_dir / f"enrichment_{safe_name}_{direction}.csv"
-                        enr_df.to_csv(csv_path, index=False)
-                        result.add_file(csv_path)
-
-                except Exception as e:
-                    logger.warning(f"Enrichr failed for {feat} ({direction}): {e}")
-
-                # Brief pause to avoid API rate limiting
-                time.sleep(0.3)
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_run_single_enrichment, job): job for job in jobs}
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Running GO enrichment"
+            ):
+                enr_df = future.result()
+                if enr_df is not None:
+                    feat, direction, _ = futures[future]
+                    all_enrichment.append(enr_df)
+                    safe_name = feat[:50].replace("/", "_").replace(" ", "_")
+                    csv_path = output_dir / f"enrichment_{safe_name}_{direction}.csv"
+                    enr_df.to_csv(csv_path, index=False)
+                    result.add_file(csv_path)
 
         if all_enrichment:
             combined = pd.concat(all_enrichment, ignore_index=True)
@@ -480,3 +513,273 @@ class VolcanoEnrichmentStage(BaseStage):
             summary_df.to_csv(csv_path, index=False)
             result.add_file(csv_path)
             logger.info(f"Enrichment summary: {len(summary_rows)} entries across {enrichment_df['feature'].nunique()} features")
+
+    # ------------------------------------------------------------------
+    # Step 6: Positive control cluster volcano + enrichment
+    # ------------------------------------------------------------------
+
+    def _run_positive_controls_analysis(
+        self,
+        features: pd.DataFrame,
+        df: pd.DataFrame,
+        ntc_mask: pd.Series,
+        background_genes: List[str],
+        output_dir: Path,
+        result: StageResult,
+        top_features_per_cluster: int = 3,
+    ) -> None:
+        """
+        For each positive control cluster, find top-3 discriminating features
+        (by Cohen's d), generate volcano plots + enrichment in a per-cluster subdir.
+        """
+        import yaml
+
+        # Load positive controls YAML
+        pc_path = Path("/hpc/projects/icd.ops/configs/gene_clusters/chad_positive_controls_v3.yml")
+        if not pc_path.exists():
+            logger.warning(f"Positive controls file not found: {pc_path}")
+            return
+
+        try:
+            with open(pc_path, "r") as f:
+                raw_clusters = yaml.safe_load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load positive controls: {e}")
+            return
+
+        # Parse clusters (skip NTCs, require >= 2 genes)
+        clusters = {}
+        for cluster_id, cluster_data in raw_clusters.items():
+            name = cluster_data.get("name", f"cluster_{cluster_id}")
+            genes = cluster_data.get("genes", [])
+            if name == "NTCs" or len(genes) < 2:
+                continue
+            clusters[name] = genes
+
+        if not clusters:
+            logger.warning("No valid positive control clusters found")
+            return
+
+        gene_col = "gene_name"
+        logger.info(f"Running volcano+enrichment for {len(clusters)} positive control clusters "
+                     f"(top {top_features_per_cluster} features each)")
+
+        # Compute Cohen's d per cluster to find top discriminating features
+        cluster_top_features = {}
+        for cluster_name, cluster_genes in clusters.items():
+            cluster_mask = df[gene_col].isin(cluster_genes)
+            n_cluster = cluster_mask.sum()
+            if n_cluster < 1:
+                continue
+
+            cluster_feat = features.loc[cluster_mask]
+            other_feat = features.loc[~cluster_mask]
+
+            scores = []
+            for feat in features.columns:
+                c_vals = cluster_feat[feat].dropna()
+                o_vals = other_feat[feat].dropna()
+                if len(c_vals) < 1 or len(o_vals) < 2:
+                    continue
+                mean_c, mean_o = c_vals.mean(), o_vals.mean()
+                if len(c_vals) == 1:
+                    pooled_std = o_vals.std()
+                else:
+                    n1, n2 = len(c_vals), len(o_vals)
+                    pooled_std = np.sqrt(
+                        ((n1 - 1) * c_vals.std() ** 2 + (n2 - 1) * o_vals.std() ** 2)
+                        / (n1 + n2 - 2)
+                    )
+                if pooled_std == 0:
+                    continue
+                scores.append({
+                    "feature": feat,
+                    "cohens_d": (mean_c - mean_o) / pooled_std,
+                })
+
+            if not scores:
+                continue
+
+            scores_df = pd.DataFrame(scores)
+            scores_df["abs_d"] = scores_df["cohens_d"].abs()
+            top = scores_df.nlargest(top_features_per_cluster, "abs_d")
+            cluster_top_features[cluster_name] = top["feature"].tolist()
+
+        if not cluster_top_features:
+            logger.warning("No clusters had enough data to compute discriminating features")
+            return
+
+        # Now generate volcano plots + enrichment for each cluster's top features
+        # Try to load speedenrich (may have been loaded in step 4)
+        speedenrich = None
+        try:
+            import importlib.util, sys as _sys
+            for search_path in _sys.path:
+                _candidate = Path(search_path) / "maayanlab_bioinformatics" / "api" / "speedrichr.py"
+                if _candidate.exists():
+                    _spec = importlib.util.spec_from_file_location("_speedrichr_pc", _candidate)
+                    _mod = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    speedenrich = _mod.speedenrich
+                    break
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        libraries = self.analysis_config.enrichr_libraries
+        n_top_enrich = 20
+        min_genes = self.analysis_config.volcano_enrichment_min_genes
+        from matplotlib import patheffects
+
+        for cluster_name, top_feats in tqdm(
+            cluster_top_features.items(), desc="Positive control volcanos"
+        ):
+            safe_cluster = cluster_name[:40].replace("/", "_").replace(" ", "_")
+            cluster_dir = output_dir / safe_cluster
+            cluster_dir.mkdir(exist_ok=True)
+
+            # Compute per-gene stats for this cluster's top features
+            cluster_stats = self._compute_per_gene_stats(
+                features, df, ntc_mask, top_feats
+            )
+            if cluster_stats.empty:
+                continue
+
+            # Save stats
+            cluster_stats.to_csv(cluster_dir / "per_gene_stats.csv", index=False)
+            result.add_file(cluster_dir / "per_gene_stats.csv")
+
+            # Generate volcano plots annotated with cluster name
+            p_thresh = self.analysis_config.volcano_p_threshold
+            fc_thresh = self.analysis_config.volcano_log2fc_threshold
+
+            for feat in top_feats:
+                feat_data = cluster_stats[cluster_stats["feature"] == feat].copy()
+                if feat_data.empty:
+                    continue
+
+                fig, ax = plt.subplots(figsize=self.plot_config.figsize_volcano)
+
+                # Highlight cluster genes
+                cluster_genes_set = set(clusters[cluster_name])
+                is_cluster = feat_data["gene_name"].isin(cluster_genes_set)
+
+                # Plot non-cluster genes (gray)
+                ax.scatter(
+                    feat_data.loc[~is_cluster, "log2_fold_change"],
+                    feat_data.loc[~is_cluster, "neg_log10_padj"],
+                    c="lightgray", alpha=0.4, s=25, label="Other genes", zorder=1,
+                )
+                # Plot cluster genes (colored, larger)
+                if is_cluster.any():
+                    ax.scatter(
+                        feat_data.loc[is_cluster, "log2_fold_change"],
+                        feat_data.loc[is_cluster, "neg_log10_padj"],
+                        c="#d62728", alpha=0.9, s=100, edgecolors="black",
+                        linewidths=0.8, label=cluster_name, zorder=3,
+                    )
+                    # Label all cluster genes
+                    for _, row in feat_data.loc[is_cluster].iterrows():
+                        ax.annotate(
+                            row["gene_name"],
+                            (row["log2_fold_change"], row["neg_log10_padj"]),
+                            fontsize=8, fontweight="bold", color="#d62728",
+                            xytext=(6, 6), textcoords="offset points",
+                            path_effects=[
+                                patheffects.withStroke(linewidth=2.5, foreground="white"),
+                            ],
+                        )
+
+                # Also label top-20 non-cluster genes by |FC|
+                non_cluster = feat_data.loc[~is_cluster].copy()
+                non_cluster["abs_log2fc"] = non_cluster["log2_fold_change"].abs()
+                top_other = non_cluster.nlargest(20, "abs_log2fc")
+                for _, row in top_other.iterrows():
+                    ax.annotate(
+                        row["gene_name"],
+                        (row["log2_fold_change"], row["neg_log10_padj"]),
+                        fontsize=6, alpha=0.7,
+                        xytext=(4, 4), textcoords="offset points",
+                        path_effects=[
+                            patheffects.withStroke(linewidth=1.5, foreground="white"),
+                        ],
+                    )
+
+                # Threshold lines
+                ax.axhline(-np.log10(p_thresh), color="gray", linestyle="--", alpha=0.5)
+                ax.axvline(-fc_thresh, color="gray", linestyle="--", alpha=0.5)
+                ax.axvline(fc_thresh, color="gray", linestyle="--", alpha=0.5)
+
+                ax.set_xlabel("Log2 Fold Change (vs NTC)")
+                ax.set_ylabel("-Log10 Adjusted P-value")
+                ax.set_title(
+                    f"Volcano: {feat}\n"
+                    f"Positive Control: {cluster_name}",
+                    fontsize=11,
+                )
+                ax.legend(loc="upper right", fontsize=8)
+
+                plt.tight_layout()
+                safe_feat = feat[:50].replace("/", "_").replace(" ", "_")
+                path = save_figure(fig, cluster_dir / f"volcano_{safe_feat}.png")
+                result.add_file(path)
+
+            # Run enrichment on this cluster's top features
+            if speedenrich is not None:
+                jobs = []
+                for feat in top_feats:
+                    feat_data = cluster_stats[cluster_stats["feature"] == feat].copy()
+                    if feat_data.empty:
+                        continue
+                    pos_fc = feat_data[feat_data["log2_fold_change"] > 0].nlargest(
+                        n_top_enrich, "log2_fold_change"
+                    )
+                    neg_fc = feat_data[feat_data["log2_fold_change"] < 0].nsmallest(
+                        n_top_enrich, "log2_fold_change"
+                    )
+                    for direction, gene_list in [
+                        ("up", pos_fc["gene_name"].tolist()),
+                        ("down", neg_fc["gene_name"].tolist()),
+                    ]:
+                        if len(gene_list) >= min_genes:
+                            jobs.append((feat, direction, gene_list))
+
+                if jobs:
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    def _enrich_single(args):
+                        feat, direction, gene_list = args
+                        try:
+                            enr_df = speedenrich(
+                                userlist=gene_list,
+                                libraries=libraries,
+                                background=background_genes,
+                            )
+                            if enr_df is not None and not enr_df.empty:
+                                enr_df["feature"] = feat
+                                enr_df["direction"] = direction
+                                enr_df["cluster"] = cluster_name
+                                enr_df["n_genes_in_list"] = len(gene_list)
+                                return enr_df
+                        except Exception as e:
+                            logger.warning(f"Enrichr failed for {cluster_name}/{feat} ({direction}): {e}")
+                        return None
+
+                    enrich_results = []
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        futures = {executor.submit(_enrich_single, j): j for j in jobs}
+                        for future in as_completed(futures):
+                            enr_df = future.result()
+                            if enr_df is not None:
+                                enrich_results.append(enr_df)
+                                feat, direction, _ = futures[future]
+                                safe_feat = feat[:50].replace("/", "_").replace(" ", "_")
+                                csv_path = cluster_dir / f"enrichment_{safe_feat}_{direction}.csv"
+                                enr_df.to_csv(csv_path, index=False)
+                                result.add_file(csv_path)
+
+                    if enrich_results:
+                        combined = pd.concat(enrich_results, ignore_index=True)
+                        combined.to_csv(cluster_dir / "all_enrichment.csv", index=False)
+                        result.add_file(cluster_dir / "all_enrichment.csv")
+
+        logger.info(f"Positive control analysis complete: {len(cluster_top_features)} clusters")
