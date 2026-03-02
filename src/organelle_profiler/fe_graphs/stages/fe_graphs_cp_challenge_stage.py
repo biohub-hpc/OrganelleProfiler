@@ -2707,6 +2707,8 @@ def main():
                         help="Only run aggregation (summary table + plots) on existing per-comparison CSVs")
     parser.add_argument("--dino", action="store_true",
                         help="Use DinoV3 embeddings instead of CellProfiler organelle features")
+    parser.add_argument("--compare-methods", action="store_true",
+                        help="Compare OrgProfiler vs DinoV3 results (requires both to have been run)")
 
     args = parser.parse_args()
 
@@ -2734,6 +2736,12 @@ def main():
     if args.aggregate:
         cp_challenge_dir = graph_output / "2_guide_level" / stage_subdir
         _run_aggregate_only(experiment, cp_challenge_dir)
+        return
+
+    # --- Compare methods mode: OrgProfiler vs DinoV3 side-by-side ---
+    if args.compare_methods:
+        base_dir = graph_output / "2_guide_level"
+        _run_compare_methods(experiment, base_dir)
         return
 
     # --- SLURM mode: submit each comparison as a separate job ---
@@ -3092,6 +3100,1345 @@ def _run_aggregate_only(experiment: str, cp_challenge_dir: Path) -> None:
                     traceback.print_exc()
 
     print(f"\nDone. Results in {cp_challenge_dir}")
+
+
+def _run_compare_methods(experiment: str, base_dir: Path) -> None:
+    """Compare OrgProfiler vs DinoV3 CP challenge results.
+
+    Reads the ntc_norm summary CSVs from both ``12_cp_challenge/`` and
+    ``12_cp_challenge_dino/``, joins on ``(organelle_type, live_experiment)``,
+    and generates comparison plots + CSVs.
+
+    Everything is derived from the data — organelle types, metrics, and
+    column names are discovered from the summary DataFrames.
+
+    Output goes to ``base_dir / 12_cp_challenge_comparison/``.
+    """
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import numpy as np
+
+    # ------------------------------------------------------------------
+    # 0. Locate & load the two summary CSVs
+    # ------------------------------------------------------------------
+    METHOD_A, METHOD_B = "OrgProfiler", "DinoV3"
+    COLOR_A, COLOR_B, COLOR_BOTH = "#5C6BC0", "#26A69A", "#7E57C2"
+
+    org_dir = base_dir / "12_cp_challenge" / "ntc_norm"
+    dino_dir = base_dir / "12_cp_challenge_dino" / "ntc_norm"
+
+    org_csv = org_dir / "cp_challenge_summary.csv"
+    dino_csv = dino_dir / "cp_challenge_summary.csv"
+
+    for path, label in [(org_csv, METHOD_A), (dino_csv, METHOD_B)]:
+        if not path.exists():
+            print(f"ERROR: {label} summary not found: {path}")
+            print(f"  Run the CP challenge for that method first, then --aggregate")
+            return
+
+    df_a = pd.read_csv(org_csv)
+    df_b = pd.read_csv(dino_csv)
+
+    join_cols = ["organelle_type", "live_experiment"]
+    merged = df_a.merge(df_b, on=join_cols, suffixes=("_a", "_b"), how="inner")
+    if merged.empty:
+        print("ERROR: No matching comparisons between the two methods")
+        return
+
+    out_dir = base_dir / "12_cp_challenge_comparison"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    organelles = sorted(merged["organelle_type"].unique())
+    cmap = plt.cm.get_cmap("tab10", max(len(organelles), 1))
+    org_colors = {o: matplotlib.colors.to_hex(cmap(i)) for i, o in enumerate(organelles)}
+
+    def _pretty(name: str) -> str:
+        """Human-readable label from a snake_case metric/organelle name."""
+        # Exact match aliases
+        _aliases = {"manual": "CHAD", "f_actin": "F-Actin", "er": "ER"}
+        if name in _aliases:
+            return _aliases[name]
+        # Substring replacements (e.g. "consistency_manual" → "Consistency CHAD")
+        _subs = {"manual": "CHAD", "f_actin": "F-Actin"}
+        result = name.replace("_", " ").title()
+        for key, replacement in _subs.items():
+            target = key.replace("_", " ").title()  # "Manual", "F Actin"
+            if target in result:
+                result = result.replace(target, replacement)
+        return result
+
+    print(f"\nCompare Methods: {METHOD_A} vs {METHOD_B}")
+    print(f"  Matched comparisons: {len(merged)}")
+    print(f"  Organelles: {', '.join(_pretty(o) for o in organelles)}")
+    print(f"  Output: {out_dir}\n")
+
+    # ------------------------------------------------------------------
+    # 1. Discover metric columns from the summary CSV
+    # ------------------------------------------------------------------
+    # Auto-detect paired columns for two scoring systems:
+    #   AUC:   cp_auc_<metric> / live_auc_<metric>
+    #   Ratio: cp_<x>_ratio    / live_<x>_ratio
+
+    def _discover_metric_pairs(prefix_cp, prefix_live, suffix=""):
+        """Find matching (cp, live) column pairs by pattern."""
+        found = {}
+        for col in df_a.columns:
+            if col.startswith(prefix_cp) and col.endswith(suffix):
+                short = col[len(prefix_cp):]
+                if suffix:
+                    short = short[: -len(suffix)]
+                found.setdefault(short, {})["cp"] = col
+            elif col.startswith(prefix_live) and col.endswith(suffix):
+                short = col[len(prefix_live):]
+                if suffix:
+                    short = short[: -len(suffix)]
+                found.setdefault(short, {})["live"] = col
+        return [(s, d["cp"], d["live"]) for s, d in found.items()
+                if "cp" in d and "live" in d]
+
+    auc_metrics = _discover_metric_pairs("cp_auc_", "live_auc_")
+    # Ratio columns: cp_active_ratio / live_active_ratio, etc. — same 4 metrics
+    # as AUC but p-value thresholded (fraction of significant genes)
+    ratio_metrics = _discover_metric_pairs("cp_", "live_", suffix="_ratio")
+
+    # Two parallel scoring systems with matching metrics
+    scoring_systems = [("auc", auc_metrics), ("ratio", ratio_metrics)]
+    # Filter to non-empty
+    scoring_systems = [(name, mets) for name, mets in scoring_systems if mets]
+
+    if not scoring_systems:
+        print("ERROR: Could not discover any metric columns from summary CSVs")
+        return
+
+    # ------------------------------------------------------------------
+    # 2. Compute per-organelle means (averaging over live experiments)
+    # ------------------------------------------------------------------
+    means_records = []
+    for org_type in organelles:
+        rows = merged[merged["organelle_type"] == org_type]
+        rec = {"organelle": org_type}
+        for score_name, mets in scoring_systems:
+            for short, cp_col, live_col in mets:
+                rec[f"a_cp_{score_name}_{short}"] = rows[f"{cp_col}_a"].mean()
+                rec[f"b_cp_{score_name}_{short}"] = rows[f"{cp_col}_b"].mean()
+                rec[f"a_live_{score_name}_{short}"] = rows[f"{live_col}_a"].mean()
+                rec[f"b_live_{score_name}_{short}"] = rows[f"{live_col}_b"].mean()
+        means_records.append(rec)
+    means_df = pd.DataFrame(means_records)
+
+    merged.to_csv(out_dir / "method_comparison_merged.csv", index=False)
+    means_df.to_csv(out_dir / "method_comparison_organelle_means.csv", index=False)
+    print(f"  Saved merged summary ({len(merged)} rows)")
+    print(f"  Saved organelle means ({len(means_df)} organelles)")
+
+    # ------------------------------------------------------------------
+    # Helper: clean axes
+    # ------------------------------------------------------------------
+    def _clean(ax):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="y", alpha=0.2, linestyle="--")
+
+    def _score_label(score_name, metric_short=None):
+        """Y-axis label for a given scoring system and metric."""
+        if score_name == "auc":
+            return "AUC"
+        # Ratio system — metric-specific labels
+        _ratio_labels = {
+            "active": "% Active Perturbations\n(mAP p < 0.05)",
+            "distinctive": "% Distinct Perturbations\n(mAP p < 0.05)",
+            "consistency_corum": "% CORUM Consistent\n(mAP p < 0.05)",
+            "consistency_manual_annotation": "% CHAD Consistent\n(mAP p < 0.05)",
+        }
+        if metric_short and metric_short in _ratio_labels:
+            return _ratio_labels[metric_short]
+        return "% Perturbations (mAP p < 0.05)"
+
+    def _add_legend(ax, include_organelles=True, include_methods=True,
+                    fontsize=7, ncol=None, loc="best", **kwargs):
+        """Add combined legend with method bar-types + organelle color map."""
+        from matplotlib.patches import Patch
+        handles = []
+        if include_methods:
+            handles.append(Patch(facecolor="#888888", alpha=0.85,
+                                 edgecolor="white", label=f"{METHOD_A} (solid)"))
+            handles.append(Patch(facecolor="#888888", alpha=0.45,
+                                 edgecolor="white", hatch="//",
+                                 label=f"{METHOD_B} (hatched)"))
+        if include_organelles:
+            for o in organelles:
+                handles.append(Patch(facecolor=org_colors[o], edgecolor="white",
+                                     label=_pretty(o)))
+        if not ncol:
+            ncol = 2 if len(handles) > 6 else 1
+        ax.legend(handles=handles, fontsize=fontsize, ncol=ncol, loc=loc,
+                  framealpha=0.9, **kwargs)
+
+    # ==================================================================
+    # Generate all plots for each scoring system (AUC and Ratio)
+    # ==================================================================
+    for score_name, score_metrics in scoring_systems:
+        sl = _score_label(score_name)
+        metric_names = [_pretty(s) for s, _, _ in score_metrics]
+        tag = score_name  # filename prefix
+
+        score_dir = out_dir / tag
+        score_dir.mkdir(parents=True, exist_ok=True)
+
+        # Helper: column key in means_df for this scoring system
+        def _mk(method, side, short):
+            return f"{method}_{side}_{tag}_{short}"
+
+        # ==============================================================
+        # PLOT 1: Grouped bar — per organelle, method A vs B
+        # ==============================================================
+        for side, side_label in [("cp", "CP-Side (Fixed-Cell)"), ("live", "Live-Cell Side")]:
+            nm = len(score_metrics)
+            fig, axes = plt.subplots(1, nm, figsize=(4.5 * nm, 5), squeeze=False)
+            axes = axes.ravel()
+            x = np.arange(len(means_df))
+            w = 0.35
+
+            bar_colors = [org_colors[o] for o in means_df["organelle"]]
+            for idx, (short, _, _) in enumerate(score_metrics):
+                ax = axes[idx]
+                vals_a = means_df[_mk("a", side, short)].values
+                vals_b = means_df[_mk("b", side, short)].values
+                ax.bar(x - w / 2, vals_a, w, color=bar_colors, alpha=0.85,
+                       edgecolor="white", lw=0.5, label=METHOD_A)
+                ax.bar(x + w / 2, vals_b, w, color=bar_colors, alpha=0.45,
+                       edgecolor="white", lw=0.5, hatch="//", label=METHOD_B)
+                ax.set_xticks(x)
+                ax.set_xticklabels([_pretty(o) for o in means_df["organelle"]],
+                                   rotation=40, ha="right", fontsize=8)
+                ax.set_ylabel(_score_label(score_name, short))
+                ax.set_title(_pretty(short), fontweight="bold")
+                ax.set_ylim(bottom=0)
+                _clean(ax)
+                if idx == nm - 1:
+                    _add_legend(ax, fontsize=6, loc="upper right")
+
+            fig.suptitle(f"{side_label}: {METHOD_A} (solid) vs {METHOD_B} (hatched) — NTC norm",
+                         fontsize=13, fontweight="bold")
+            fig.tight_layout()
+            fname = f"{side}_by_organelle.png"
+            fig.savefig(score_dir / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}] Saved {fname}")
+
+        # ==============================================================
+        # PLOT 2: Scatter — method A vs B (per comparison point)
+        # ==============================================================
+        for side, side_label in [("cp", "CP-Side"), ("live", "Live-Cell")]:
+            nm = len(score_metrics)
+            fig, axes = plt.subplots(1, nm, figsize=(5 * nm, 5), squeeze=False)
+            axes = axes.ravel()
+
+            for idx, (short, cp_col, live_col) in enumerate(score_metrics):
+                ax = axes[idx]
+                col = cp_col if side == "cp" else live_col
+                col_a, col_b = f"{col}_a", f"{col}_b"
+
+                for org_type in organelles:
+                    sub = merged[merged["organelle_type"] == org_type]
+                    ax.scatter(sub[col_a], sub[col_b], c=org_colors[org_type],
+                               s=60, alpha=0.85, edgecolors="white", linewidth=0.5,
+                               label=_pretty(org_type), zorder=3)
+
+                hi = max(merged[col_a].max(), merged[col_b].max()) * 1.1
+                ax.plot([0, hi], [0, hi], "k--", alpha=0.25, linewidth=1)
+                ax.set_xlabel(METHOD_A)
+                ax.set_ylabel(METHOD_B if idx == 0 else "")
+                ax.set_title(_pretty(short), fontweight="bold")
+                ax.set_xlim(left=0); ax.set_ylim(bottom=0)
+                _clean(ax)
+                if idx == 0:
+                    ax.legend(fontsize=6, loc="lower right")
+
+            fig.suptitle(f"{side_label} {sl} scatter: {METHOD_A} vs {METHOD_B}",
+                         fontsize=13, fontweight="bold")
+            fig.tight_layout()
+            fname = f"{side}_scatter.png"
+            fig.savefig(score_dir / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}] Saved {fname}")
+
+        # ==============================================================
+        # PLOT 3: Delta heatmap — (B - A) per organelle × metric
+        # ==============================================================
+        nm = len(score_metrics)
+        fig, axes = plt.subplots(1, 2, figsize=(5 + 2.5 * nm, max(4, 0.7 * len(organelles))),
+                                 sharey=True)
+        for si, (side, side_label) in enumerate([("cp", "CP-Side"), ("live", "Live-Cell")]):
+            ax = axes[si]
+            delta = np.zeros((len(means_df), nm))
+            for j, (short, _, _) in enumerate(score_metrics):
+                vb = pd.to_numeric(means_df[_mk("b", side, short)], errors="coerce").fillna(0).values
+                va = pd.to_numeric(means_df[_mk("a", side, short)], errors="coerce").fillna(0).values
+                delta[:, j] = vb - va
+            vmax = max(np.abs(delta).max(), 0.01)
+            sns.heatmap(delta, ax=ax,
+                        xticklabels=metric_names,
+                        yticklabels=[_pretty(o) for o in means_df["organelle"]],
+                        cmap="RdBu_r", center=0, vmin=-vmax, vmax=vmax,
+                        annot=True, fmt=".3f", annot_kws={"fontsize": 9},
+                        linewidths=0.5, linecolor="white",
+                        cbar_kws={"label": f"{METHOD_B} - {METHOD_A}", "shrink": 0.8})
+            ax.set_title(side_label, fontweight="bold")
+            ax.set_ylabel("" if si else "Organelle")
+            ax.tick_params(axis="y", rotation=0)
+        fig.suptitle(f"{sl} Delta: + = {METHOD_B} better, - = {METHOD_A} better",
+                     fontsize=13, fontweight="bold", y=1.02)
+        fig.tight_layout()
+        fig.savefig(score_dir / "delta_heatmap.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [{tag}] Saved delta_heatmap.png")
+
+        # ==============================================================
+        # PLOT 4: Paired dot — per comparison, CP-side
+        # ==============================================================
+        for short, cp_col, _ in score_metrics:
+            plot_df = merged.sort_values(["organelle_type", "live_experiment"]).reset_index(drop=True)
+            x = np.arange(len(plot_df))
+            va = plot_df[f"{cp_col}_a"].values
+            vb = plot_df[f"{cp_col}_b"].values
+
+            fig, ax = plt.subplots(figsize=(max(10, len(plot_df) * 0.7), 5))
+            for i in range(len(plot_df)):
+                c = COLOR_B if vb[i] > va[i] else COLOR_A
+                ax.plot([x[i], x[i]], [va[i], vb[i]], color=c, alpha=0.5, lw=2)
+            ax.scatter(x, va, c=COLOR_A, s=50, zorder=3, edgecolors="white", lw=0.5, label=METHOD_A)
+            ax.scatter(x, vb, c=COLOR_B, s=50, zorder=3, edgecolors="white", lw=0.5,
+                       marker="D", label=METHOD_B)
+            lbls = [f"{_pretty(r['organelle_type'])}\n{r['live_experiment'].split('_')[0]}"
+                    for _, r in plot_df.iterrows()]
+            ax.set_xticks(x)
+            ax.set_xticklabels(lbls, fontsize=7, rotation=45, ha="right")
+            ax.set_ylabel(f"CP {_pretty(short)} {_score_label(score_name, short)}")
+            ax.set_title(f"Paired: CP {_pretty(short)} (NTC norm)", fontweight="bold")
+            ax.legend(fontsize=9); ax.set_ylim(bottom=0); _clean(ax)
+            fig.tight_layout()
+            fname = f"paired_cp_{short}.png"
+            fig.savefig(score_dir / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}] Saved {fname}")
+
+        # ==============================================================
+        # PLOT 5: Radar — global mean, one panel per side
+        # ==============================================================
+        if nm >= 3:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), subplot_kw=dict(polar=True))
+            for si, (side, side_label) in enumerate([("cp", "CP-Side"), ("live", "Live-Cell")]):
+                ax = axes[si]
+                va = [means_df[_mk("a", side, s)].mean() for s, _, _ in score_metrics]
+                vb = [means_df[_mk("b", side, s)].mean() for s, _, _ in score_metrics]
+                angles = np.linspace(0, 2 * np.pi, nm, endpoint=False).tolist()
+                angles += angles[:1]; va += va[:1]; vb += vb[:1]
+                ax.plot(angles, va, "o-", color=COLOR_A, lw=2, label=METHOD_A)
+                ax.fill(angles, va, alpha=0.12, color=COLOR_A)
+                ax.plot(angles, vb, "D-", color=COLOR_B, lw=2, label=METHOD_B)
+                ax.fill(angles, vb, alpha=0.12, color=COLOR_B)
+                ax.set_xticks(angles[:-1])
+                ax.set_xticklabels(metric_names, fontsize=10)
+                ax.set_title(side_label, fontweight="bold", pad=18)
+                ax.legend(fontsize=8, bbox_to_anchor=(1.25, 1.1))
+            fig.suptitle(f"Global Mean {sl}: {METHOD_A} vs {METHOD_B}", fontsize=13,
+                         fontweight="bold", y=1.04)
+            fig.tight_layout()
+            fig.savefig(score_dir / "global_radar.png", dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}] Saved global_radar.png")
+
+        # ==============================================================
+        # PLOT 6: Combined CP + Live — per organelle, 4 bars each
+        #   Shows how each method performs on CP-side vs live-cell side
+        # ==============================================================
+        for short, _, _ in score_metrics:
+            fig, ax = plt.subplots(figsize=(max(10, 2 * len(organelles)), 5.5))
+            x = np.arange(len(means_df))
+            w = 0.2
+            offsets = [-1.5 * w, -0.5 * w, 0.5 * w, 1.5 * w]
+            bar_colors = [org_colors[o] for o in means_df["organelle"]]
+            # solid=CP, lighter=Live; no-hatch=OrgProfiler, hatched=DinoV3
+            bar_specs = [
+                (f"a_cp_{tag}_{short}", METHOD_A + " CP", 0.85, ""),
+                (f"a_live_{tag}_{short}", METHOD_A + " Live", 0.45, ""),
+                (f"b_cp_{tag}_{short}", METHOD_B + " CP", 0.85, "//"),
+                (f"b_live_{tag}_{short}", METHOD_B + " Live", 0.45, "//"),
+            ]
+            for (col_key, label, alpha, hatch), off in zip(bar_specs, offsets):
+                ax.bar(x + off, means_df[col_key].values, w,
+                       label=label, color=bar_colors, alpha=alpha,
+                       hatch=hatch, edgecolor="white", lw=0.5)
+
+            ax.set_xticks(x)
+            ax.set_xticklabels([_pretty(o) for o in means_df["organelle"]],
+                               rotation=35, ha="right", fontsize=9)
+            ax.set_ylabel(_score_label(score_name, short))
+            ax.set_title(f"{_pretty(short)}: CP vs Live-Cell per Method (NTC norm)",
+                         fontweight="bold")
+            # Custom legend: method bar-types + organelle colors
+            from matplotlib.patches import Patch
+            method_handles = [
+                Patch(facecolor="#888", alpha=0.85, edgecolor="white",
+                      label=f"{METHOD_A} CP (solid, dark)"),
+                Patch(facecolor="#888", alpha=0.45, edgecolor="white",
+                      label=f"{METHOD_A} Live (solid, light)"),
+                Patch(facecolor="#888", alpha=0.85, edgecolor="white", hatch="//",
+                      label=f"{METHOD_B} CP (hatched, dark)"),
+                Patch(facecolor="#888", alpha=0.45, edgecolor="white", hatch="//",
+                      label=f"{METHOD_B} Live (hatched, light)"),
+            ]
+            org_handles = [Patch(facecolor=org_colors[o], edgecolor="white",
+                                 label=_pretty(o)) for o in organelles]
+            ax.legend(handles=method_handles + org_handles, fontsize=6,
+                      ncol=2, loc="upper right", framealpha=0.9)
+            ax.set_ylim(bottom=0)
+            _clean(ax)
+            fig.tight_layout()
+            fname = f"combined_cp_live_{short}.png"
+            fig.savefig(score_dir / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}] Saved {fname}")
+
+        # ==============================================================
+        # PLOT 7: CP-to-Live recovery ratio — per organelle per method
+        #   ratio = CP / Live (>1 means CP exceeds live-cell)
+        # ==============================================================
+        fig, axes = plt.subplots(1, nm, figsize=(4.5 * nm, 5), squeeze=False)
+        axes = axes.ravel()
+        x = np.arange(len(means_df))
+        w = 0.35
+        for idx, (short, _, _) in enumerate(score_metrics):
+            ax = axes[idx]
+            live_a = means_df[_mk("a", "live", short)].values
+            live_b = means_df[_mk("b", "live", short)].values
+            cp_a = means_df[_mk("a", "cp", short)].values
+            cp_b = means_df[_mk("b", "cp", short)].values
+            # ratio: CP / Live (clamp denominator)
+            ratio_a = np.where(live_a > 0.001, cp_a / live_a, 0)
+            ratio_b = np.where(live_b > 0.001, cp_b / live_b, 0)
+
+            bar_colors = [org_colors[o] for o in means_df["organelle"]]
+            ax.bar(x - w / 2, ratio_a, w, color=bar_colors, alpha=0.85,
+                   edgecolor="white", lw=0.5, label=METHOD_A)
+            ax.bar(x + w / 2, ratio_b, w, color=bar_colors, alpha=0.45,
+                   edgecolor="white", lw=0.5, hatch="//", label=METHOD_B)
+            ax.axhline(1.0, color="gray", ls="--", lw=1, alpha=0.5)
+            ax.set_xticks(x)
+            ax.set_xticklabels([_pretty(o) for o in means_df["organelle"]],
+                               rotation=40, ha="right", fontsize=8)
+            ax.set_ylabel("CP / Live-Cell" if idx == 0 else "")
+            ax.set_title(_pretty(short), fontweight="bold")
+            ax.set_ylim(bottom=0)
+            _clean(ax)
+            if idx == nm - 1:
+                _add_legend(ax, fontsize=6, loc="upper right")
+
+        fig.suptitle(f"CP Recovery Ratio ({sl}): CP / Live-Cell per Method\n"
+                     f"(>1 = CP exceeds live-cell; dashed = parity)",
+                     fontsize=12, fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(score_dir / "cp_live_recovery_ratio.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [{tag}] Saved cp_live_recovery_ratio.png")
+
+        # ==============================================================
+        # PLOT 8: Winner table
+        # ==============================================================
+        fig, ax = plt.subplots(figsize=(2.5 + 2.5 * nm, max(3, 0.6 * len(organelles) + 1)))
+        ax.set_axis_off()
+        cell_text, cell_colors = [], []
+        for _, row in means_df.iterrows():
+            rt, rc = [], []
+            for short, _, _ in score_metrics:
+                va, vb = row[_mk("a", "cp", short)], row[_mk("b", "cp", short)]
+                d = vb - va
+                if abs(d) < 0.005:
+                    rc.append("#F5F5F5")
+                    rt.append(f"~tie ({d:+.3f})")
+                elif d > 0:
+                    t = min(d / 0.15, 1.0)
+                    rc.append(matplotlib.colors.to_hex((0.78 - 0.24*t, 0.9 - 0.16*t, 0.82 - 0.12*t)))
+                    rt.append(f"{METHOD_B} +{d:.3f}")
+                else:
+                    t = min(-d / 0.15, 1.0)
+                    rc.append(matplotlib.colors.to_hex((0.82 - 0.12*t, 0.78 - 0.2*t, 0.9 - 0.16*t)))
+                    rt.append(f"{METHOD_A} +{-d:.3f}")
+            cell_text.append(rt)
+            cell_colors.append(rc)
+
+        tbl = ax.table(cellText=cell_text, cellColours=cell_colors,
+                       rowLabels=[_pretty(o) for o in means_df["organelle"]],
+                       colLabels=metric_names,
+                       loc="center", cellLoc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(10)
+        tbl.scale(1.2, 1.8)
+        for j in range(nm):
+            tbl[0, j].set_text_props(fontweight="bold")
+            tbl[0, j].set_facecolor("#E0E0E0")
+        ax.set_title(f"CP-Side {sl} Winner (NTC norm)", fontsize=13, fontweight="bold", pad=20)
+        fig.tight_layout()
+        fig.savefig(score_dir / "winner_table.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [{tag}] Saved winner_table.png")
+
+        # ==============================================================
+        # PER-EXPERIMENT PLOTS — show every (organelle, experiment) row
+        # with marker name and cell count annotations
+        # ==============================================================
+        exp_dir = score_dir / "per_experiment"
+        exp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build per-experiment labels: "ops0089 | GFP TOMM70A (1234 cells)"
+        exp_labels = []
+        for _, row in merged.iterrows():
+            exp_short = row["live_experiment"].split("_")[0] if "_" in str(row["live_experiment"]) else str(row["live_experiment"])
+            marker = str(row.get("notes_a", row.get("notes_b", "")))
+            if not marker or marker == "nan":
+                marker = _pretty(row["organelle_type"])
+            n_cells = row.get("n_cells_used_a", row.get("n_cells_used_b", ""))
+            n_cells_str = f"{int(n_cells):,}" if pd.notna(n_cells) and n_cells != "" else "?"
+            exp_labels.append(f"{exp_short} | {marker}\n({n_cells_str} cells)")
+
+        # PLOT E1: Per-experiment grouped bar — method A vs B, one panel per metric
+        for side, side_label in [("cp", "CP-Side"), ("live", "Live-Cell")]:
+            nm = len(score_metrics)
+            panel_w = max(6, 0.9 * len(merged))
+            fig, axes = plt.subplots(1, nm, figsize=(panel_w * nm, 6), squeeze=False)
+            axes = axes.ravel()
+            x = np.arange(len(merged))
+            w = 0.35
+
+            for idx, (short, cp_col, live_col) in enumerate(score_metrics):
+                ax = axes[idx]
+                col = cp_col if side == "cp" else live_col
+                vals_a = merged[f"{col}_a"].values
+                vals_b = merged[f"{col}_b"].values
+
+                bar_colors_a = [org_colors[o] for o in merged["organelle_type"]]
+                ax.bar(x - w / 2, vals_a, w, color=bar_colors_a, alpha=0.85,
+                       edgecolor="white", lw=0.5, label=METHOD_A)
+                ax.bar(x + w / 2, vals_b, w, color=bar_colors_a, alpha=0.45,
+                       edgecolor="white", lw=0.5, hatch="//", label=METHOD_B)
+
+                ax.set_xticks(x)
+                ax.set_xticklabels(exp_labels, rotation=55, ha="right", fontsize=6)
+                ax.set_ylabel(_score_label(score_name, short))
+                ax.set_title(_pretty(short), fontweight="bold")
+                ax.set_ylim(bottom=0)
+                _clean(ax)
+                if idx == nm - 1:
+                    _add_legend(ax, fontsize=5, loc="upper right", ncol=2)
+
+            fig.suptitle(f"Per-Experiment {side_label}: {METHOD_A} (solid) vs {METHOD_B} (hatched)",
+                         fontsize=12, fontweight="bold")
+            fig.tight_layout()
+            fname = f"exp_{side}_by_experiment.png"
+            fig.savefig(exp_dir / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}/per_experiment] Saved {fname}")
+
+        # PLOT E2: Per-experiment scatter — A vs B, colored by organelle
+        for side, side_label in [("cp", "CP-Side"), ("live", "Live-Cell")]:
+            nm = len(score_metrics)
+            fig, axes = plt.subplots(1, nm, figsize=(6 * nm, 6), squeeze=False)
+            axes = axes.ravel()
+
+            for idx, (short, cp_col, live_col) in enumerate(score_metrics):
+                ax = axes[idx]
+                col = cp_col if side == "cp" else live_col
+
+                for org_type in organelles:
+                    sub = merged[merged["organelle_type"] == org_type]
+                    ax.scatter(sub[f"{col}_a"], sub[f"{col}_b"],
+                               c=org_colors[org_type], s=70, alpha=0.85,
+                               edgecolors="white", lw=0.5, label=_pretty(org_type), zorder=3)
+                    # Annotate each point with experiment short name
+                    for _, r in sub.iterrows():
+                        exp_short = str(r["live_experiment"]).split("_")[0]
+                        ax.annotate(exp_short, (r[f"{col}_a"], r[f"{col}_b"]),
+                                    fontsize=5, alpha=0.7, ha="left",
+                                    xytext=(4, 2), textcoords="offset points")
+
+                hi = max(merged[f"{col}_a"].max(), merged[f"{col}_b"].max()) * 1.15
+                ax.plot([0, hi], [0, hi], "k--", alpha=0.25, lw=1)
+                ax.set_xlabel(METHOD_A)
+                ax.set_ylabel(METHOD_B if idx == 0 else "")
+                ax.set_title(_pretty(short), fontweight="bold")
+                ax.set_xlim(left=0); ax.set_ylim(bottom=0)
+                _clean(ax)
+                if idx == 0:
+                    ax.legend(fontsize=6, loc="lower right")
+
+            fig.suptitle(f"Per-Experiment {side_label} {sl}: {METHOD_A} vs {METHOD_B}",
+                         fontsize=12, fontweight="bold")
+            fig.tight_layout()
+            fname = f"exp_{side}_scatter.png"
+            fig.savefig(exp_dir / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}/per_experiment] Saved {fname}")
+
+        # PLOT E3: Per-experiment delta heatmap — rows=experiments, cols=metrics
+        for side, side_label in [("cp", "CP-Side"), ("live", "Live-Cell")]:
+            nm = len(score_metrics)
+            exp_short_labels = []
+            for _, row in merged.iterrows():
+                es = str(row["live_experiment"]).split("_")[0]
+                marker = str(row.get("notes_a", row.get("notes_b", "")))
+                if not marker or marker == "nan":
+                    marker = _pretty(row["organelle_type"])
+                exp_short_labels.append(f"{es} | {marker}")
+
+            delta = np.zeros((len(merged), nm))
+            for j, (short, cp_col, live_col) in enumerate(score_metrics):
+                col = cp_col if side == "cp" else live_col
+                va = pd.to_numeric(merged[f"{col}_a"], errors="coerce").fillna(0).values
+                vb = pd.to_numeric(merged[f"{col}_b"], errors="coerce").fillna(0).values
+                delta[:, j] = vb - va
+
+            n_rows = len(merged)
+            fig, ax = plt.subplots(figsize=(4 + 2.5 * nm, max(6, 0.6 * n_rows + 2)))
+            vmax = max(np.abs(delta).max(), 0.01)
+            sns.heatmap(delta, ax=ax,
+                        xticklabels=[_pretty(s) for s, _, _ in score_metrics],
+                        yticklabels=exp_short_labels,
+                        cmap="RdBu_r", center=0, vmin=-vmax, vmax=vmax,
+                        annot=True, fmt=".3f", annot_kws={"fontsize": 8},
+                        linewidths=0.5, linecolor="white",
+                        cbar_kws={"label": f"{METHOD_B} - {METHOD_A}", "shrink": 0.7})
+            ax.set_title(f"Per-Experiment {side_label} {sl} Delta\n"
+                         f"+ = {METHOD_B} better, - = {METHOD_A} better",
+                         fontweight="bold")
+            ax.tick_params(axis="y", rotation=0, labelsize=8)
+            fig.tight_layout()
+            fname = f"exp_{side}_delta_heatmap.png"
+            fig.savefig(exp_dir / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}/per_experiment] Saved {fname}")
+
+        # PLOT E4: Per-experiment combined CP+Live — 4 bars per experiment
+        for short, cp_col, live_col in score_metrics:
+            n_exp = len(merged)
+            fig, ax = plt.subplots(figsize=(max(14, 1.5 * n_exp), 6))
+            x = np.arange(n_exp)
+            w = 0.2
+            offsets = [-1.5 * w, -0.5 * w, 0.5 * w, 1.5 * w]
+            exp_bar_colors = [org_colors[o] for o in merged["organelle_type"]]
+            # solid=CP, lighter=Live; no-hatch=OrgProfiler, hatched=DinoV3
+            bar_specs = [
+                (f"{cp_col}_a", METHOD_A + " CP", 0.85, ""),
+                (f"{live_col}_a", METHOD_A + " Live", 0.45, ""),
+                (f"{cp_col}_b", METHOD_B + " CP", 0.85, "//"),
+                (f"{live_col}_b", METHOD_B + " Live", 0.45, "//"),
+            ]
+            for (col_key, label, alpha, hatch), off in zip(bar_specs, offsets):
+                ax.bar(x + off, merged[col_key].values, w,
+                       label=label, color=exp_bar_colors, alpha=alpha,
+                       hatch=hatch, edgecolor="white", lw=0.5)
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(exp_labels, rotation=55, ha="right", fontsize=6)
+            ax.set_ylabel(_score_label(score_name, short))
+            ax.set_title(f"Per-Experiment {_pretty(short)}: CP vs Live per Method",
+                         fontweight="bold")
+            # Custom legend: 4 bar types + organelle colors
+            from matplotlib.patches import Patch
+            method_handles = [
+                Patch(facecolor="#888", alpha=0.85, edgecolor="white",
+                      label=f"{METHOD_A} CP (solid, dark)"),
+                Patch(facecolor="#888", alpha=0.45, edgecolor="white",
+                      label=f"{METHOD_A} Live (solid, light)"),
+                Patch(facecolor="#888", alpha=0.85, edgecolor="white", hatch="//",
+                      label=f"{METHOD_B} CP (hatched, dark)"),
+                Patch(facecolor="#888", alpha=0.45, edgecolor="white", hatch="//",
+                      label=f"{METHOD_B} Live (hatched, light)"),
+            ]
+            org_handles = [Patch(facecolor=org_colors[o], edgecolor="white",
+                                 label=_pretty(o)) for o in organelles]
+            ax.legend(handles=method_handles + org_handles, fontsize=5,
+                      ncol=2, loc="upper right", framealpha=0.9)
+            ax.set_ylim(bottom=0)
+            _clean(ax)
+            fig.tight_layout()
+            fname = f"exp_combined_cp_live_{short}.png"
+            fig.savefig(exp_dir / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [{tag}/per_experiment] Saved {fname}")
+
+    # ==================================================================
+    # Per-gene plots (scoring-independent — use raw mAP from CSVs)
+    # ==================================================================
+
+    # Active gene overlap per organelle
+    overlap_data = []
+    for org_type in organelles:
+        rows = merged[merged["organelle_type"] == org_type]
+        live_exp = rows.iloc[0]["live_experiment"].split("_")[0]
+        path_a = org_dir / "per_organelle" / org_type / f"cp_activity_{live_exp}.csv"
+        path_b = dino_dir / "per_organelle" / org_type / f"cp_activity_{live_exp}.csv"
+        if path_a.exists() and path_b.exists():
+            act_a = pd.read_csv(path_a)
+            act_b = pd.read_csv(path_b)
+            active_a = set(act_a.loc[act_a["below_corrected_p"] == True, "perturbation"])
+            active_b = set(act_b.loc[act_b["below_corrected_p"] == True, "perturbation"])
+            overlap_data.append({
+                "organelle": org_type,
+                "both": len(active_a & active_b),
+                "a_only": len(active_a - active_b),
+                "b_only": len(active_b - active_a),
+            })
+
+    if overlap_data:
+        ov_df = pd.DataFrame(overlap_data)
+        n = len(ov_df)
+        fig, axes = plt.subplots(1, n, figsize=(3 * n, 4), squeeze=False)
+        axes = axes.ravel()
+        for i, row in ov_df.iterrows():
+            ax = axes[i]
+            cats = ["Both", f"{METHOD_A}\nonly", f"{METHOD_B}\nonly"]
+            vals = [row["both"], row["a_only"], row["b_only"]]
+            bars = ax.bar(cats, vals, color=[COLOR_BOTH, COLOR_A, COLOR_B], edgecolor="white")
+            for bar, v in zip(bars, vals):
+                if v > 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                            str(v), ha="center", va="bottom", fontsize=9, fontweight="bold")
+            ax.set_title(_pretty(row["organelle"]), fontweight="bold",
+                         color=org_colors[row["organelle"]])
+            _clean(ax)
+            ax.set_ylabel("# Active Genes" if i == 0 else "")
+        fig.suptitle(f"Active Gene Overlap: CP-side ({METHOD_A} vs {METHOD_B})",
+                     fontsize=13, fontweight="bold", y=1.03)
+        fig.tight_layout()
+        fig.savefig(out_dir / "active_gene_overlap.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved active_gene_overlap.png")
+
+        # -- Nicer overlap: stacked horizontal bars + Jaccard lollipop --
+        n_ov = len(ov_df)
+        fig, (ax_bar, ax_jacc) = plt.subplots(
+            1, 2, figsize=(13, max(4, 0.8 * n_ov + 1.5)),
+            gridspec_kw={"width_ratios": [3, 1]},
+        )
+
+        y = np.arange(n_ov)
+        labels = [_pretty(o) for o in ov_df["organelle"]]
+        a_only = ov_df["a_only"].values.astype(float)
+        both_vals = ov_df["both"].values.astype(float)
+        b_only = ov_df["b_only"].values.astype(float)
+        totals = a_only + both_vals + b_only
+
+        # Stacked horizontal bars
+        ax_bar.barh(y, a_only, height=0.6, color=COLOR_A,
+                    label=f"{METHOD_A} only", edgecolor="white", lw=0.5)
+        ax_bar.barh(y, both_vals, height=0.6, left=a_only, color=COLOR_BOTH,
+                    label="Shared", edgecolor="white", lw=0.5)
+        ax_bar.barh(y, b_only, height=0.6, left=a_only + both_vals, color=COLOR_B,
+                    label=f"{METHOD_B} only", edgecolor="white", lw=0.5)
+
+        # Annotate counts inside bars (only if segment is wide enough)
+        max_total = max(totals) if len(totals) else 1
+        for i in range(n_ov):
+            for val, left in [
+                (a_only[i], 0.0),
+                (both_vals[i], a_only[i]),
+                (b_only[i], a_only[i] + both_vals[i]),
+            ]:
+                if val > 0 and val / max_total > 0.06:
+                    ax_bar.text(left + val / 2, y[i], str(int(val)),
+                                ha="center", va="center",
+                                fontsize=9, fontweight="bold", color="white")
+
+        ax_bar.set_yticks(y)
+        ax_bar.set_yticklabels(labels, fontsize=10)
+        ax_bar.set_xlabel("# Active Genes (CP-side)")
+        ax_bar.legend(fontsize=8, loc="lower right")
+        _clean(ax_bar)
+
+        # Jaccard lollipop (|A∩B| / |A∪B|)
+        jaccard = np.where(totals > 0, both_vals / totals, 0)
+        dot_colors = [org_colors[o] for o in ov_df["organelle"]]
+        ax_jacc.hlines(y, 0, jaccard, color="gray", alpha=0.4, lw=2)
+        ax_jacc.scatter(jaccard, y, c=dot_colors, s=90, zorder=3,
+                        edgecolors="white", lw=0.8)
+        for i in range(n_ov):
+            ax_jacc.text(jaccard[i] + 0.03, y[i], f"{jaccard[i]:.0%}",
+                         va="center", fontsize=9)
+        ax_jacc.set_xlim(0, 1.05)
+        ax_jacc.set_yticks([])
+        ax_jacc.set_xlabel("Jaccard Index")
+        _clean(ax_jacc)
+
+        fig.suptitle(
+            f"Active Gene Overlap: {METHOD_A} vs {METHOD_B} (CP-side)",
+            fontsize=13, fontweight="bold", y=1.02,
+        )
+        fig.tight_layout()
+        fig.savefig(out_dir / "active_gene_overlap_detailed.png",
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved active_gene_overlap_detailed.png")
+
+    # Per-gene mAP correlation scatter
+    gene_frames = []
+    for org_type in organelles:
+        rows = merged[merged["organelle_type"] == org_type]
+        live_exp = rows.iloc[0]["live_experiment"].split("_")[0]
+        path_a = org_dir / "per_organelle" / org_type / f"cp_activity_{live_exp}.csv"
+        path_b = dino_dir / "per_organelle" / org_type / f"cp_activity_{live_exp}.csv"
+        if path_a.exists() and path_b.exists():
+            ga = pd.read_csv(path_a)[["perturbation", "mean_average_precision"]].rename(
+                columns={"mean_average_precision": "mAP_a"})
+            gb = pd.read_csv(path_b)[["perturbation", "mean_average_precision"]].rename(
+                columns={"mean_average_precision": "mAP_b"})
+            gm = ga.merge(gb, on="perturbation")
+            gm["organelle"] = org_type
+            gene_frames.append(gm)
+
+    if gene_frames:
+        gene_df = pd.concat(gene_frames, ignore_index=True)
+        fig, ax = plt.subplots(figsize=(7, 7))
+        for org_type in organelles:
+            sub = gene_df[gene_df["organelle"] == org_type]
+            if sub.empty:
+                continue
+            ax.scatter(sub["mAP_a"], sub["mAP_b"], c=org_colors[org_type],
+                       s=10, alpha=0.35, rasterized=True, label=_pretty(org_type))
+        hi = max(gene_df["mAP_a"].max(), gene_df["mAP_b"].max()) * 1.05
+        ax.plot([0, hi], [0, hi], "k--", alpha=0.25)
+        ax.set_xlabel(f"{METHOD_A} mAP (per gene)")
+        ax.set_ylabel(f"{METHOD_B} mAP (per gene)")
+        ax.set_title(f"Per-Gene Activity mAP: {METHOD_A} vs {METHOD_B} (CP-side)",
+                     fontweight="bold")
+        ax.legend(fontsize=7, loc="lower right", markerscale=2, framealpha=0.9)
+        ax.set_xlim(left=0); ax.set_ylim(bottom=0)
+        ax.set_aspect("equal"); _clean(ax)
+        try:
+            from scipy.stats import pearsonr
+            r, _ = pearsonr(gene_df["mAP_a"], gene_df["mAP_b"])
+            ax.text(0.05, 0.95, f"r = {r:.3f}  (n={len(gene_df)})",
+                    transform=ax.transAxes, fontsize=10, va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+        except ImportError:
+            pass
+        fig.tight_layout()
+        fig.savefig(out_dir / "per_gene_mAP_correlation.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved per_gene_mAP_correlation.png")
+
+    # ==================================================================
+    # Per-experiment perturbation overlap — all 4 metrics
+    # ==================================================================
+    # CSV filename patterns for each metric (CP-side)
+    _metric_csv = [
+        ("activity", "cp_activity_{exp}.csv"),
+        ("distinctiveness", "cp_distinctiveness_{exp}.csv"),
+        ("consistency_corum", "cp_consistency_corum_{exp}.csv"),
+        ("consistency_manual", "cp_consistency_manual_{exp}.csv"),
+    ]
+
+    # Collect overlap data: one record per (experiment, metric)
+    # Also track per-perturbation significance across metrics for disagreement analysis
+    exp_overlap_records = []
+    # per_pert_records: {(exp, org, perturbation)} -> {metric: "both"|"a_only"|"b_only"|"neither"}
+    per_pert_significance = {}
+    for _, row in merged.iterrows():
+        org_type = row["organelle_type"]
+        live_exp_full = str(row["live_experiment"])
+        live_short = live_exp_full.split("_")[0] if "_" in live_exp_full else live_exp_full
+        marker = str(row.get("notes_a", row.get("notes_b", "")))
+        if not marker or marker == "nan":
+            marker = _pretty(org_type)
+
+        for metric_name, csv_tpl in _metric_csv:
+            csv_name = csv_tpl.format(exp=live_short)
+            path_a = org_dir / "per_organelle" / org_type / csv_name
+            path_b = dino_dir / "per_organelle" / org_type / csv_name
+            if not (path_a.exists() and path_b.exists()):
+                continue
+            try:
+                df_ma = pd.read_csv(path_a)
+                df_mb = pd.read_csv(path_b)
+                sig_a = set(df_ma.loc[df_ma["below_corrected_p"] == True, "perturbation"])
+                sig_b = set(df_mb.loc[df_mb["below_corrected_p"] == True, "perturbation"])
+            except Exception:
+                continue
+
+            shared = len(sig_a & sig_b)
+            a_only = len(sig_a - sig_b)
+            b_only = len(sig_b - sig_a)
+            total = shared + a_only + b_only
+            exp_overlap_records.append({
+                "experiment": live_short,
+                "organelle": org_type,
+                "marker": marker,
+                "metric": metric_name,
+                "shared": shared,
+                "a_only": a_only,
+                "b_only": b_only,
+                "total": total,
+                "pct_shared": shared / total * 100 if total > 0 else 0,
+                "pct_a_only": a_only / total * 100 if total > 0 else 0,
+                "pct_b_only": b_only / total * 100 if total > 0 else 0,
+            })
+
+            # Track per-perturbation status for disagreement analysis
+            all_perts = set(df_ma["perturbation"]) | set(df_mb["perturbation"])
+            for p in all_perts:
+                key = (live_short, org_type, marker, p)
+                if key not in per_pert_significance:
+                    per_pert_significance[key] = {}
+                in_a = p in sig_a
+                in_b = p in sig_b
+                if in_a and in_b:
+                    per_pert_significance[key][metric_name] = "both"
+                elif in_a:
+                    per_pert_significance[key][metric_name] = "a_only"
+                elif in_b:
+                    per_pert_significance[key][metric_name] = "b_only"
+                else:
+                    per_pert_significance[key][metric_name] = "neither"
+
+    if exp_overlap_records:
+        ov_exp_df = pd.DataFrame(exp_overlap_records)
+        ov_exp_df.to_csv(out_dir / "per_experiment_perturbation_overlap.csv", index=False)
+        print(f"  Saved per_experiment_perturbation_overlap.csv ({len(ov_exp_df)} rows)")
+
+        exp_overlap_dir = out_dir / "per_experiment"
+        exp_overlap_dir.mkdir(parents=True, exist_ok=True)
+
+        metrics_found = ov_exp_df["metric"].unique()
+        _metric_pretty = {
+            "activity": "Active",
+            "distinctiveness": "Distinct",
+            "consistency_corum": "CORUM Consistent",
+            "consistency_manual": "CHAD Consistent",
+        }
+
+        # --- PLOT: Stacked % bar per experiment, one panel per metric ---
+        nm = len(metrics_found)
+        exp_ids = ov_exp_df.drop_duplicates(subset=["experiment", "organelle"])[
+            ["experiment", "organelle", "marker"]
+        ].values.tolist()
+        n_exp = len(exp_ids)
+
+        fig, axes = plt.subplots(1, nm, figsize=(max(8, 1.2 * n_exp) * nm / max(nm, 2), 6),
+                                 squeeze=False)
+        axes = axes.ravel()
+
+        for mi, metric in enumerate(metrics_found):
+            ax = axes[mi]
+            sub = ov_exp_df[ov_exp_df["metric"] == metric].reset_index(drop=True)
+            y = np.arange(len(sub))
+            labels = [f"{r['experiment']} | {r['marker']}" for _, r in sub.iterrows()]
+
+            ax.barh(y, sub["pct_shared"], height=0.6, color=COLOR_BOTH,
+                    label="Shared", edgecolor="white", lw=0.5)
+            ax.barh(y, sub["pct_a_only"], height=0.6, left=sub["pct_shared"],
+                    color=COLOR_A, label=f"{METHOD_A} only", edgecolor="white", lw=0.5)
+            ax.barh(y, sub["pct_b_only"], height=0.6,
+                    left=sub["pct_shared"].values + sub["pct_a_only"].values,
+                    color=COLOR_B, label=f"{METHOD_B} only", edgecolor="white", lw=0.5)
+
+            # Annotate counts inside bars
+            for i, r in sub.iterrows():
+                total = r["total"]
+                if total == 0:
+                    continue
+                cx = 0.0
+                for val, key in [(r["shared"], "shared"), (r["a_only"], "a_only"), (r["b_only"], "b_only")]:
+                    pct = val / total * 100 if total else 0
+                    if pct > 8:
+                        ax.text(cx + pct / 2, i, str(int(val)),
+                                ha="center", va="center", fontsize=7,
+                                fontweight="bold", color="white")
+                    cx += pct
+
+            ax.set_yticks(y)
+            ax.set_yticklabels(labels if mi == 0 else [""] * len(labels), fontsize=7)
+            ax.set_xlim(0, 105)
+            ax.set_xlabel("% of Significant Perturbations")
+            ax.set_title(f"{_metric_pretty.get(metric, _pretty(metric))}\n(mAP p < 0.05)",
+                         fontweight="bold")
+            _clean(ax)
+            if mi == 0:
+                ax.legend(fontsize=7, loc="lower right")
+
+        fig.suptitle(f"Per-Experiment Perturbation Overlap: {METHOD_A} vs {METHOD_B} (CP-side)",
+                     fontsize=12, fontweight="bold", y=1.02)
+        fig.tight_layout()
+        fig.savefig(exp_overlap_dir / "perturbation_overlap_pct.png",
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [per_experiment] Saved perturbation_overlap_pct.png")
+
+        # --- PLOT: Absolute count stacked bar (same layout) ---
+        fig, axes = plt.subplots(1, nm, figsize=(max(8, 1.2 * n_exp) * nm / max(nm, 2), 6),
+                                 squeeze=False)
+        axes = axes.ravel()
+
+        for mi, metric in enumerate(metrics_found):
+            ax = axes[mi]
+            sub = ov_exp_df[ov_exp_df["metric"] == metric].reset_index(drop=True)
+            y = np.arange(len(sub))
+            labels = [f"{r['experiment']} | {r['marker']}" for _, r in sub.iterrows()]
+
+            ax.barh(y, sub["shared"], height=0.6, color=COLOR_BOTH,
+                    label="Shared", edgecolor="white", lw=0.5)
+            ax.barh(y, sub["a_only"], height=0.6, left=sub["shared"],
+                    color=COLOR_A, label=f"{METHOD_A} only", edgecolor="white", lw=0.5)
+            ax.barh(y, sub["b_only"], height=0.6,
+                    left=sub["shared"].values + sub["a_only"].values,
+                    color=COLOR_B, label=f"{METHOD_B} only", edgecolor="white", lw=0.5)
+
+            # Annotate counts
+            max_total = sub["total"].max() if len(sub) else 1
+            for i, r in sub.iterrows():
+                cx = 0.0
+                for val in [r["shared"], r["a_only"], r["b_only"]]:
+                    if val > 0 and val / max(max_total, 1) > 0.06:
+                        ax.text(cx + val / 2, i, str(int(val)),
+                                ha="center", va="center", fontsize=7,
+                                fontweight="bold", color="white")
+                    cx += val
+
+            ax.set_yticks(y)
+            ax.set_yticklabels(labels if mi == 0 else [""] * len(labels), fontsize=7)
+            ax.set_xlabel("# Significant Perturbations")
+            ax.set_title(f"{_metric_pretty.get(metric, _pretty(metric))}\n(mAP p < 0.05)",
+                         fontweight="bold")
+            _clean(ax)
+            if mi == 0:
+                ax.legend(fontsize=7, loc="lower right")
+
+        fig.suptitle(f"Per-Experiment Perturbation Overlap: {METHOD_A} vs {METHOD_B} (CP-side)",
+                     fontsize=12, fontweight="bold", y=1.02)
+        fig.tight_layout()
+        fig.savefig(exp_overlap_dir / "perturbation_overlap_counts.png",
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [per_experiment] Saved perturbation_overlap_counts.png")
+
+        # --- PLOT: Heatmap of Jaccard index — experiments × metrics ---
+        pivot = ov_exp_df.copy()
+        pivot["jaccard"] = np.where(
+            pivot["total"] > 0, pivot["shared"] / pivot["total"], 0
+        )
+        pivot["exp_label"] = pivot["experiment"] + " | " + pivot["marker"]
+        heat_df = pivot.pivot_table(
+            index="exp_label", columns="metric", values="jaccard", aggfunc="first"
+        )
+        # Reorder columns to match standard order
+        col_order = [m for m in ["activity", "distinctiveness",
+                                  "consistency_corum", "consistency_manual"]
+                     if m in heat_df.columns]
+        heat_df = heat_df[col_order]
+        heat_df.columns = [_metric_pretty.get(c, _pretty(c)) for c in col_order]
+
+        fig, ax = plt.subplots(figsize=(3 + 2 * len(col_order),
+                                        max(5, 0.5 * len(heat_df) + 2)))
+        sns.heatmap(heat_df.fillna(0), ax=ax, cmap="YlGnBu",
+                    vmin=0, vmax=1, annot=True, fmt=".0%",
+                    annot_kws={"fontsize": 9},
+                    linewidths=0.5, linecolor="white",
+                    cbar_kws={"label": "Jaccard Index", "shrink": 0.7})
+        ax.set_title(f"Perturbation Overlap Jaccard: {METHOD_A} vs {METHOD_B}\n"
+                     f"(1 = identical hits, 0 = no overlap)",
+                     fontweight="bold")
+        ax.tick_params(axis="y", rotation=0, labelsize=8)
+        ax.tick_params(axis="x", rotation=25, labelsize=9)
+        fig.tight_layout()
+        fig.savefig(exp_overlap_dir / "perturbation_overlap_jaccard_heatmap.png",
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [per_experiment] Saved perturbation_overlap_jaccard_heatmap.png")
+
+    # ==================================================================
+    # Concordance analysis — agreement vs disagreement between methods
+    # ==================================================================
+    if per_pert_significance:
+        _metric_pretty_dis = {
+            "activity": "Active",
+            "distinctiveness": "Distinct",
+            "consistency_corum": "CORUM",
+            "consistency_manual": "CHAD",
+        }
+        _metric_order = ["activity", "distinctiveness",
+                         "consistency_corum", "consistency_manual"]
+
+        # Build per-perturbation records (for CSV + D3 pattern plot)
+        dis_records = []
+        for (exp, org, marker, pert), metric_map in per_pert_significance.items():
+            n_a_only = sum(1 for v in metric_map.values() if v == "a_only")
+            n_b_only = sum(1 for v in metric_map.values() if v == "b_only")
+            n_disagree = n_a_only + n_b_only
+            n_metrics = len(metric_map)
+            if n_disagree == 0:
+                continue
+            rec = {
+                "experiment": exp,
+                "organelle": org,
+                "marker": marker,
+                "perturbation": pert,
+                "n_disagree": n_disagree,
+                "n_a_only": n_a_only,
+                "n_b_only": n_b_only,
+                "n_metrics": n_metrics,
+            }
+            for m in _metric_order:
+                rec[m] = metric_map.get(m, "neither")
+            dis_records.append(rec)
+
+        # Compute per (experiment, metric) concordance breakdown
+        # 4 categories: both_sig, both_nonsig, a_only_sig, b_only_sig
+        concordance_records = []
+        exp_keys = sorted(set((e, o, m) for (e, o, m, _) in per_pert_significance))
+        for exp, org, marker in exp_keys:
+            for metric in _metric_order:
+                n_both = 0
+                n_neither = 0
+                n_a_only = 0
+                n_b_only = 0
+                n_total = 0
+                for (e, o, m, p), mmap in per_pert_significance.items():
+                    if e != exp or o != org:
+                        continue
+                    status = mmap.get(metric)
+                    if status is None:
+                        continue
+                    n_total += 1
+                    if status == "both":
+                        n_both += 1
+                    elif status == "neither":
+                        n_neither += 1
+                    elif status == "a_only":
+                        n_a_only += 1
+                    elif status == "b_only":
+                        n_b_only += 1
+                if n_total == 0:
+                    continue
+                concordance_records.append({
+                    "experiment": exp,
+                    "organelle": org,
+                    "marker": marker,
+                    "metric": metric,
+                    "n_total": n_total,
+                    "both_sig": n_both,
+                    "both_nonsig": n_neither,
+                    "a_only_sig": n_a_only,
+                    "b_only_sig": n_b_only,
+                    "pct_agree": (n_both + n_neither) / n_total * 100,
+                    "pct_both_sig": n_both / n_total * 100,
+                    "pct_both_nonsig": n_neither / n_total * 100,
+                    "pct_a_only": n_a_only / n_total * 100,
+                    "pct_b_only": n_b_only / n_total * 100,
+                })
+
+        conc_df = pd.DataFrame(concordance_records)
+        disagree_dir = out_dir / "per_experiment"
+        disagree_dir.mkdir(parents=True, exist_ok=True)
+
+        if not conc_df.empty:
+            conc_df.to_csv(out_dir / "method_concordance.csv", index=False)
+            print(f"  Saved method_concordance.csv ({len(conc_df)} rows)")
+
+            # -- PLOT C1: 4-panel concordance canvas --
+            # One panel per metric, stacked horizontal bars per experiment
+            # Segments: Both Sig | A-only Sig | B-only Sig | Both Non-Sig
+            avail_metrics = [m for m in _metric_order if m in conc_df["metric"].values]
+            nm_c = len(avail_metrics)
+            exp_ids = conc_df.drop_duplicates(subset=["experiment", "organelle"])[
+                ["experiment", "organelle", "marker"]
+            ].values.tolist()
+            n_exp_c = len(exp_ids)
+
+            fig, axes = plt.subplots(1, nm_c,
+                                     figsize=(max(7, 1.2 * n_exp_c) * nm_c / max(nm_c, 2),
+                                              max(5, 0.6 * n_exp_c + 2)),
+                                     squeeze=False)
+            axes = axes.ravel()
+
+            COLOR_AGREE_SIG = "#4CAF50"    # green — both methods agree: significant
+            COLOR_AGREE_NS = "#E0E0E0"     # light gray — both agree: not significant
+            COLOR_DIS_A = COLOR_A           # blue — only OrgProfiler
+            COLOR_DIS_B = COLOR_B           # teal — only DinoV3
+
+            for mi, metric in enumerate(avail_metrics):
+                ax = axes[mi]
+                sub = conc_df[conc_df["metric"] == metric].reset_index(drop=True)
+                y = np.arange(len(sub))
+                labels = [f"{r['experiment']} | {r['marker']}" for _, r in sub.iterrows()]
+
+                # Stacked horizontal: Both-Sig, A-only, B-only, Both-NonSig
+                ax.barh(y, sub["pct_both_sig"], height=0.6, color=COLOR_AGREE_SIG,
+                        label="Both Significant", edgecolor="white", lw=0.5)
+                left = sub["pct_both_sig"].values
+                ax.barh(y, sub["pct_a_only"], height=0.6, left=left,
+                        color=COLOR_DIS_A, label=f"{METHOD_A} only", edgecolor="white", lw=0.5)
+                left = left + sub["pct_a_only"].values
+                ax.barh(y, sub["pct_b_only"], height=0.6, left=left,
+                        color=COLOR_DIS_B, label=f"{METHOD_B} only", edgecolor="white", lw=0.5)
+                left = left + sub["pct_b_only"].values
+                ax.barh(y, sub["pct_both_nonsig"], height=0.6, left=left,
+                        color=COLOR_AGREE_NS, label="Both Not Significant",
+                        edgecolor="white", lw=0.5)
+
+                # Annotate counts inside segments
+                for i, r in sub.iterrows():
+                    cx = 0.0
+                    for pct_key, cnt_key in [("pct_both_sig", "both_sig"),
+                                              ("pct_a_only", "a_only_sig"),
+                                              ("pct_b_only", "b_only_sig"),
+                                              ("pct_both_nonsig", "both_nonsig")]:
+                        pct = r[pct_key]
+                        cnt = int(r[cnt_key])
+                        if pct > 6 and cnt > 0:
+                            fc = "white" if pct_key != "pct_both_nonsig" else "#555"
+                            ax.text(cx + pct / 2, i, str(cnt),
+                                    ha="center", va="center", fontsize=7,
+                                    fontweight="bold", color=fc)
+                        cx += pct
+
+                ax.set_yticks(y)
+                ax.set_yticklabels(labels if mi == 0 else [""] * len(labels), fontsize=7)
+                ax.set_xlim(0, 105)
+                ax.set_xlabel("% of All Perturbations")
+                ax.set_title(f"{_metric_pretty_dis.get(metric, _pretty(metric))}\n(mAP p < 0.05)",
+                             fontweight="bold")
+                _clean(ax)
+                if mi == 0:
+                    ax.legend(fontsize=6, loc="lower right")
+
+            fig.suptitle(
+                f"Method Concordance: {METHOD_A} vs {METHOD_B} (CP-side)\n"
+                f"How much do the two methods agree on which perturbations are significant?",
+                fontsize=12, fontweight="bold", y=1.04,
+            )
+            fig.tight_layout()
+            fig.savefig(disagree_dir / "concordance_breakdown.png",
+                        dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [per_experiment] Saved concordance_breakdown.png")
+
+            # -- PLOT C2: Concordance heatmap — % agreement per experiment × metric --
+            pivot_conc = conc_df.copy()
+            pivot_conc["exp_label"] = pivot_conc["experiment"] + " | " + pivot_conc["marker"]
+            heat_conc = pivot_conc.pivot_table(
+                index="exp_label", columns="metric", values="pct_agree", aggfunc="first"
+            )
+            col_order_c = [m for m in _metric_order if m in heat_conc.columns]
+            heat_conc = heat_conc[col_order_c]
+            heat_conc.columns = [_metric_pretty_dis.get(c, c) for c in col_order_c]
+
+            fig, ax = plt.subplots(figsize=(3 + 2 * len(col_order_c),
+                                            max(5, 0.5 * len(heat_conc) + 2)))
+            sns.heatmap(heat_conc.fillna(0), ax=ax, cmap="RdYlGn",
+                        vmin=50, vmax=100, annot=True, fmt=".0f",
+                        annot_kws={"fontsize": 9},
+                        linewidths=0.5, linecolor="white",
+                        cbar_kws={"label": "% Agreement", "shrink": 0.7})
+            ax.set_title(
+                f"Method Agreement: {METHOD_A} vs {METHOD_B}\n"
+                f"(% perturbations where both methods agree — sig or not sig)",
+                fontweight="bold",
+            )
+            ax.tick_params(axis="y", rotation=0, labelsize=8)
+            ax.tick_params(axis="x", rotation=25, labelsize=9)
+            fig.tight_layout()
+            fig.savefig(disagree_dir / "concordance_heatmap.png",
+                        dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [per_experiment] Saved concordance_heatmap.png")
+
+        # Save disagreement CSV
+        if dis_records:
+            dis_df = pd.DataFrame(dis_records).sort_values(
+                "n_disagree", ascending=False
+            ).reset_index(drop=True)
+            dis_df.to_csv(out_dir / "perturbation_disagreements.csv", index=False)
+            print(f"  Saved perturbation_disagreements.csv ({len(dis_df)} perturbations)")
+
+            # -- PLOT D3: Disagreement pattern summary --
+            # How many perturbations have each pattern of disagreement
+            # e.g., "disagree on 1 metric", "disagree on 2", etc.
+            # Split by direction: mostly A-only vs mostly B-only
+            pattern_records = []
+            for _, r in dis_df.iterrows():
+                if r["n_a_only"] > r["n_b_only"]:
+                    direction = f"{METHOD_A} finds more"
+                elif r["n_b_only"] > r["n_a_only"]:
+                    direction = f"{METHOD_B} finds more"
+                else:
+                    direction = "Mixed"
+                pattern_records.append({
+                    "n_disagree": r["n_disagree"],
+                    "direction": direction,
+                })
+            pat_df = pd.DataFrame(pattern_records)
+            pat_summary = pat_df.groupby(["n_disagree", "direction"]).size().reset_index(name="count")
+
+            fig, ax = plt.subplots(figsize=(8, 5))
+            directions = pat_summary["direction"].unique()
+            dir_colors = {
+                f"{METHOD_A} finds more": COLOR_A,
+                f"{METHOD_B} finds more": COLOR_B,
+                "Mixed": COLOR_BOTH,
+            }
+            max_dis = int(pat_summary["n_disagree"].max())
+            x_vals = np.arange(1, max_dis + 1)
+            bottom = np.zeros(len(x_vals))
+            for direction in [f"{METHOD_A} finds more", "Mixed", f"{METHOD_B} finds more"]:
+                if direction not in directions:
+                    continue
+                sub = pat_summary[pat_summary["direction"] == direction]
+                heights = np.zeros(len(x_vals))
+                for _, r in sub.iterrows():
+                    idx = int(r["n_disagree"]) - 1
+                    if 0 <= idx < len(heights):
+                        heights[idx] = r["count"]
+                ax.bar(x_vals, heights, bottom=bottom, color=dir_colors.get(direction, "#888"),
+                       label=direction, edgecolor="white", lw=0.5, alpha=0.85)
+                bottom += heights
+
+            ax.set_xticks(x_vals)
+            ax.set_xticklabels([f"{i} of {len(_metric_order)}" for i in x_vals])
+            ax.set_xlabel("# Metrics with Disagreement")
+            ax.set_ylabel("# Perturbations")
+            ax.set_title(f"Disagreement Pattern: how many metrics disagree per perturbation\n"
+                         f"(color = which method calls it significant)",
+                         fontweight="bold", fontsize=11)
+            ax.legend(fontsize=8)
+            _clean(ax)
+            fig.tight_layout()
+            fig.savefig(disagree_dir / "disagreement_pattern.png",
+                        dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [per_experiment] Saved disagreement_pattern.png")
+
+    # ------------------------------------------------------------------
+    # Console summary
+    # ------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"  SUMMARY: CP-Side scores (mean across organelles)")
+    print(f"{'='*60}")
+    for score_name, score_metrics in scoring_systems:
+        sl = _score_label(score_name)
+        print(f"\n  [{sl}]")
+        for short, _, _ in score_metrics:
+            col_a = f"a_cp_{score_name}_{short}"
+            col_b = f"b_cp_{score_name}_{short}"
+            ma = means_df[col_a].mean()
+            mb = means_df[col_b].mean()
+            winner = METHOD_B if mb > ma else METHOD_A
+            d = abs(mb - ma)
+            print(f"    {_pretty(short):20s}  {METHOD_A}={ma:.4f}  {METHOD_B}={mb:.4f}  "
+                  f"Winner={winner} (+{d:.4f})")
+    print(f"{'='*60}")
+    print(f"\nDone. {out_dir}")
 
 
 if __name__ == "__main__":
