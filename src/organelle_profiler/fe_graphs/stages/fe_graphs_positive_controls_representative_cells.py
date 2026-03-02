@@ -363,7 +363,7 @@ def _collect_viz_data_fast(
             else:
                 # Discover available labels if not yet cached
                 if not hasattr(_collect_viz_data_fast, '_available_labels'):
-                    from ...fe_metadata import _discover_available_labels
+                    from ...feature_extraction.fe_metadata import _discover_available_labels
                     _collect_viz_data_fast._available_labels = _discover_available_labels(morphology_path)
                 available_labels = _collect_viz_data_fast._available_labels
 
@@ -677,7 +677,7 @@ def visualize_representative_cells(
 
         # Build available_labels for organelle detection (do this once)
         if available_labels is None:
-            from ...fe_metadata import _discover_available_labels
+            from ...feature_extraction.fe_metadata import _discover_available_labels
             available_labels = _discover_available_labels(morphology_path)
 
         # ============================================================
@@ -959,7 +959,7 @@ def visualize_representative_cells(
                     logger.warning("    Mappings not provided - building locally (slower)")
                     # Fallback: discover from zarr store
                     from iohub import open_ome_zarr
-                    from ...fe_metadata import _discover_available_labels
+                    from ...feature_extraction.fe_metadata import _discover_available_labels
 
                     with open_ome_zarr(morphology_path, mode="r") as pheno_store:
                         channel_names = list(pheno_store.channel_names) if hasattr(pheno_store, 'channel_names') else []
@@ -1161,7 +1161,7 @@ def _generate_representative_cell_canvas(
     # Discover available labels ONCE for all cells (not per-cell!)
     available_labels = None
     if morphology_path is not None:
-        from ...fe_metadata import _discover_available_labels
+        from ...feature_extraction.fe_metadata import _discover_available_labels
         available_labels = _discover_available_labels(morphology_path)
     
     n_cells = len(viz_data_list)

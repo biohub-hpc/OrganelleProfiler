@@ -101,7 +101,7 @@ def list_available_options():
 def main():
     """Main execution function."""
     from ops_utils.data.filesystem import resolve_experiment_name
-    from .fe_graphs import AnalysisOrchestrator
+    from .fe_graphs_orchestrator import AnalysisOrchestrator
     
     parser = argparse.ArgumentParser(
         description="Generate graphs from morphological feature data (v3 - stage-based architecture).",
@@ -349,7 +349,7 @@ def run_graphs(experiment: str, **kwargs):
             - skip_stages: List of stages to skip
     """
     from ops_utils.data.filesystem import resolve_experiment_name
-    from .fe_graphs import AnalysisOrchestrator
+    from .fe_graphs_orchestrator import AnalysisOrchestrator
 
     # Resolve experiment name
     resolved_experiment = resolve_experiment_name(

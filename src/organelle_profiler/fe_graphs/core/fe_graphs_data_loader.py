@@ -316,7 +316,7 @@ class DataLoader:
 
         if morphology_path and morphology_path.exists():
             from iohub import open_ome_zarr
-            from ...fe_metadata import _discover_available_labels
+            from ...feature_extraction.fe_metadata import _discover_available_labels
 
             # Get channel names from zarr store
             try:
