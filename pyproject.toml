@@ -36,7 +36,6 @@ dependencies = [
     "dask",
     "statsmodels",
     "copairs",
-    "maayanlab-bioinformatics",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +49,7 @@ interactive = [
 rapids = [
     "cucim-cu12>=25.6",
     "cuml-cu12>=25.6",
+    "maayanlab-bioinformatics",
 ]
 all = [
     "organelle_profiler[interactive,rapids]",
