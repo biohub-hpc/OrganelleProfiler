@@ -142,9 +142,9 @@ class VolcanoEnrichmentStage(BaseStage):
                     logger.info(f"Using top features from upstream differential stats (abs_zscore)")
                     return top[:n_top]
 
-        # Fallback: raw feature variance
+        # Fallback: raw feature variance (float64 to avoid overflow)
         logger.info("Computing feature variance for ranking (no upstream differential)")
-        variances = features.var().sort_values(ascending=False)
+        variances = features.astype(np.float64).var().sort_values(ascending=False)
         return variances.head(n_top).index.tolist()
 
     # ------------------------------------------------------------------
@@ -161,6 +161,8 @@ class VolcanoEnrichmentStage(BaseStage):
         """Compute per-gene log2FC and p-value for each top feature vs NTC."""
         from statsmodels.stats.multitest import fdrcorrection
 
+        # Cast to float64 to avoid overflow in variance/std computations
+        features = features[top_features].astype(np.float64)
         ntc_features = features.loc[ntc_mask]
         # At gene level there may be only 1 row per gene
         min_samples = {"cell": 5, "guide": 2, "gene": 1}.get(self.level, 2)
@@ -367,6 +369,24 @@ class VolcanoEnrichmentStage(BaseStage):
                 if len(gene_list) >= min_genes:
                     jobs.append((feat, direction, gene_list))
 
+        # Save the gene lists used for enrichment
+        gene_list_rows = []
+        for feat, direction, gene_list in jobs:
+            for rank, gene in enumerate(gene_list, 1):
+                row = {"feature": feat, "direction": direction, "rank": rank, "gene_name": gene}
+                # Add fold-change from stats
+                match = stats_df[(stats_df["feature"] == feat) & (stats_df["gene_name"] == gene)]
+                if not match.empty:
+                    row["log2_fold_change"] = match.iloc[0]["log2_fold_change"]
+                    row["pvalue_adj"] = match.iloc[0].get("pvalue_adj", np.nan)
+                gene_list_rows.append(row)
+        if gene_list_rows:
+            gene_list_df = pd.DataFrame(gene_list_rows)
+            csv_path = output_dir / "enrichment_gene_lists.csv"
+            gene_list_df.to_csv(csv_path, index=False)
+            result.add_file(csv_path)
+            logger.info(f"Saved enrichment gene lists: {len(gene_list_rows)} entries")
+
         logger.info(f"Running {len(jobs)} enrichment queries with {num_workers} workers")
 
         def _run_single_enrichment(args):
@@ -530,7 +550,8 @@ class VolcanoEnrichmentStage(BaseStage):
     ) -> None:
         """
         For each positive control cluster, find top-3 discriminating features
-        (by Cohen's d), generate volcano plots + enrichment in a per-cluster subdir.
+        (by Cohen's d), then generate volcano plots showing ALL perturbations
+        with cluster members highlighted, plus enrichment on the top-20 up/down.
         """
         import yaml
 
@@ -564,19 +585,21 @@ class VolcanoEnrichmentStage(BaseStage):
         logger.info(f"Running volcano+enrichment for {len(clusters)} positive control clusters "
                      f"(top {top_features_per_cluster} features each)")
 
+        # Cast to float64 to avoid overflow in variance/std computations
+        features_f64 = features.astype(np.float64)
+
         # Compute Cohen's d per cluster to find top discriminating features
         cluster_top_features = {}
         for cluster_name, cluster_genes in clusters.items():
             cluster_mask = df[gene_col].isin(cluster_genes)
-            n_cluster = cluster_mask.sum()
-            if n_cluster < 1:
+            if cluster_mask.sum() < 1:
                 continue
 
-            cluster_feat = features.loc[cluster_mask]
-            other_feat = features.loc[~cluster_mask]
+            cluster_feat = features_f64.loc[cluster_mask]
+            other_feat = features_f64.loc[~cluster_mask]
 
             scores = []
-            for feat in features.columns:
+            for feat in features_f64.columns:
                 c_vals = cluster_feat[feat].dropna()
                 o_vals = other_feat[feat].dropna()
                 if len(c_vals) < 1 or len(o_vals) < 2:
@@ -590,27 +613,40 @@ class VolcanoEnrichmentStage(BaseStage):
                         ((n1 - 1) * c_vals.std() ** 2 + (n2 - 1) * o_vals.std() ** 2)
                         / (n1 + n2 - 2)
                     )
-                if pooled_std == 0:
+                if pooled_std == 0 or not np.isfinite(pooled_std):
                     continue
-                scores.append({
-                    "feature": feat,
-                    "cohens_d": (mean_c - mean_o) / pooled_std,
-                })
+                d = (mean_c - mean_o) / pooled_std
+                if not np.isfinite(d):
+                    continue
+                scores.append({"feature": feat, "cohens_d": d})
 
             if not scores:
                 continue
-
             scores_df = pd.DataFrame(scores)
             scores_df["abs_d"] = scores_df["cohens_d"].abs()
-            top = scores_df.nlargest(top_features_per_cluster, "abs_d")
-            cluster_top_features[cluster_name] = top["feature"].tolist()
+            cluster_top_features[cluster_name] = (
+                scores_df.nlargest(top_features_per_cluster, "abs_d")["feature"].tolist()
+            )
 
         if not cluster_top_features:
             logger.warning("No clusters had enough data to compute discriminating features")
             return
 
-        # Now generate volcano plots + enrichment for each cluster's top features
-        # Try to load speedenrich (may have been loaded in step 4)
+        # Collect ALL unique features needed across all clusters, compute stats ONCE
+        all_pc_features = list({f for feats in cluster_top_features.values() for f in feats})
+        logger.info(f"Computing per-gene stats for {len(all_pc_features)} cluster features "
+                     f"across ALL perturbations")
+        all_pc_stats = self._compute_per_gene_stats(
+            features, df, ntc_mask, all_pc_features
+        )
+        if all_pc_stats.empty:
+            logger.warning("No per-gene stats computed for positive control features")
+            return
+        n_pc_genes = all_pc_stats["gene_name"].nunique()
+        n_pc_feats = all_pc_stats["feature"].nunique()
+        logger.info(f"Positive control stats: {n_pc_genes} genes × {n_pc_feats} features = {len(all_pc_stats)} rows")
+
+        # Try to load speedenrich
         speedenrich = None
         try:
             import importlib.util, sys as _sys
@@ -628,6 +664,8 @@ class VolcanoEnrichmentStage(BaseStage):
         libraries = self.analysis_config.enrichr_libraries
         n_top_enrich = 20
         min_genes = self.analysis_config.volcano_enrichment_min_genes
+        p_thresh = self.analysis_config.volcano_p_threshold
+        fc_thresh = self.analysis_config.volcano_log2fc_threshold
         from matplotlib import patheffects
 
         for cluster_name, top_feats in tqdm(
@@ -636,48 +674,36 @@ class VolcanoEnrichmentStage(BaseStage):
             safe_cluster = cluster_name[:40].replace("/", "_").replace(" ", "_")
             cluster_dir = output_dir / safe_cluster
             cluster_dir.mkdir(exist_ok=True)
+            cluster_genes_set = set(clusters[cluster_name])
 
-            # Compute per-gene stats for this cluster's top features
-            cluster_stats = self._compute_per_gene_stats(
-                features, df, ntc_mask, top_feats
-            )
-            if cluster_stats.empty:
-                continue
-
-            # Save stats
-            cluster_stats.to_csv(cluster_dir / "per_gene_stats.csv", index=False)
-            result.add_file(cluster_dir / "per_gene_stats.csv")
-
-            # Generate volcano plots annotated with cluster name
-            p_thresh = self.analysis_config.volcano_p_threshold
-            fc_thresh = self.analysis_config.volcano_log2fc_threshold
-
+            # Generate volcano plots: ALL perturbations, cluster highlighted
             for feat in top_feats:
-                feat_data = cluster_stats[cluster_stats["feature"] == feat].copy()
+                feat_data = all_pc_stats[all_pc_stats["feature"] == feat].copy()
                 if feat_data.empty:
                     continue
 
                 fig, ax = plt.subplots(figsize=self.plot_config.figsize_volcano)
 
-                # Highlight cluster genes
-                cluster_genes_set = set(clusters[cluster_name])
                 is_cluster = feat_data["gene_name"].isin(cluster_genes_set)
+                n_total = len(feat_data)
+                n_cluster = is_cluster.sum()
+                logger.info(f"  {cluster_name} / {feat}: {n_total} total genes, {n_cluster} in cluster")
 
-                # Plot non-cluster genes (gray)
+                # All perturbations (gray background)
                 ax.scatter(
                     feat_data.loc[~is_cluster, "log2_fold_change"],
                     feat_data.loc[~is_cluster, "neg_log10_padj"],
-                    c="lightgray", alpha=0.4, s=25, label="Other genes", zorder=1,
+                    c="#aaaaaa", alpha=0.5, s=30,
+                    label=f"Other genes ({n_total - n_cluster})", zorder=1,
                 )
-                # Plot cluster genes (colored, larger)
+                # Cluster genes highlighted (red, large)
                 if is_cluster.any():
                     ax.scatter(
                         feat_data.loc[is_cluster, "log2_fold_change"],
                         feat_data.loc[is_cluster, "neg_log10_padj"],
-                        c="#d62728", alpha=0.9, s=100, edgecolors="black",
-                        linewidths=0.8, label=cluster_name, zorder=3,
+                        c="#d62728", alpha=0.95, s=120, edgecolors="black",
+                        linewidths=0.8, label=f"{cluster_name} ({n_cluster})", zorder=3,
                     )
-                    # Label all cluster genes
                     for _, row in feat_data.loc[is_cluster].iterrows():
                         ax.annotate(
                             row["gene_name"],
@@ -689,11 +715,10 @@ class VolcanoEnrichmentStage(BaseStage):
                             ],
                         )
 
-                # Also label top-20 non-cluster genes by |FC|
+                # Label top-20 non-cluster genes by |FC|
                 non_cluster = feat_data.loc[~is_cluster].copy()
                 non_cluster["abs_log2fc"] = non_cluster["log2_fold_change"].abs()
-                top_other = non_cluster.nlargest(20, "abs_log2fc")
-                for _, row in top_other.iterrows():
+                for _, row in non_cluster.nlargest(20, "abs_log2fc").iterrows():
                     ax.annotate(
                         row["gene_name"],
                         (row["log2_fold_change"], row["neg_log10_padj"]),
@@ -717,17 +742,16 @@ class VolcanoEnrichmentStage(BaseStage):
                     fontsize=11,
                 )
                 ax.legend(loc="upper right", fontsize=8)
-
                 plt.tight_layout()
                 safe_feat = feat[:50].replace("/", "_").replace(" ", "_")
                 path = save_figure(fig, cluster_dir / f"volcano_{safe_feat}.png")
                 result.add_file(path)
 
-            # Run enrichment on this cluster's top features
+            # Enrichment on top-20 up/down for each feature
             if speedenrich is not None:
                 jobs = []
                 for feat in top_feats:
-                    feat_data = cluster_stats[cluster_stats["feature"] == feat].copy()
+                    feat_data = all_pc_stats[all_pc_stats["feature"] == feat]
                     if feat_data.empty:
                         continue
                     pos_fc = feat_data[feat_data["log2_fold_change"] > 0].nlargest(
@@ -743,6 +767,26 @@ class VolcanoEnrichmentStage(BaseStage):
                         if len(gene_list) >= min_genes:
                             jobs.append((feat, direction, gene_list))
 
+                # Save gene lists for this cluster
+                if jobs:
+                    gl_rows = []
+                    for feat, direction, gene_list in jobs:
+                        for rank, gene in enumerate(gene_list, 1):
+                            row = {"feature": feat, "direction": direction, "rank": rank, "gene_name": gene}
+                            match = all_pc_stats[
+                                (all_pc_stats["feature"] == feat) & (all_pc_stats["gene_name"] == gene)
+                            ]
+                            if not match.empty:
+                                row["log2_fold_change"] = match.iloc[0]["log2_fold_change"]
+                                row["pvalue_adj"] = match.iloc[0].get("pvalue_adj", np.nan)
+                            row["in_cluster"] = gene in cluster_genes_set
+                            gl_rows.append(row)
+                    if gl_rows:
+                        pd.DataFrame(gl_rows).to_csv(
+                            cluster_dir / "enrichment_gene_lists.csv", index=False
+                        )
+                        result.add_file(cluster_dir / "enrichment_gene_lists.csv")
+
                 if jobs:
                     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -750,8 +794,7 @@ class VolcanoEnrichmentStage(BaseStage):
                         feat, direction, gene_list = args
                         try:
                             enr_df = speedenrich(
-                                userlist=gene_list,
-                                libraries=libraries,
+                                userlist=gene_list, libraries=libraries,
                                 background=background_genes,
                             )
                             if enr_df is not None and not enr_df.empty:
