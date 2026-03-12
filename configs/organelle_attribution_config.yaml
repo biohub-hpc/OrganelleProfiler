@@ -9,11 +9,9 @@
 # Storage roots to search for dino features (in priority order)
 storage_roots:
   - /hpc/projects/icd.fast.ops
-  - /hpc/projects/intracellular_dashboard/ops
-  - /hpc/projects/icd.ops
 
 # Directory name under 3-assembly containing dino anndata objects
-feature_dir: dino_features_v1
+feature_dir: dino_features
 
 # Combination strategy: biology-aware uses concatenate_experiments_comprehensive
 # to pool same-biology channels vertically, then horizontally concat different ones.
@@ -45,4 +43,4 @@ slurm:
   partition: cpu
   mem: 256GB
   cpus_per_task: 16
-  time_min: 120
+  time_min: 480

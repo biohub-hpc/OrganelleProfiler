@@ -7,8 +7,9 @@ Workflow:
 1. Discover all experiments with dino guide_bulked_*.h5ad files, filter bad experiments
 2. Build biology-aware coembedding via concatenate_experiments_comprehensive
 3. Run the 4 copairs mAP metrics (activity, distinctiveness, CORUM, CHAD) on full features
-4. For each channel label, remove that label's features and re-run mAP metrics
-5. Compute deltas to reveal each organelle's contribution + which perturbations depend on it
+4. Greedy backward elimination (knock-out): cumulatively remove least important channel
+5. Greedy forward selection (knock-in): cumulatively add most impactful channel
+6. Compute deltas to reveal each organelle's contribution + which perturbations depend on it
 
 Usage:
   # Local mode:
@@ -16,17 +17,19 @@ Usage:
 
   # SLURM mode:
   python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage --slurm
-  python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage --slurm --slurm-memory 256GB
+  python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage --slurm --slurm-memory 500GB
 
 CLI arguments:
   -o, --output-dir      Output directory (default: auto-generated)
   --config              Path to config YAML (default: organelle_attribution_config.yaml)
   --norm-method         Normalization method(s): global, ntc, or both (default: both)
+  --fast                Per-channel PCA reduction for faster iteration (~50-80x fewer features)
+  --variance-threshold  Cumulative explained variance for PCA (default: 0.95)
   --dry-run             Discover experiments/channels and print summary without loading data
 
 SLURM options:
   --slurm               Submit as a single SLURM job
-  --slurm-memory        Memory (default: 256GB)
+  --slurm-memory        Memory (default: 500GB)
   --slurm-time          Time limit in minutes (default: 120)
   --slurm-cpus          CPUs (default: 16)
 """
@@ -75,11 +78,9 @@ DEFAULT_CONFIG_PATH = Path(__file__).parents[4] / "configs" / "organelle_attribu
 CHANNEL_MAPS_PATH = Path("/hpc/projects/icd.fast.ops/configs/ops_channel_maps.yaml")
 CHANNEL_MAPS_PATH_FALLBACK = Path("/hpc/projects/intracellular_dashboard/ops/configs/ops_channel_maps.yaml")
 
-# Storage roots to search for dino features (priority order)
+# Storage roots to search for dino features
 DEFAULT_STORAGE_ROOTS = [
     Path("/hpc/projects/icd.fast.ops"),
-    Path("/hpc/projects/intracellular_dashboard/ops"),
-    Path("/hpc/projects/icd.ops"),
 ]
 
 
@@ -116,6 +117,7 @@ class OrganelleAttributionStage(BaseStage):
 
     STAGE_NUMBER = 13
     STAGE_NAME = "organelle_attribution"
+    VALID_METRICS = ("activity", "distinctiveness", "corum", "chad")
 
     def __init__(
         self,
@@ -124,11 +126,17 @@ class OrganelleAttributionStage(BaseStage):
         level: str = "guide",
         norm_methods: Optional[List[str]] = None,
         config_path: Optional[Path] = None,
+        fast_mode: bool = False,
+        variance_threshold: float = 0.95,
         **kwargs,
     ):
+        self.mode = kwargs.pop("mode", "all")  # "all", "knockout", or "knockin"
+        self.metric = kwargs.pop("metric", "activity")  # which metric drives scoring
         super().__init__(data_context, config, level, **kwargs)
-        self.norm_methods = norm_methods or ["ntc", "global"]
+        self.norm_methods = norm_methods or ["ntc"]
         self.config_path = config_path or DEFAULT_CONFIG_PATH
+        self.fast_mode = fast_mode
+        self.variance_threshold = variance_threshold
 
         # Load attribution config
         if self.config_path.exists():
@@ -141,7 +149,7 @@ class OrganelleAttributionStage(BaseStage):
         self._storage_roots = [
             Path(p) for p in self.attr_config.get("storage_roots", [str(p) for p in DEFAULT_STORAGE_ROOTS])
         ]
-        self._feature_dir = self.attr_config.get("feature_dir", "dino_features_v1")
+        self._feature_dir = self.attr_config.get("feature_dir", "dino_features")
         self._feature_type = self.attr_config.get("feature_type", "dinov3")
         self._join = self.attr_config.get("join", "inner")
 
@@ -172,7 +180,7 @@ class OrganelleAttributionStage(BaseStage):
         # Step 1b: Build signal_map from resolved channel labels so the combiner
         #          groups by the same labels as dry-run (bypasses FeatureMetadata)
         import io, contextlib, warnings as _warnings
-        from ops_model.data.feature_metadata import FeatureMetadata
+        from ops_utils.data.feature_metadata import FeatureMetadata
         fm = FeatureMetadata(metadata_path=str(CHANNEL_MAPS_PATH) if CHANNEL_MAPS_PATH.exists() else str(CHANNEL_MAPS_PATH_FALLBACK))
         signal_map: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
         # Suppress FeatureMetadata's bare print() warnings during reverse lookup
@@ -213,11 +221,11 @@ class OrganelleAttributionStage(BaseStage):
         base_output_dir = self.output_dir
         for norm_method in self.norm_methods:
             logger.info(f"\n{'='*70}")
-            logger.info(f"  NORMALIZATION: {norm_method}")
+            logger.info(f"  NORMALIZATION: {norm_method} | METRIC: {self.metric} | MODE: {self.mode}")
             logger.info(f"{'='*70}")
 
-            # Each norm method gets its own output subdirectory
-            norm_dir = base_output_dir / f"{norm_method}_norm"
+            # Each norm method + metric gets its own output subdirectory
+            norm_dir = base_output_dir / f"{norm_method}_norm" / self.metric
             norm_dir.mkdir(parents=True, exist_ok=True)
             self._output_dir = norm_dir
 
@@ -235,32 +243,68 @@ class OrganelleAttributionStage(BaseStage):
             )
             logger.info(f"  Normalization done: {time.time()-t_norm:.1f}s")
 
+            # Step 4b: Combined PCA reduction for baseline (fast mode)
+            if self.fast_mode:
+                t_pca = time.time()
+                logger.info(
+                    f"Step 4b: Combined PCA reduction "
+                    f"(variance threshold={self.variance_threshold:.0%})..."
+                )
+                baseline_guide, baseline_gene, n_pcs, expl_var = (
+                    self._pca_reduce_combined(adata_guide, adata_gene, label="baseline")
+                )
+                logger.info(
+                    f"  PCA: {adata_guide.n_vars} → {n_pcs} PCs "
+                    f"({expl_var:.1%} variance, {time.time()-t_pca:.1f}s)"
+                )
+                # Save reduction report
+                report_df = pd.DataFrame([{
+                    "original_features": adata_guide.n_vars,
+                    "kept_components": n_pcs,
+                    "explained_variance": expl_var,
+                }])
+                report_df.to_csv(self.output_dir / "pca_reduction_report.csv", index=False)
+            else:
+                baseline_guide, baseline_gene = adata_guide, adata_gene
+
             # Step 5: Baseline mAP
             logger.info("Step 5: Running baseline mAP battery...")
-            baseline = self._run_map_battery(adata_guide, adata_gene, "baseline")
+            baseline = self._run_map_battery(baseline_guide, baseline_gene, "baseline")
             if baseline is None:
                 result.add_error(f"Baseline mAP computation failed ({norm_method} norm)")
                 continue
 
             self._save_baseline(baseline, result)
-            logger.info(f"  Baseline ({norm_method}): activity={baseline['active_ratio']:.2%}, "
-                         f"distinct={baseline['distinctive_ratio']:.2%}")
-
-            # Step 6: Leave-one-out ablation
-            logger.info("Step 6: Leave-one-out ablation...")
-            ablation_results = self._leave_one_out(
-                adata_guide, adata_gene, label_to_cols, baseline
+            logger.info(
+                f"  Baseline ({norm_method}, {self.metric}): "
+                f"AUC={self._get_metric_score(baseline):.4f}, "
+                f"ratio={self._get_metric_ratio(baseline):.2%}"
             )
 
-            # Step 7: Compute attribution and generate outputs
-            logger.info("Step 7: Computing attribution and generating outputs...")
-            self._compute_and_save_attribution(baseline, ablation_results, label_to_cols, result)
+            # Step 6: Greedy backward elimination (cumulative knock-out)
+            # Pass RAW normalized data + label_to_cols; PCA is redone per candidate
+            if self.mode in ("all", "knockout"):
+                logger.info("Step 6: Greedy backward elimination (knock-out)...")
+                ablation_results = self._greedy_backward_elimination(
+                    adata_guide, adata_gene, label_to_cols, baseline,
+                    norm_method, result,
+                )
 
-            # Step 8: Greedy forward selection — minimal set for full coverage
-            logger.info("Step 8: Greedy forward selection for minimal coverage set...")
-            self._greedy_minimal_set(
-                adata_guide, adata_gene, label_to_cols, baseline, norm_method, result
-            )
+                # Step 7: Compute attribution and generate outputs
+                logger.info("Step 7: Computing attribution and generating outputs...")
+                self._compute_and_save_attribution(baseline, ablation_results, label_to_cols, result)
+            else:
+                logger.info("Skipping knock-out (mode=%s)", self.mode)
+
+            # Step 8: Greedy forward selection (cumulative knock-in)
+            # Pass RAW normalized data + label_to_cols; PCA is redone per candidate
+            if self.mode in ("all", "knockin"):
+                logger.info("Step 8: Greedy forward selection (knock-in)...")
+                self._greedy_minimal_set(
+                    adata_guide, adata_gene, label_to_cols, baseline, norm_method, result
+                )
+            else:
+                logger.info("Skipping knock-in (mode=%s)", self.mode)
 
         # Restore base output dir
         self._output_dir = base_output_dir
@@ -486,7 +530,7 @@ class OrganelleAttributionStage(BaseStage):
 
     def dry_run(self) -> None:
         """Discover experiments/channels and print summary without loading data."""
-        from ops_model.data.feature_metadata import FeatureMetadata
+        from ops_utils.data.feature_metadata import FeatureMetadata
         from collections import defaultdict
 
         print("\n" + "=" * 80)
@@ -619,6 +663,7 @@ class OrganelleAttributionStage(BaseStage):
             adata_guide, adata_gene = concatenate_experiments_comprehensive(
                 experiments_channels=exp_channel_pairs,
                 feature_type=self._feature_type,
+                base_dir=str(self._storage_roots[0]),
                 feature_dir=self._feature_dir,
                 recompute_embeddings=False,
                 compute_pca=False,
@@ -729,8 +774,166 @@ class OrganelleAttributionStage(BaseStage):
         return adata_guide, adata_gene
 
     # -------------------------------------------------------------------------
+    # Step 4b: Per-channel PCA reduction (fast mode)
+    # -------------------------------------------------------------------------
+
+    # Minimum features per channel group to attempt PCA (smaller groups kept as-is)
+    _MIN_FEATURES_FOR_PCA = 10
+
+    def _pca_reduce_combined(
+        self,
+        adata_guide: ad.AnnData,
+        adata_gene: ad.AnnData,
+        label: str = "",
+    ) -> Tuple[ad.AnnData, ad.AnnData, int, float]:
+        """
+        Combined PCA reduction across ALL features in the given AnnData objects.
+
+        Fits PCA on the guide-level data (typically more observations) and keeps
+        the minimum number of components to reach ``self.variance_threshold``
+        cumulative explained variance.  The same transform is applied to gene-level.
+
+        Parameters
+        ----------
+        adata_guide, adata_gene : AnnData
+            Input data (raw concatenated features from all included channels).
+        label : str
+            Label for logging (e.g. "baseline", "bwd_without_X").
+
+        Returns
+        -------
+        reduced_guide, reduced_gene : AnnData
+            PCA-reduced AnnData objects with PC0..PCn as var_names.
+        n_components : int
+            Number of PCs kept.
+        explained_variance : float
+            Cumulative explained variance of kept components.
+        """
+        from sklearn.decomposition import PCA
+
+        n_features = adata_guide.n_vars
+
+        X_guide = np.asarray(adata_guide.X, dtype=np.float64)
+        X_gene = np.asarray(adata_gene.X, dtype=np.float64)
+
+        # Replace NaN/inf
+        X_guide = np.nan_to_num(X_guide, nan=0.0, posinf=0.0, neginf=0.0)
+        X_gene = np.nan_to_num(X_gene, nan=0.0, posinf=0.0, neginf=0.0)
+
+        max_components = min(n_features, adata_guide.n_obs - 1)
+        pca = PCA(n_components=max_components)
+        guide_transformed = pca.fit_transform(X_guide)
+
+        # Find n_keep: minimum components to reach variance_threshold
+        cumvar = np.cumsum(pca.explained_variance_ratio_)
+        n_keep = int(np.searchsorted(cumvar, self.variance_threshold) + 1)
+        n_keep = max(n_keep, 1)
+        n_keep = min(n_keep, max_components)
+
+        explained = float(cumvar[n_keep - 1])
+
+        guide_reduced = guide_transformed[:, :n_keep].astype(np.float32)
+        gene_reduced = pca.transform(X_gene)[:, :n_keep].astype(np.float32)
+
+        pc_names = [f"PC{j}" for j in range(n_keep)]
+
+        reduced_guide = ad.AnnData(
+            X=guide_reduced,
+            obs=adata_guide.obs.copy(),
+            var=pd.DataFrame(index=pc_names),
+        )
+        reduced_gene = ad.AnnData(
+            X=gene_reduced,
+            obs=adata_gene.obs.copy(),
+            var=pd.DataFrame(index=pc_names),
+        )
+
+        return reduced_guide, reduced_gene, n_keep, explained
+
+    def _subset_channels(
+        self,
+        adata_guide: ad.AnnData,
+        adata_gene: ad.AnnData,
+        label_to_cols: Dict[str, List[str]],
+        keep_labels: set,
+    ) -> Tuple[ad.AnnData, ad.AnnData]:
+        """Subset AnnData to only features belonging to keep_labels channels."""
+        keep_cols = set()
+        for lbl in keep_labels:
+            keep_cols.update(label_to_cols[lbl])
+
+        all_guide = list(adata_guide.var_names)
+        all_gene = list(adata_gene.var_names)
+        mask_guide = np.array([v in keep_cols for v in all_guide])
+        mask_gene = np.array([v in keep_cols for v in all_gene])
+
+        return adata_guide[:, mask_guide].copy(), adata_gene[:, mask_gene].copy()
+
+    def _reduce_features_pca(
+        self,
+        adata_guide: ad.AnnData,
+        adata_gene: ad.AnnData,
+        label_to_cols: Dict[str, List[str]],
+    ) -> Tuple[ad.AnnData, ad.AnnData, Dict[str, List[str]]]:
+        """
+        Combined PCA reduction across all features.
+
+        Fits PCA on the full concatenated feature space (all channels together)
+        and keeps the minimum number of components to reach
+        ``self.variance_threshold`` cumulative explained variance.
+
+        This is used for the baseline computation.  Backward/forward elimination
+        steps redo PCA on each candidate subset independently via
+        ``_pca_reduce_combined``.
+
+        Returns
+        -------
+        new_adata_guide, new_adata_gene : AnnData
+            PCA-reduced AnnData objects.
+        label_to_cols : dict
+            Original label_to_cols (unchanged — elimination steps use raw features).
+        """
+        reduced_guide, reduced_gene, n_keep, explained = self._pca_reduce_combined(
+            adata_guide, adata_gene, label="baseline"
+        )
+
+        n_original = adata_guide.n_vars
+        logger.info(
+            f"  Combined PCA: {n_original} → {n_keep} PCs "
+            f"({explained:.1%} variance explained)"
+        )
+
+        # Save reduction report
+        report_df = pd.DataFrame([{
+            "original_features": n_original,
+            "kept_components": n_keep,
+            "explained_variance": explained,
+        }])
+        report_path = self.output_dir / "pca_reduction_report.csv"
+        report_df.to_csv(report_path, index=False)
+
+        # Return original label_to_cols — elimination steps need raw column mapping
+        return reduced_guide, reduced_gene, label_to_cols
+
+    # -------------------------------------------------------------------------
     # Step 5: mAP battery
     # -------------------------------------------------------------------------
+
+    # Mapping from metric name to result dict keys
+    _METRIC_KEYS = {
+        "activity":        {"auc": "activity_auc",  "ratio": "active_ratio"},
+        "distinctiveness": {"auc": "distinct_auc",   "ratio": "distinctive_ratio"},
+        "corum":           {"auc": "corum_auc",      "ratio": "corum_ratio"},
+        "chad":            {"auc": "chad_auc",       "ratio": "chad_ratio"},
+    }
+
+    def _get_metric_score(self, result_dict: Dict) -> float:
+        """Return the AUC score for the configured metric (used for greedy decisions)."""
+        return result_dict[self._METRIC_KEYS[self.metric]["auc"]]
+
+    def _get_metric_ratio(self, result_dict: Dict) -> float:
+        """Return the ratio score for the configured metric (used for plotting)."""
+        return result_dict[self._METRIC_KEYS[self.metric]["ratio"]]
 
     def _run_map_battery(
         self,
@@ -739,52 +942,71 @@ class OrganelleAttributionStage(BaseStage):
         run_label: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        Run all 4 mAP metrics + AUC scores.
+        Run the target mAP metric (+ activity as dependency).
 
-        Returns dict with all results or None on failure.
+        Only computes the metric specified by ``self.metric``.  Activity is
+        always computed first since distinctiveness/CORUM/CHAD depend on it.
+
+        Returns dict with results or None on failure.
         """
         try:
             t0 = time.time()
+            metric = self.metric
 
-            # 1. Activity (guide level)
-            logger.info(f"    [{run_label}] Running activity mAP ({adata_guide.n_obs} guides × {adata_guide.n_vars} features)...")
+            # 1. Activity (always needed — dependency for all other metrics)
             activity_map, active_ratio = phenotypic_activity_assesment(
                 adata_guide, plot_results=False
             )
             activity_auc = compute_auc_score(activity_map)
             activity_sweep = compute_threshold_sweep_auc(activity_map)
-            logger.info(f"    [{run_label}] Activity done ({time.time()-t0:.1f}s): {active_ratio:.2%} active")
+            logger.info(
+                f"    [{run_label}] Activity ({time.time()-t0:.1f}s): "
+                f"{active_ratio:.2%} active, AUC={activity_auc:.4f}"
+            )
 
             # 2. Distinctiveness (guide level)
-            t1 = time.time()
-            logger.info(f"    [{run_label}] Running distinctiveness mAP...")
-            distinct_map, distinctive_ratio = phenotypic_distinctivness(
-                adata_guide, activity_map, plot_results=False
-            )
-            distinct_auc = compute_auc_score(distinct_map)
-            distinct_sweep = compute_threshold_sweep_auc(distinct_map)
-            logger.info(f"    [{run_label}] Distinctiveness done ({time.time()-t1:.1f}s): {distinctive_ratio:.2%} distinct")
+            distinct_map, distinctive_ratio, distinct_auc, distinct_sweep = None, 0.0, 0.0, 0.0
+            if metric == "distinctiveness":
+                t1 = time.time()
+                distinct_map, distinctive_ratio = phenotypic_distinctivness(
+                    adata_guide, activity_map, plot_results=False
+                )
+                distinct_auc = compute_auc_score(distinct_map)
+                distinct_sweep = compute_threshold_sweep_auc(distinct_map)
+                logger.info(
+                    f"    [{run_label}] Distinctiveness ({time.time()-t1:.1f}s): "
+                    f"{distinctive_ratio:.2%}, AUC={distinct_auc:.4f}"
+                )
 
             # 3. CORUM consistency (gene level)
-            t2 = time.time()
-            logger.info(f"    [{run_label}] Running CORUM consistency mAP ({adata_gene.n_obs} genes)...")
-            corum_map, corum_ratio = phenotypic_consistency_corum(
-                adata_gene, activity_map, plot_results=False
-            )
-            corum_auc = compute_auc_score(corum_map)
-            corum_sweep = compute_threshold_sweep_auc(corum_map)
-            logger.info(f"    [{run_label}] CORUM done ({time.time()-t2:.1f}s): {corum_ratio:.2%}")
+            corum_map, corum_ratio, corum_auc, corum_sweep = None, 0.0, 0.0, 0.0
+            if metric == "corum":
+                t2 = time.time()
+                corum_map, corum_ratio = phenotypic_consistency_corum(
+                    adata_gene, activity_map, plot_results=False
+                )
+                corum_auc = compute_auc_score(corum_map)
+                corum_sweep = compute_threshold_sweep_auc(corum_map)
+                logger.info(
+                    f"    [{run_label}] CORUM ({time.time()-t2:.1f}s): "
+                    f"{corum_ratio:.2%}, AUC={corum_auc:.4f}"
+                )
 
             # 4. CHAD consistency (gene level)
-            t3 = time.time()
-            logger.info(f"    [{run_label}] Running CHAD consistency mAP...")
-            chad_map, chad_ratio = phenotypic_consistency_manual_annotation(
-                adata_gene, activity_map, plot_results=False
-            )
-            chad_auc = compute_auc_score(chad_map)
-            chad_sweep = compute_threshold_sweep_auc(chad_map)
-            logger.info(f"    [{run_label}] CHAD done ({time.time()-t3:.1f}s): {chad_ratio:.2%}")
-            logger.info(f"    [{run_label}] mAP battery total: {time.time()-t0:.1f}s")
+            chad_map, chad_ratio, chad_auc, chad_sweep = None, 0.0, 0.0, 0.0
+            if metric == "chad":
+                t3 = time.time()
+                chad_map, chad_ratio = phenotypic_consistency_manual_annotation(
+                    adata_gene, activity_map, plot_results=False
+                )
+                chad_auc = compute_auc_score(chad_map)
+                chad_sweep = compute_threshold_sweep_auc(chad_map)
+                logger.info(
+                    f"    [{run_label}] CHAD ({time.time()-t3:.1f}s): "
+                    f"{chad_ratio:.2%}, AUC={chad_auc:.4f}"
+                )
+
+            logger.info(f"    [{run_label}] Total: {time.time()-t0:.1f}s")
 
             return {
                 "label": run_label,
@@ -813,16 +1035,17 @@ class OrganelleAttributionStage(BaseStage):
             return None
 
     def _save_baseline(self, baseline: Dict, result: StageResult) -> None:
-        """Save baseline mAP results to CSV files."""
+        """Save baseline mAP results to CSV files (only for computed metrics)."""
         baseline_dir = self.output_dir / "baseline"
         baseline_dir.mkdir(parents=True, exist_ok=True)
 
         for key in ["activity_map", "distinct_map", "corum_map", "chad_map"]:
-            csv_path = baseline_dir / f"{key}.csv"
-            baseline[key].to_csv(csv_path, index=False)
-            result.add_file(csv_path)
+            if baseline[key] is not None:
+                csv_path = baseline_dir / f"{key}.csv"
+                baseline[key].to_csv(csv_path, index=False)
+                result.add_file(csv_path)
 
-        # Summary
+        # Summary (only include computed metrics)
         summary = {
             "metric": ["activity", "distinctiveness", "corum", "chad"],
             "ratio": [
@@ -849,90 +1072,281 @@ class OrganelleAttributionStage(BaseStage):
         result.add_file(summary_path)
 
     # -------------------------------------------------------------------------
-    # Step 6: Leave-one-out ablation
+    # Step 6: Greedy backward elimination (cumulative knock-out)
     # -------------------------------------------------------------------------
 
-    def _leave_one_out(
+    def _greedy_backward_elimination(
         self,
         adata_guide: ad.AnnData,
         adata_gene: ad.AnnData,
         label_to_cols: Dict[str, List[str]],
         baseline: Dict,
+        norm_method: str,
+        result: StageResult,
     ) -> List[Dict[str, Any]]:
         """
-        For each channel label, remove its features and re-run mAP battery.
+        Greedy backward elimination: cumulatively remove the least important channel.
+
+        Starting from all channels, at each step try removing each remaining
+        channel and permanently remove the one whose loss causes the least mAP
+        damage.  This produces an elimination ordering from least → most important
+        and a cumulative degradation curve.
+
+        Returns list of ablation result dicts (one per elimination step), ordered
+        from first-removed (least important) to last-removed (most important).
         """
-        ablation_results = []
-        n_labels = len(label_to_cols)
-        t_loo_start = time.time()
+        remaining = set(label_to_cols.keys())
+        elimination_order: List[str] = []
+        ablation_results: List[Dict[str, Any]] = []
 
-        for i, (label, cols_to_remove) in enumerate(sorted(label_to_cols.items()), 1):
-            t_iter = time.time()
-            logger.info(f"\n  Ablation {i}/{n_labels}: removing '{label}' ({len(cols_to_remove)} features)")
+        n_labels = len(remaining)
+        n_raw_features = adata_guide.n_vars
+        t_start = time.time()
 
-            # Create ablated AnnData by dropping columns
-            cols_set = set(cols_to_remove)
-            keep_mask = np.array([v not in cols_set for v in adata_guide.var_names])
+        # Track the "previous step" result — starts as the full baseline
+        prev_result = baseline
 
-            if keep_mask.sum() == 0:
-                logger.warning(f"  Skipping '{label}': would remove ALL features")
-                continue
+        steps: List[Dict[str, Any]] = []
+        # Step 0: full baseline
+        steps.append({
+            "step": 0,
+            "label_removed": "(none)",
+            "n_channels_remaining": n_labels,
+            "n_features_remaining": n_raw_features,
+            "metric_auc": self._get_metric_score(baseline),
+            "metric_ratio": self._get_metric_ratio(baseline),
+        })
 
-            ablated_guide = adata_guide[:, keep_mask].copy()
-            # For gene-level, use same column mask (var_names should match)
-            keep_mask_gene = np.array([v not in cols_set for v in adata_gene.var_names])
-            ablated_gene = adata_gene[:, keep_mask_gene].copy()
+        # Determine parallelism: use threads (PCA/numpy release GIL)
+        import os
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        n_workers = max(1, min(8, int(os.environ.get("SLURM_CPUS_PER_TASK", "4")) // 2))
+        logger.info(f"  Backward elimination across {n_labels} channel groups (workers={n_workers})...")
 
-            logger.info(f"  Ablated: {ablated_guide.n_vars} features remaining "
-                         f"(removed {len(cols_to_remove)})")
+        for step_num in range(1, n_labels):
+            # At each step, try removing each remaining channel from the current set
+            best_label = None
+            best_score = -np.inf
+            best_result_dict = None
 
-            # Run mAP battery on ablated data
-            abl_result = self._run_map_battery(ablated_guide, ablated_gene, label)
+            n_candidates = len(remaining)
+            logger.info(f"  Step {step_num}/{n_labels-1}: testing {n_candidates} candidates...")
 
-            if abl_result is None:
-                logger.warning(f"  mAP battery failed for ablation '{label}', skipping")
-                continue
+            def _eval_bwd_candidate(candidate):
+                """Evaluate removing one candidate channel."""
+                keep_labels = remaining - {candidate}
+                subset_guide, subset_gene = self._subset_channels(
+                    adata_guide, adata_gene, label_to_cols, keep_labels
+                )
+                if subset_guide.n_vars == 0:
+                    return candidate, None
+                if self.fast_mode:
+                    subset_guide, subset_gene, _, _ = self._pca_reduce_combined(
+                        subset_guide, subset_gene, label=f"bwd_without_{candidate}"
+                    )
+                r = self._run_map_battery(
+                    subset_guide, subset_gene, f"bwd_without_{candidate}"
+                )
+                return candidate, r
 
-            # Compute per-perturbation deltas
+            candidates_sorted = sorted(remaining)
+            if n_workers > 1 and n_candidates > 1:
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {pool.submit(_eval_bwd_candidate, c): c for c in candidates_sorted}
+                    for j, future in enumerate(as_completed(futures), 1):
+                        candidate, r = future.result()
+                        logger.info(f"    [{step_num}/{n_labels-1}] completed {j}/{n_candidates}: {candidate}")
+                        if r is None:
+                            continue
+                        score = self._get_metric_score(r)
+                        if score > best_score:
+                            best_score = score
+                            best_label = candidate
+                            best_result_dict = r
+            else:
+                for j, candidate in enumerate(candidates_sorted, 1):
+                    logger.info(f"    [{step_num}/{n_labels-1}] candidate {j}/{n_candidates}: {candidate}")
+                    candidate, r = _eval_bwd_candidate(candidate)
+                    if r is None:
+                        continue
+                    score = self._get_metric_score(r)
+                    if score > best_score:
+                        best_score = score
+                        best_label = candidate
+                        best_result_dict = r
+
+            if best_label is None:
+                logger.warning(f"  Step {step_num}: no valid candidate, stopping")
+                break
+
+            # Permanently remove the least impactful channel
+            remaining.discard(best_label)
+            elimination_order.append(best_label)
+
+            # Compute per-perturbation deltas (against previous step, not baseline)
             per_pert_delta = self._compute_per_perturbation_delta(
-                baseline, abl_result, label
+                prev_result, best_result_dict, best_label
             )
 
-            iter_elapsed = time.time() - t_iter
-            total_elapsed = time.time() - t_loo_start
-            avg_per_iter = total_elapsed / i
-            eta = avg_per_iter * (n_labels - i)
-            logger.info(f"  Ablation {i}/{n_labels} done in {iter_elapsed:.1f}s "
-                         f"(avg {avg_per_iter:.1f}s/iter, ETA {eta:.0f}s)")
+            n_feats_remaining = sum(len(label_to_cols[l]) for l in remaining)
 
             ablation_results.append({
-                "label": label,
-                "n_features_removed": len(cols_to_remove),
-                "n_features_remaining": int(keep_mask.sum()),
-                "active_ratio": abl_result["active_ratio"],
-                "distinctive_ratio": abl_result["distinctive_ratio"],
-                "corum_ratio": abl_result["corum_ratio"],
-                "chad_ratio": abl_result["chad_ratio"],
-                "activity_auc": abl_result["activity_auc"],
-                "distinct_auc": abl_result["distinct_auc"],
-                "corum_auc": abl_result["corum_auc"],
-                "chad_auc": abl_result["chad_auc"],
-                "activity_sweep": abl_result["activity_sweep"],
-                "distinct_sweep": abl_result["distinct_sweep"],
-                "corum_sweep": abl_result["corum_sweep"],
-                "chad_sweep": abl_result["chad_sweep"],
+                "label": best_label,
+                "step": step_num,
+                "n_features_removed": len(label_to_cols[best_label]),
+                "n_features_remaining": n_feats_remaining,
+                "n_channels_remaining": len(remaining),
+                "active_ratio": best_result_dict["active_ratio"],
+                "distinctive_ratio": best_result_dict["distinctive_ratio"],
+                "corum_ratio": best_result_dict["corum_ratio"],
+                "chad_ratio": best_result_dict["chad_ratio"],
+                "activity_auc": best_result_dict["activity_auc"],
+                "distinct_auc": best_result_dict["distinct_auc"],
+                "corum_auc": best_result_dict["corum_auc"],
+                "chad_auc": best_result_dict["chad_auc"],
+                "activity_sweep": best_result_dict["activity_sweep"],
+                "distinct_sweep": best_result_dict["distinct_sweep"],
+                "corum_sweep": best_result_dict["corum_sweep"],
+                "chad_sweep": best_result_dict["chad_sweep"],
                 "per_pert_delta": per_pert_delta,
-                "full_result": abl_result,
+                "full_result": best_result_dict,
             })
 
+            steps.append({
+                "step": step_num,
+                "label_removed": best_label,
+                "n_channels_remaining": len(remaining),
+                "n_features_remaining": n_feats_remaining,
+                "metric_auc": self._get_metric_score(best_result_dict),
+                "metric_ratio": self._get_metric_ratio(best_result_dict),
+            })
+
+            elapsed = time.time() - t_start
+            avg = elapsed / step_num
+            eta = avg * (n_labels - 1 - step_num)
             logger.info(
-                f"  Result: activity={abl_result['active_ratio']:.2%} "
-                f"(delta={baseline['active_ratio'] - abl_result['active_ratio']:+.2%}), "
-                f"distinct={abl_result['distinctive_ratio']:.2%} "
-                f"(delta={baseline['distinctive_ratio'] - abl_result['distinctive_ratio']:+.2%})"
+                f"  Step {step_num}/{n_labels-1}: removed '{best_label}' "
+                f"({len(remaining)} channels left) → "
+                f"{self.metric} AUC={self._get_metric_score(best_result_dict):.4f}, "
+                f"ratio={self._get_metric_ratio(best_result_dict):.2%} "
+                f"({avg:.1f}s/step, ETA {eta:.0f}s)"
             )
 
+            prev_result = best_result_dict
+
+        # Save elimination order table
+        steps_df = pd.DataFrame(steps)
+        steps_df["metric"] = self.metric
+        steps_df["baseline_auc"] = self._get_metric_score(baseline)
+        steps_df["baseline_ratio"] = self._get_metric_ratio(baseline)
+
+        csv_path = self.output_dir / "backward_elimination_order.csv"
+        steps_df.to_csv(csv_path, index=False)
+        result.add_file(csv_path)
+        logger.info(f"  Saved: {csv_path}")
+
+        # Generate degradation curve plot
+        self._plot_backward_elimination(steps_df, baseline, norm_method, result)
+
         return ablation_results
+
+    @staticmethod
+    def _wrap_label(text: str, max_chars: int = 18) -> str:
+        """Wrap a long label with newlines so it stays readable horizontally."""
+        if len(text) <= max_chars:
+            return text
+        # Try splitting on comma first (e.g. "lipid droplet, PLIN2")
+        if ", " in text:
+            parts = text.split(", ", 1)
+            return parts[0] + ",\n" + parts[1]
+        # Fall back to splitting on space nearest to midpoint
+        mid = len(text) // 2
+        best = text.rfind(" ", 0, mid + 5)
+        if best == -1:
+            best = text.find(" ", mid)
+        if best == -1:
+            return text  # no space found, leave as-is
+        return text[:best] + "\n" + text[best + 1:]
+
+    def _plot_backward_elimination(
+        self,
+        steps_df: pd.DataFrame,
+        baseline: Dict,
+        norm_method: str,
+        result: StageResult,
+    ) -> None:
+        """Cumulative degradation curve as channels are removed.
+
+        Two subplots on the same canvas: AUC (scoring metric) and ratio (% significant).
+        X-axis tick labels show which channel was removed at each step.
+        """
+        metric_label = self.metric.capitalize()
+        bl_auc = self._get_metric_score(baseline)
+        bl_ratio = self._get_metric_ratio(baseline)
+
+        n_steps = len(steps_df)
+        fig_width = max(14, n_steps * 1.2)
+        fig, (ax_auc, ax_ratio) = plt.subplots(1, 2, figsize=(fig_width, 8))
+
+        # Build x-tick labels: step 0 = "all", then channel removed at each step
+        tick_labels = []
+        for _, row in steps_df.iterrows():
+            if row["step"] == 0:
+                tick_labels.append("all\nchannels")
+            else:
+                tick_labels.append(self._wrap_label(str(row["label_removed"])))
+
+        panels = [
+            (ax_auc,   "metric_auc",   f"{metric_label} AUC",              bl_auc),
+            (ax_ratio, "metric_ratio", f"{metric_label} Ratio (p<0.05)",   bl_ratio),
+        ]
+
+        for ax, col, title, bl_val in panels:
+            step_vals = steps_df["step"].values
+            values = steps_df[col].values
+
+            ax.plot(step_vals, values, "o-", color="#d32f2f", linewidth=2,
+                    markersize=8, zorder=3)
+
+            # Baseline reference
+            ax.axhline(bl_val, color="#1976d2", linestyle="--", linewidth=1.5,
+                        label=f"Full baseline ({bl_val:.3f})")
+
+            # 95% threshold band
+            threshold_95 = bl_val * 0.95
+            ax.axhspan(threshold_95, bl_val, color="#1976d2", alpha=0.08)
+            ax.axhline(threshold_95, color="#1976d2", linestyle=":", linewidth=1,
+                        alpha=0.5, label=f"95% threshold ({threshold_95:.3f})")
+
+            # Find where score drops below 95%
+            below_95 = np.where(values < threshold_95)[0]
+            if len(below_95) > 0:
+                first_drop = below_95[0]
+                ax.axvline(step_vals[first_drop], color="#388e3c", linestyle="--",
+                           linewidth=1.5, alpha=0.7,
+                           label=f"Below 95% at step {step_vals[first_drop]}")
+
+            # Use channel names as x-tick labels (horizontal)
+            ax.set_xticks(step_vals)
+            ax.set_xticklabels(tick_labels, fontsize=7, ha="center", rotation=0)
+
+            ax.set_xlabel("Channel Removed (cumulative, least important first)", fontsize=11)
+            ax.set_ylabel(title, fontsize=12)
+            ax.set_title(f"Backward Elimination: {title}", fontsize=13, fontweight="bold")
+            ax.legend(fontsize=9, loc="lower left")
+            ax.set_xlim(-0.5, step_vals[-1] + 0.5)
+            ax.grid(True, alpha=0.3)
+
+        fig.suptitle(
+            f"Greedy Backward Elimination — {metric_label}\n"
+            f"(normalization: {norm_method}, least important removed first, scored by AUC)",
+            fontsize=14, fontweight="bold", y=1.02,
+        )
+        plt.tight_layout()
+
+        path = save_figure(fig, self.output_dir / "backward_elimination_curve.png")
+        result.add_file(path)
+        logger.info(f"  Saved: {path}")
 
     def _compute_per_perturbation_delta(
         self,
@@ -1279,7 +1693,6 @@ class OrganelleAttributionStage(BaseStage):
         - ``minimal_coverage_curve.png`` — cumulative gain plot
         """
         labels = sorted(label_to_cols.keys())
-        all_features = list(adata_guide.var_names)
         remaining = set(labels)
         selected_order: List[str] = []
 
@@ -1291,47 +1704,64 @@ class OrganelleAttributionStage(BaseStage):
             "step": 0,
             "label_added": "(none)",
             "n_features": 0,
-            "activity_ratio": 0.0,
-            "distinct_ratio": 0.0,
-            "activity_auc": 0.0,
-            "distinct_auc": 0.0,
+            "metric_auc": 0.0,
+            "metric_ratio": 0.0,
         })
 
-        logger.info(f"  Forward selection across {len(labels)} organelle groups...")
+        import os
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        n_workers = max(1, min(8, int(os.environ.get("SLURM_CPUS_PER_TASK", "4")) // 2))
+        n_labels = len(labels)
+        logger.info(f"  Forward selection across {n_labels} organelle groups (workers={n_workers})...")
 
-        for step_num in range(1, len(labels) + 1):
+        for step_num in range(1, n_labels + 1):
             best_label = None
             best_score = -1.0
             best_result_dict = None
 
-            for candidate in sorted(remaining):
-                # Build feature set = all selected so far + candidate
-                include_labels = selected_order + [candidate]
-                include_cols = []
-                for lbl in include_labels:
-                    include_cols.extend(label_to_cols[lbl])
+            n_candidates = len(remaining)
+            logger.info(f"  Step {step_num}/{n_labels}: testing {n_candidates} candidates...")
 
-                # Subset adata to only these features
-                include_set = set(include_cols)
-                keep_mask = np.array([v in include_set for v in all_features])
-                if keep_mask.sum() == 0:
-                    continue
-
-                subset_guide = adata_guide[:, keep_mask].copy()
-                # Gene-level uses same features
-                keep_mask_gene = np.array([v in include_set for v in adata_gene.var_names])
-                subset_gene = adata_gene[:, keep_mask_gene].copy()
-
+            def _eval_fwd_candidate(candidate):
+                """Evaluate adding one candidate channel."""
+                include_labels = set(selected_order + [candidate])
+                subset_guide, subset_gene = self._subset_channels(
+                    adata_guide, adata_gene, label_to_cols, include_labels
+                )
+                if subset_guide.n_vars == 0:
+                    return candidate, None
+                if self.fast_mode:
+                    subset_guide, subset_gene, _, _ = self._pca_reduce_combined(
+                        subset_guide, subset_gene, label=f"fwd_{candidate}"
+                    )
                 r = self._run_map_battery(subset_guide, subset_gene, f"fwd_{candidate}")
-                if r is None:
-                    continue
+                return candidate, r
 
-                # Score = average of activity_auc + distinct_auc (primary metrics)
-                score = (r["activity_auc"] + r["distinct_auc"]) / 2.0
-                if score > best_score:
-                    best_score = score
-                    best_label = candidate
-                    best_result_dict = r
+            candidates_sorted = sorted(remaining)
+            if n_workers > 1 and n_candidates > 1:
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {pool.submit(_eval_fwd_candidate, c): c for c in candidates_sorted}
+                    for j, future in enumerate(as_completed(futures), 1):
+                        candidate, r = future.result()
+                        logger.info(f"    [{step_num}/{n_labels}] completed {j}/{n_candidates}: {candidate}")
+                        if r is None:
+                            continue
+                        score = self._get_metric_score(r)
+                        if score > best_score:
+                            best_score = score
+                            best_label = candidate
+                            best_result_dict = r
+            else:
+                for j, candidate in enumerate(candidates_sorted, 1):
+                    logger.info(f"    [{step_num}/{n_labels}] candidate {j}/{n_candidates}: {candidate}")
+                    candidate, r = _eval_fwd_candidate(candidate)
+                    if r is None:
+                        continue
+                    score = self._get_metric_score(r)
+                    if score > best_score:
+                        best_score = score
+                        best_label = candidate
+                        best_result_dict = r
 
             if best_label is None:
                 logger.warning(f"  Step {step_num}: no valid candidate, stopping")
@@ -1345,25 +1775,22 @@ class OrganelleAttributionStage(BaseStage):
                 "step": step_num,
                 "label_added": best_label,
                 "n_features": n_feats,
-                "activity_ratio": best_result_dict["active_ratio"],
-                "distinct_ratio": best_result_dict["distinctive_ratio"],
-                "activity_auc": best_result_dict["activity_auc"],
-                "distinct_auc": best_result_dict["distinct_auc"],
+                "metric_auc": self._get_metric_score(best_result_dict),
+                "metric_ratio": self._get_metric_ratio(best_result_dict),
             })
 
             logger.info(
                 f"  Step {step_num}: +'{best_label}' → "
-                f"activity={best_result_dict['active_ratio']:.2%}, "
-                f"distinct={best_result_dict['distinctive_ratio']:.2%}, "
+                f"AUC={self._get_metric_score(best_result_dict):.4f}, "
+                f"ratio={self._get_metric_ratio(best_result_dict):.2%}, "
                 f"features={n_feats}"
             )
 
         # Save step table
         steps_df = pd.DataFrame(steps)
-        steps_df["baseline_activity_ratio"] = baseline["active_ratio"]
-        steps_df["baseline_distinct_ratio"] = baseline["distinctive_ratio"]
-        steps_df["baseline_activity_auc"] = baseline["activity_auc"]
-        steps_df["baseline_distinct_auc"] = baseline["distinct_auc"]
+        steps_df["metric"] = self.metric
+        steps_df["baseline_auc"] = self._get_metric_score(baseline)
+        steps_df["baseline_ratio"] = self._get_metric_ratio(baseline)
 
         csv_path = self.output_dir / "minimal_coverage_order.csv"
         steps_df.to_csv(csv_path, index=False)
@@ -1383,23 +1810,33 @@ class OrganelleAttributionStage(BaseStage):
         """
         Cumulative gain curve showing how mAP grows as organelles are added.
 
-        X-axis: number of organelle groups, Y-axis: mAP metric score.
-        Horizontal dashed line at full baseline, shaded 95% band.
-        Each point labeled with the organelle added at that step.
+        Two subplots on the same canvas: AUC (scoring metric) and ratio (% significant).
         """
-        fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+        metric_label = self.metric.capitalize()
+        bl_auc = self._get_metric_score(baseline)
+        bl_ratio = self._get_metric_ratio(baseline)
 
-        metrics = [
-            ("activity_auc", "Activity AUC", baseline["activity_auc"]),
-            ("distinct_auc", "Distinctiveness AUC", baseline["distinct_auc"]),
+        # Skip step 0 (no channels) — start from first channel added
+        plot_df = steps_df[steps_df["step"] > 0].reset_index(drop=True)
+
+        # Build x-tick labels from channel names
+        tick_labels = [self._wrap_label(str(row["label_added"])) for _, row in plot_df.iterrows()]
+
+        n_steps = len(plot_df)
+        fig_width = max(14, n_steps * 1.2)
+        fig, (ax_auc, ax_ratio) = plt.subplots(1, 2, figsize=(fig_width, 8))
+
+        panels = [
+            (ax_auc,   "metric_auc",   f"{metric_label} AUC",              bl_auc),
+            (ax_ratio, "metric_ratio", f"{metric_label} Ratio (p<0.05)",   bl_ratio),
         ]
 
-        for ax, (col, title, bl_val) in zip(axes, metrics):
-            steps = steps_df["step"].values
-            values = steps_df[col].values
+        for ax, col, title, bl_val in panels:
+            step_vals = plot_df["step"].values
+            values = plot_df[col].values
 
             # Main curve
-            ax.plot(steps, values, "o-", color="#1976d2", linewidth=2,
+            ax.plot(step_vals, values, "o-", color="#1976d2", linewidth=2,
                     markersize=8, zorder=3)
 
             # Baseline reference
@@ -1416,39 +1853,24 @@ class OrganelleAttributionStage(BaseStage):
             above_95 = np.where(values >= threshold_95)[0]
             if len(above_95) > 0:
                 first_95 = above_95[0]
-                ax.axvline(steps[first_95], color="#388e3c", linestyle="--",
+                ax.axvline(step_vals[first_95], color="#388e3c", linestyle="--",
                            linewidth=1.5, alpha=0.7,
-                           label=f"95% reached at step {steps[first_95]}")
+                           label=f"95% reached at step {step_vals[first_95]}")
 
-            # Label each point with the organelle added
-            for i, row in steps_df.iterrows():
-                if row["step"] == 0:
-                    continue
-                label = row["label_added"]
-                # Truncate long labels
-                if len(label) > 25:
-                    label = label[:22] + "..."
-                ax.annotate(
-                    label,
-                    (row["step"], row[col]),
-                    textcoords="offset points",
-                    xytext=(8, 8 if i % 2 == 0 else -14),
-                    fontsize=7,
-                    rotation=30,
-                    ha="left",
-                    va="bottom" if i % 2 == 0 else "top",
-                )
+            # Use channel names as x-tick labels (horizontal)
+            ax.set_xticks(step_vals)
+            ax.set_xticklabels(tick_labels, fontsize=7, ha="center", rotation=0)
 
-            ax.set_xlabel("Number of Organelle Groups Included", fontsize=12)
+            ax.set_xlabel("Channel Added (cumulative, most important first)", fontsize=11)
             ax.set_ylabel(title, fontsize=12)
-            ax.set_title(f"Minimal Coverage: {title}", fontsize=13, fontweight="bold")
+            ax.set_title(f"Forward Selection: {title}", fontsize=13, fontweight="bold")
             ax.legend(fontsize=9, loc="lower right")
-            ax.set_xlim(-0.5, steps[-1] + 0.5)
+            ax.set_xlim(step_vals[0] - 0.5, step_vals[-1] + 0.5)
             ax.grid(True, alpha=0.3)
 
         fig.suptitle(
-            f"Greedy Forward Selection — Minimal Organelle Set for Full mAP Coverage\n"
-            f"(normalization: {norm_method})",
+            f"Greedy Forward Selection — {metric_label}\n"
+            f"(normalization: {norm_method}, scored by AUC)",
             fontsize=14, fontweight="bold", y=1.02,
         )
         plt.tight_layout()
@@ -1466,6 +1888,10 @@ def run_attribution_job(
     output_dir: str,
     config_path: str,
     norm_methods: Optional[List[str]] = None,
+    fast_mode: bool = False,
+    variance_threshold: float = 0.95,
+    mode: str = "all",
+    metric: str = "activity",
 ) -> str:
     """
     Run organelle attribution as a standalone SLURM job.
@@ -1497,6 +1923,10 @@ def run_attribution_job(
             level="guide",
             norm_methods=norm_methods,
             config_path=Path(config_path),
+            fast_mode=fast_mode,
+            variance_threshold=variance_threshold,
+            mode=mode,
+            metric=metric,
         )
         # Override output_dir directly since we're not going through orchestrator
         stage._output_dir = output_dir / "13_organelle_attribution"
@@ -1531,10 +1961,27 @@ def main():
                         help="Output directory (default: auto-generated)")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH),
                         help=f"Config YAML path (default: {DEFAULT_CONFIG_PATH})")
-    parser.add_argument("--norm-method", default="both", choices=["global", "ntc", "both"],
-                        help="Normalization method: global, ntc, or both (default: both)")
+    parser.add_argument("--norm-method", default="ntc", choices=["global", "ntc", "both"],
+                        help="Normalization method: global, ntc, or both (default: ntc)")
+    parser.add_argument("--fast", action="store_true",
+                        help="Enable per-channel PCA reduction for faster iteration "
+                             "(reduces ~40k features to PCs based on explained variance)")
+    parser.add_argument("--variance-threshold", type=float, default=0.95,
+                        help="Cumulative explained variance threshold for PCA (default: 0.95). "
+                             "Lower values = more compression = faster but lossier.")
+    parser.add_argument("--metric", default="all",
+                        choices=["all", "activity", "distinctiveness", "corum", "chad"],
+                        help="Which mAP metric to score by. Default: all. "
+                             "With --slurm, 'all' submits a separate job per metric.")
+    parser.add_argument("--mode", default="all", choices=["all", "knockout", "knockin"],
+                        help="Run mode: all (both directions), knockout (backward elimination only), "
+                             "knockin (forward selection only). Default: all. "
+                             "With --slurm, 'all' submits knockout and knockin as parallel jobs.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover experiments/channels and print summary without loading data")
+    parser.add_argument("--baseline-only", action="store_true",
+                        help="Only compute the baseline mAP (no elimination). "
+                             "Useful for comparing --fast vs full-feature baselines.")
 
     # SLURM options
     slurm_group = parser.add_argument_group("SLURM options")
@@ -1544,9 +1991,9 @@ def main():
                              help="Don't wait for SLURM job to complete")
     slurm_group.add_argument("--yes", "-y", action="store_true",
                              help="Skip confirmation prompt")
-    slurm_group.add_argument("--slurm-memory", type=str, default="256GB",
-                             help="Memory (default: 256GB)")
-    slurm_group.add_argument("--slurm-time", type=int, default=120,
+    slurm_group.add_argument("--slurm-memory", type=str, default="500GB",
+                             help="Memory (default: 500GB)")
+    slurm_group.add_argument("--slurm-time", type=int, default=480,
                              help="Time limit in minutes (default: 120)")
     slurm_group.add_argument("--slurm-cpus", type=int, default=16,
                              help="CPUs (default: 16)")
@@ -1587,85 +2034,133 @@ def main():
         stage.dry_run()
         return
 
+    # --- baseline-only → override mode so elimination is skipped ---
+    if args.baseline_only:
+        args.mode = "baseline"
+        # Default to single metric if not specified
+        if args.metric == "all":
+            args.metric = "activity"
+
     # --- SLURM mode ---
     if args.slurm:
         _run_slurm_mode(args, output_dir, config_path, norm_methods)
         return
 
     # --- Local mode ---
-    data_shim = SimpleNamespace(
-        experiment="cross_experiment",
-        graph_output_path=output_dir,
+    metrics = (
+        list(OrganelleAttributionStage.VALID_METRICS)
+        if args.metric == "all"
+        else [args.metric]
     )
-    config_shim = SimpleNamespace(experiment="cross_experiment")
 
-    stage = OrganelleAttributionStage(
-        data_context=data_shim,
-        config=config_shim,
-        level="guide",
-        norm_methods=norm_methods,
-        config_path=config_path,
-    )
-    stage._output_dir = output_dir / "13_organelle_attribution"
-    stage._output_dir.mkdir(parents=True, exist_ok=True)
+    for metric in metrics:
+        print(f"\n--- Running metric: {metric} ---")
+        data_shim = SimpleNamespace(
+            experiment="cross_experiment",
+            graph_output_path=output_dir,
+        )
+        config_shim = SimpleNamespace(experiment="cross_experiment")
 
-    result = stage.run()
+        stage = OrganelleAttributionStage(
+            data_context=data_shim,
+            config=config_shim,
+            level="guide",
+            norm_methods=norm_methods,
+            config_path=config_path,
+            fast_mode=args.fast,
+            variance_threshold=args.variance_threshold,
+            mode=args.mode,
+            metric=metric,
+        )
+        stage._output_dir = output_dir / "13_organelle_attribution"
+        stage._output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nOutput: {stage.output_dir}")
-    print(f"Files: {len(result.output_files)}")
-    if result.errors:
-        print(f"Errors: {len(result.errors)}")
-        for err in result.errors:
-            print(f"  - {err}")
+        result = stage.run()
+
+        print(f"\nOutput: {stage.output_dir}")
+        print(f"Files: {len(result.output_files)}")
+        if result.errors:
+            print(f"Errors: {len(result.errors)}")
+            for err in result.errors:
+                print(f"  - {err}")
 
 
 def _run_slurm_mode(
     args, output_dir: Path, config_path: Path, norm_methods: List[str]
 ) -> None:
-    """Submit the attribution pipeline as a single SLURM job."""
+    """Submit the attribution pipeline as SLURM job(s).
+
+    When ``--mode all`` (the default), submits knockout and knockin as two
+    parallel jobs so they run concurrently on the cluster.  Otherwise submits
+    a single job for the requested mode.
+    """
     from ops_utils.hpc.slurm_batch_utils import submit_parallel_jobs
 
     slurm_params = {
         "timeout_min": args.slurm_time,
         "mem": args.slurm_memory,
         "cpus_per_task": args.slurm_cpus,
-        "slurm_partition": "cpu",
+        "slurm_partition": "cpu,gpu",
     }
 
-    job = {
-        "name": "organelle_attribution",
-        "func": run_attribution_job,
-        "kwargs": {
-            "output_dir": str(output_dir),
-            "config_path": str(config_path),
-            "norm_methods": norm_methods,
-        },
+    common_kwargs = {
+        "output_dir": str(output_dir),
+        "config_path": str(config_path),
+        "norm_methods": norm_methods,
+        "fast_mode": args.fast,
+        "variance_threshold": args.variance_threshold,
     }
+
+    # Resolve metric and mode lists
+    metrics = (
+        list(OrganelleAttributionStage.VALID_METRICS)
+        if args.metric == "all"
+        else [args.metric]
+    )
+    modes = ["knockout", "knockin"] if args.mode == "all" else [args.mode]
+
+    # Build job list: one job per (metric, mode) combination
+    jobs = []
+    for metric in metrics:
+        for mode in modes:
+            jobs.append({
+                "name": f"organelle_attribution_{metric}_{mode}",
+                "func": run_attribution_job,
+                "kwargs": {**common_kwargs, "mode": mode, "metric": metric},
+            })
+
+    mode_desc = f"{len(metrics)} metrics × {len(modes)} modes = {len(jobs)} parallel jobs"
 
     if not args.yes:
-        print(f"\nOrganelle Attribution SLURM Job:")
-        print(f"  Output: {output_dir}")
-        print(f"  Config: {config_path}")
-        print(f"  Norm:   {', '.join(norm_methods)}")
-        print(f"  Memory: {args.slurm_memory}")
-        print(f"  Time:   {args.slurm_time} min")
-        print(f"  CPUs:   {args.slurm_cpus}")
+        print(f"\nOrganelle Attribution SLURM Job(s):")
+        print(f"  Output:    {output_dir}")
+        print(f"  Config:    {config_path}")
+        print(f"  Norm:      {', '.join(norm_methods)}")
+        print(f"  Metrics:   {', '.join(metrics)}")
+        print(f"  Modes:     {', '.join(modes)}")
+        print(f"  Jobs:      {mode_desc}")
+        print(f"  Fast:      {args.fast}" + (f" (variance threshold: {args.variance_threshold})" if args.fast else ""))
+        print(f"  Partition: cpu,gpu")
+        print(f"  Memory:    {args.slurm_memory}")
+        print(f"  Time:      {args.slurm_time} min")
+        print(f"  CPUs:      {args.slurm_cpus}")
         confirm = input("\nSubmit? [y/N] ").strip().lower()
         if confirm != "y":
             print("Cancelled.")
             return
 
     result = submit_parallel_jobs(
-        jobs_to_submit=[job],
+        jobs_to_submit=jobs,
         experiment="organelle_attribution",
         slurm_params=slurm_params,
-        log_dir=str(output_dir / "slurm_logs"),
+        log_dir="organelle_attribution",
         manifest_prefix="organelle_attribution",
         wait_for_completion=not args.no_wait,
     )
 
     if result.get("success"):
-        print(f"\nJob submitted: {result.get('base_job_id')}")
+        print(f"\nJob(s) submitted: {result.get('base_job_id')}")
+        print(f"  Jobs: {len(jobs)}")
     else:
         print("\nJob submission failed!")
 
