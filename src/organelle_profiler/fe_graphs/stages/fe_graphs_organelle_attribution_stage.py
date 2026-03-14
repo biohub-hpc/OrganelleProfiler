@@ -23,8 +23,9 @@ CLI arguments:
   -o, --output-dir      Output directory (default: auto-generated)
   --config              Path to config YAML (default: organelle_attribution_config.yaml)
   --norm-method         Normalization method(s): global, ntc, or both (default: both)
-  --fast                Per-channel PCA reduction for faster iteration (~50-80x fewer features)
+  --fast                Post-aggregation PCA reduction for faster iteration
   --variance-threshold  Cumulative explained variance for PCA (default: 0.95)
+  --pca-optimized       Path to pre-reduced PCA-optimized h5ad dir (from pca_optimization_stage)
   --dry-run             Discover experiments/channels and print summary without loading data
 
 SLURM options:
@@ -55,7 +56,6 @@ from ops_utils.analysis.map_scores import (
     phenotypic_consistency_corum,
     phenotypic_consistency_manual_annotation,
     compute_auc_score,
-    compute_threshold_sweep_auc,
 )
 from ops_utils.analysis.normalization import zscore_normalize, df_to_adata
 
@@ -71,8 +71,79 @@ logger = logging.getLogger(__name__)
 # Suppress copairs internal INFO logging
 logging.getLogger("copairs").setLevel(logging.WARNING)
 
+import multiprocessing as _mp
+
 # Default config path
 DEFAULT_CONFIG_PATH = Path(__file__).parents[4] / "configs" / "organelle_attribution_config.yaml"
+
+# ---------------------------------------------------------------------------
+# Process-pool infrastructure for greedy elimination/selection
+# ---------------------------------------------------------------------------
+# Shared state populated before forking; children inherit via COW.
+_POOL_SHARED: Dict[str, Any] = {}
+
+
+def _pool_worker_init():
+    """Set per-thread limits in forked workers to prevent oversubscription."""
+    import os
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = "1"
+
+
+def _ensure_picklable():
+    """Register pool functions in __main__ so multiprocessing can pickle them.
+
+    When this module is loaded by submitit (SLURM), __main__ is submitit's
+    wrapper, not our module.  multiprocessing.Pool pickles function references
+    by qualified name, so it needs to find them in __main__.
+    """
+    import __main__
+    for fn in (_pool_worker_init, _eval_candidate_process):
+        if not hasattr(__main__, fn.__name__):
+            setattr(__main__, fn.__name__, fn)
+
+
+def _eval_candidate_process(args: tuple):
+    """Evaluate a single candidate in a forked process (lightweight mode).
+
+    Reads immutable shared data from ``_POOL_SHARED`` (inherited via fork COW).
+    Args tuple: (candidate, keep_labels_list, run_label)
+    Returns: (candidate, score, ratio) — only scalars to avoid pipe deadlock
+        from serialising large DataFrames back to the parent process.
+    """
+    candidate, keep_labels_list, run_label = args
+    keep_labels = set(keep_labels_list)
+
+    sd = _POOL_SHARED
+    adata_guide = sd["adata_guide"]
+    adata_gene = sd["adata_gene"]
+    label_to_idx_guide = sd["label_to_idx_guide"]
+    label_to_idx_gene = sd["label_to_idx_gene"]
+    stage = sd["stage"]
+
+    # Fast integer-indexed subset
+    idx_guide = np.concatenate([label_to_idx_guide[l] for l in sorted(keep_labels)])
+    idx_gene = np.concatenate([label_to_idx_gene[l] for l in sorted(keep_labels)])
+    idx_guide.sort()
+    idx_gene.sort()
+
+    subset_guide = adata_guide[:, idx_guide].copy()
+    subset_gene = adata_gene[:, idx_gene].copy()
+
+    if subset_guide.n_vars == 0:
+        return candidate, None, None
+
+    if stage.fast_mode and stage.pca_optimized_dir is None:
+        subset_guide, subset_gene, _, _ = stage._pca_reduce_combined(
+            subset_guide, subset_gene, label=run_label
+        )
+
+    r = stage._run_map_battery(subset_guide, subset_gene, run_label, lightweight=True)
+    if r is None:
+        return candidate, None, None
+    # Return only scalars — avoids serialising large DataFrames through the pipe
+    return candidate, stage._get_metric_score(r), stage._get_metric_ratio(r)
 
 # Channel maps path (prefer fast_ops partition which has the most up-to-date entries)
 CHANNEL_MAPS_PATH = Path("/hpc/projects/icd.fast.ops/configs/ops_channel_maps.yaml")
@@ -128,15 +199,20 @@ class OrganelleAttributionStage(BaseStage):
         config_path: Optional[Path] = None,
         fast_mode: bool = False,
         variance_threshold: float = 0.95,
+        pca_optimized_dir: Optional[str] = None,
         **kwargs,
     ):
         self.mode = kwargs.pop("mode", "all")  # "all", "knockout", or "knockin"
         self.metric = kwargs.pop("metric", "activity")  # which metric drives scoring
+        self.variance_sweep = kwargs.pop("variance_sweep", None)  # list of thresholds for baseline sweep
+        self.agg_funcs = kwargs.pop("agg_funcs", None)  # multi-stat aggregation e.g. ["mean","std","min","max","median","sum"]
+        self.enforce_phase = kwargs.pop("enforce_phase", False)  # force Phase as first channel in forward selection
         super().__init__(data_context, config, level, **kwargs)
         self.norm_methods = norm_methods or ["ntc"]
         self.config_path = config_path or DEFAULT_CONFIG_PATH
         self.fast_mode = fast_mode
         self.variance_threshold = variance_threshold
+        self.pca_optimized_dir = Path(pca_optimized_dir) if pca_optimized_dir else None
 
         # Load attribution config
         if self.config_path.exists():
@@ -192,10 +268,22 @@ class OrganelleAttributionStage(BaseStage):
         logger.info(f"  Resolved {len(signal_map)} biological signal groups")
 
         # Step 2: Build biology-aware coembedding (done once for all norm methods)
-        logger.info("Step 2: Building biology-aware coembedding...")
-        with _warnings.catch_warnings():
-            _warnings.filterwarnings("ignore", message=".*names are not unique.*")
-            adata_guide_raw, adata_gene_raw = self._load_and_combine(exp_channel_pairs, signal_map=signal_map)
+        if self.pca_optimized_dir is not None:
+            # Load pre-reduced PCA-optimized data
+            logger.info(f"Step 2: Loading PCA-optimized data from {self.pca_optimized_dir}...")
+            guide_path = self.pca_optimized_dir / "guide_pca_optimized.h5ad"
+            gene_path = self.pca_optimized_dir / "gene_pca_optimized.h5ad"
+            if not guide_path.exists() or not gene_path.exists():
+                result.add_error(f"PCA-optimized files not found in {self.pca_optimized_dir}")
+                return result
+            adata_guide_raw = ad.read_h5ad(guide_path)
+            adata_gene_raw = ad.read_h5ad(gene_path)
+            logger.info(f"  Loaded pre-reduced data (already NTC-normalized, PCA-optimized)")
+        else:
+            logger.info("Step 2: Building biology-aware coembedding...")
+            with _warnings.catch_warnings():
+                _warnings.filterwarnings("ignore", message=".*names are not unique.*")
+                adata_guide_raw, adata_gene_raw = self._load_and_combine(exp_channel_pairs, signal_map=signal_map)
         if adata_guide_raw is None:
             result.add_error("Failed to build coembedding")
             return result
@@ -204,6 +292,11 @@ class OrganelleAttributionStage(BaseStage):
         )
         logger.info(
             f"  Gene-level: {adata_gene_raw.n_obs} perturbations, {adata_gene_raw.n_vars} features"
+        )
+        logger.info(
+            f"  Config: agg={'multi-stat' if self.agg_funcs else 'mean-only'}, "
+            f"PCA={'pca-optimized' if self.pca_optimized_dir else ('on (' + str(self.variance_threshold) + ')' if self.fast_mode else 'off')}, "
+            f"norm={self.norm_methods}"
         )
 
         # Step 3: Build channel label -> feature column mapping (shared)
@@ -235,16 +328,107 @@ class OrganelleAttributionStage(BaseStage):
             adata_gene = adata_gene_raw.copy()
             logger.info(f"  Data copy: {time.time()-t_copy:.1f}s")
 
-            # Step 4: Z-score normalize
-            t_norm = time.time()
-            logger.info(f"Step 4: Z-score normalizing (method={norm_method})...")
-            adata_guide, adata_gene = self._normalize_adata(
-                adata_guide, adata_gene, norm_method
-            )
-            logger.info(f"  Normalization done: {time.time()-t_norm:.1f}s")
+            # Step 4: Z-score normalize (skip if already normalized in PCA-optimized data)
+            if self.pca_optimized_dir is not None:
+                logger.info(f"Step 4: Skipping normalization (PCA-optimized data already normalized)")
+            else:
+                t_norm = time.time()
+                logger.info(f"Step 4: Z-score normalizing (method={norm_method})...")
+                adata_guide, adata_gene = self._normalize_adata(
+                    adata_guide, adata_gene, norm_method
+                )
+                logger.info(f"  Normalization done: {time.time()-t_norm:.1f}s")
+
+            # Step 4b/5: Variance sweep mode (baseline-only with multiple thresholds)
+            if self.mode == "baseline" and self.variance_sweep:
+                sweep_rows = []
+                logger.info(
+                    f"Step 4b/5: Variance sweep — testing {len(self.variance_sweep)} "
+                    f"thresholds on {adata_guide.n_vars} features..."
+                )
+                # Pre-fit full PCA once, then slice to different n_keep values
+                from sklearn.decomposition import PCA as _PCA
+                X_guide = np.asarray(adata_guide.X, dtype=np.float64)
+                X_gene = np.asarray(adata_gene.X, dtype=np.float64)
+                X_guide = np.nan_to_num(X_guide, nan=0.0, posinf=0.0, neginf=0.0)
+                X_gene = np.nan_to_num(X_gene, nan=0.0, posinf=0.0, neginf=0.0)
+                max_components = min(adata_guide.n_vars, adata_guide.n_obs - 1)
+                t_pca_fit = time.time()
+                logger.info(f"  Fitting PCA with {max_components} components...")
+                pca_full = _PCA(n_components=max_components)
+                guide_transformed = pca_full.fit_transform(X_guide)
+                gene_transformed = pca_full.transform(X_gene)
+                cumvar = np.cumsum(pca_full.explained_variance_ratio_)
+                logger.info(f"  PCA fit done in {time.time()-t_pca_fit:.1f}s")
+
+                for thresh in self.variance_sweep:
+                    t_step = time.time()
+                    n_keep = int(np.searchsorted(cumvar, thresh) + 1)
+                    n_keep = max(n_keep, 1)
+                    n_keep = min(n_keep, max_components)
+                    actual_var = float(cumvar[n_keep - 1])
+                    logger.info(
+                        f"  Threshold {thresh:.1%}: {n_keep} PCs "
+                        f"(actual {actual_var:.2%} variance)"
+                    )
+
+                    pc_names = [f"PC{j}" for j in range(n_keep)]
+                    sweep_guide = ad.AnnData(
+                        X=guide_transformed[:, :n_keep].astype(np.float32),
+                        obs=adata_guide.obs.copy(),
+                        var=pd.DataFrame(index=pc_names),
+                    )
+                    sweep_gene = ad.AnnData(
+                        X=gene_transformed[:, :n_keep].astype(np.float32),
+                        obs=adata_gene.obs.copy(),
+                        var=pd.DataFrame(index=pc_names),
+                    )
+
+                    sweep_result = self._run_map_battery(
+                        sweep_guide, sweep_gene, f"sweep_{thresh:.3f}"
+                    )
+                    if sweep_result is not None:
+                        auc = self._get_metric_score(sweep_result)
+                        ratio = self._get_metric_ratio(sweep_result)
+                        sweep_rows.append({
+                            "variance_threshold": thresh,
+                            "n_pcs": n_keep,
+                            "actual_variance": actual_var,
+                            "auc": auc,
+                            "active_ratio": ratio,
+                            "time_s": time.time() - t_step,
+                        })
+                        logger.info(
+                            f"    AUC={auc:.4f}, ratio={ratio:.2%} "
+                            f"({time.time()-t_step:.1f}s)"
+                        )
+
+                # Free large arrays
+                del guide_transformed, gene_transformed, pca_full
+
+                # Save sweep results
+                if sweep_rows:
+                    sweep_df = pd.DataFrame(sweep_rows)
+                    sweep_path = self.output_dir / "variance_sweep_results.csv"
+                    sweep_df.to_csv(sweep_path, index=False)
+                    result.add_file(sweep_path)
+                    logger.info(f"\n{'='*60}")
+                    logger.info("VARIANCE SWEEP RESULTS:")
+                    logger.info(f"{'='*60}")
+                    for row in sweep_rows:
+                        logger.info(
+                            f"  {row['variance_threshold']:>6.1%} → "
+                            f"{row['n_pcs']:>4d} PCs | "
+                            f"AUC={row['auc']:.4f} | "
+                            f"active={row['active_ratio']:.2%}"
+                        )
+                    logger.info(f"{'='*60}")
+                    logger.info(f"Saved to {sweep_path}")
+                continue  # skip normal baseline/elimination flow
 
             # Step 4b: Combined PCA reduction for baseline (fast mode)
-            if self.fast_mode:
+            # Skip if using PCA-optimized data (already reduced at cell level)
+            if self.fast_mode and self.pca_optimized_dir is None:
                 t_pca = time.time()
                 logger.info(
                     f"Step 4b: Combined PCA reduction "
@@ -447,7 +631,13 @@ class OrganelleAttributionStage(BaseStage):
         def _norm(s: str) -> str:
             return s.replace("_", " ").replace("-", " ").lower()
 
+        # Collapsed helper: strip ALL separators for CellProfiler names
+        # (CP filenames like "BODIPYlivecelldye" vs YAML "BODIPY_live_cell_dye")
+        def _collapse(s: str) -> str:
+            return s.replace("_", "").replace("-", "").replace(" ", "").lower()
+
         file_norm = _norm(file_channel)
+        file_collapsed = _collapse(file_channel)
 
         if exp_short in fm.metadata:
             for ch_entry in fm.metadata[exp_short]:
@@ -490,6 +680,24 @@ class OrganelleAttributionStage(BaseStage):
                         "yaml_channel": ch_entry.get("channel_name", file_channel),
                         "method": "reverse_label_fuzzy",
                     }
+                # 2e. Collapsed marker match (all separators stripped — for CellProfiler filenames)
+                if "," in label:
+                    marker = label.split(",", 1)[1].strip()
+                    if _collapse(marker) == file_collapsed:
+                        return {
+                            "label": label,
+                            "short": marker,
+                            "yaml_channel": ch_entry.get("channel_name", file_channel),
+                            "method": "reverse_marker_collapsed",
+                        }
+                # 2f. Collapsed whole-label match
+                if _collapse(label) == file_collapsed:
+                    return {
+                        "label": label,
+                        "short": label,
+                        "yaml_channel": ch_entry.get("channel_name", file_channel),
+                        "method": "reverse_label_collapsed",
+                    }
 
         # --- Attempt 3: Cell Painting channels (CP1_organelle_marker) ---
         if file_channel.startswith(("CP1_", "CP2_")):
@@ -506,6 +714,10 @@ class OrganelleAttributionStage(BaseStage):
         _HARDCODED = {
             # File says "emission" but YAML says "excitation"
             "ChromaLive_488_emission": "ChromaLIVE 488 excitation",
+            "ChromaLive488emission": "ChromaLIVE 488 excitation",  # CellProfiler variant
+            # CellProfiler truncated names that can't be fuzzy-matched
+            "FastAct": "actin filament, FastAct_SPY555 Live Cell Dye",
+            "unlabeled": "no label",
         }
         if file_channel in _HARDCODED:
             hardcoded_label = _HARDCODED[file_channel]
@@ -669,14 +881,15 @@ class OrganelleAttributionStage(BaseStage):
                 compute_pca=False,
                 compute_umap=False,
                 compute_phate=False,
-                normalize_on_pooling=True,
+                normalize_on_pooling=False,
                 normalize_on_controls=False,
                 join=self._join,
                 verbose=False,
                 search_dirs=self._storage_roots,
-                use_preaggregated=True,
+                use_preaggregated=False,
                 metadata_path=_maps,
                 signal_map=signal_map,
+                agg_funcs=self.agg_funcs,
             )
             return adata_guide, adata_gene
 
@@ -754,22 +967,40 @@ class OrganelleAttributionStage(BaseStage):
         adata_gene: ad.AnnData,
         norm_method: str = "ntc",
     ) -> Tuple[ad.AnnData, ad.AnnData]:
-        """Z-score normalize the combined AnnData objects."""
-        for adata, level_name in [(adata_guide, "guide"), (adata_gene, "gene")]:
-            feature_cols = list(adata.var_names)
-            df = pd.DataFrame(adata.X, columns=feature_cols)
-            for col in adata.obs.columns:
-                df[col] = adata.obs[col].values
+        """Z-score normalize guide-level, then re-aggregate to gene-level.
 
-            df = zscore_normalize(
-                df, feature_cols,
-                method=norm_method,
-                perturbation_col="perturbation",
-            )
+        Normalizing at guide-level first ensures proper NTC normalization
+        (210 NTC guides available). Gene-level is then derived by averaging
+        the already-normalized guide features per gene, avoiding the problem
+        of only 1 NTC row at gene-level.
+        """
+        from ops_model.features.anndata_utils import aggregate_to_level
 
-            # Write back normalized features
-            adata.X = df[feature_cols].values.astype(np.float32)
-            logger.info(f"  Normalized {level_name}-level ({norm_method}): {adata.n_obs} obs, {adata.n_vars} features")
+        # 1. Normalize guide-level (has full NTC guide population)
+        feature_cols = list(adata_guide.var_names)
+        df = pd.DataFrame(adata_guide.X, columns=feature_cols)
+        for col in adata_guide.obs.columns:
+            df[col] = adata_guide.obs[col].values
+
+        df = zscore_normalize(
+            df, feature_cols,
+            method=norm_method,
+            perturbation_col="perturbation",
+        )
+        adata_guide.X = df[feature_cols].values.astype(np.float32)
+        logger.info(f"  Normalized guide-level ({norm_method}): {adata_guide.n_obs} obs, {adata_guide.n_vars} features")
+
+        # 2. Re-aggregate normalized guide data to gene-level
+        min_guides = self.attr_config.get("min_guides_per_perturbation", 2)
+        adata_gene = aggregate_to_level(
+            adata_guide, "gene",
+            preserve_batch_info=False,
+            subsample_controls=False,
+        )
+        logger.info(
+            f"  Re-aggregated to gene-level from normalized guides: "
+            f"{adata_gene.n_obs} genes, {adata_gene.n_vars} features"
+        )
 
         return adata_guide, adata_gene
 
@@ -869,6 +1100,24 @@ class OrganelleAttributionStage(BaseStage):
 
         return adata_guide[:, mask_guide].copy(), adata_gene[:, mask_gene].copy()
 
+    @staticmethod
+    def _precompute_label_indices(
+        adata: ad.AnnData,
+        label_to_cols: Dict[str, List[str]],
+    ) -> Dict[str, np.ndarray]:
+        """Pre-compute label → integer index arrays for fast subsetting.
+
+        Called once before the greedy loop so that per-candidate subsetting
+        uses cheap integer indexing instead of repeated string set membership.
+        """
+        var_names = list(adata.var_names)
+        name_to_idx = {v: i for i, v in enumerate(var_names)}
+        label_to_idx: Dict[str, np.ndarray] = {}
+        for label, cols in label_to_cols.items():
+            indices = [name_to_idx[c] for c in cols if c in name_to_idx]
+            label_to_idx[label] = np.array(indices, dtype=np.intp)
+        return label_to_idx
+
     def _reduce_features_pca(
         self,
         adata_guide: ad.AnnData,
@@ -935,11 +1184,21 @@ class OrganelleAttributionStage(BaseStage):
         """Return the ratio score for the configured metric (used for plotting)."""
         return result_dict[self._METRIC_KEYS[self.metric]["ratio"]]
 
+    # Reduced null_size for lightweight (greedy candidate) evaluation.
+    # 10K samples gives ~1% p-value precision — sufficient for ranking.
+    _LIGHTWEIGHT_NULL_SIZE = 10_000
+    # Moderate null_size for intermediate step re-evaluation (stored results).
+    # 100K gives ~0.3% precision — more than enough for per-step CSVs.
+    # Only the baseline uses the full 1M.
+    _REEVAL_NULL_SIZE = 100_000
+
     def _run_map_battery(
         self,
         adata_guide: ad.AnnData,
         adata_gene: ad.AnnData,
         run_label: str,
+        lightweight: bool = False,
+        null_size: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Run the target mAP metric (+ activity as dependency).
@@ -947,60 +1206,72 @@ class OrganelleAttributionStage(BaseStage):
         Only computes the metric specified by ``self.metric``.  Activity is
         always computed first since distinctiveness/CORUM/CHAD depend on it.
 
+        Parameters
+        ----------
+        lightweight : bool
+            When True (used during greedy candidate evaluation), uses reduced
+            null_size (10K vs 1M) for ~100x faster p-value estimation.
+        null_size : int, optional
+            Explicit null_size override. If provided, takes precedence over
+            the lightweight flag. Allows intermediate re-evaluations to use
+            a moderate value (100K) instead of the full 1M.
+
         Returns dict with results or None on failure.
         """
         try:
             t0 = time.time()
             metric = self.metric
+            if null_size is not None:
+                ns = null_size
+            else:
+                ns = self._LIGHTWEIGHT_NULL_SIZE if lightweight else 1_000_000
 
             # 1. Activity (always needed — dependency for all other metrics)
             activity_map, active_ratio = phenotypic_activity_assesment(
-                adata_guide, plot_results=False
+                adata_guide, plot_results=False, null_size=ns,
             )
             activity_auc = compute_auc_score(activity_map)
-            activity_sweep = compute_threshold_sweep_auc(activity_map)
             logger.info(
                 f"    [{run_label}] Activity ({time.time()-t0:.1f}s): "
                 f"{active_ratio:.2%} active, AUC={activity_auc:.4f}"
             )
 
             # 2. Distinctiveness (guide level)
-            distinct_map, distinctive_ratio, distinct_auc, distinct_sweep = None, 0.0, 0.0, 0.0
+            distinct_map, distinctive_ratio, distinct_auc = None, 0.0, 0.0
             if metric == "distinctiveness":
                 t1 = time.time()
                 distinct_map, distinctive_ratio = phenotypic_distinctivness(
-                    adata_guide, activity_map, plot_results=False
+                    adata_guide, activity_map, plot_results=False, null_size=ns,
                 )
                 distinct_auc = compute_auc_score(distinct_map)
-                distinct_sweep = compute_threshold_sweep_auc(distinct_map)
                 logger.info(
                     f"    [{run_label}] Distinctiveness ({time.time()-t1:.1f}s): "
                     f"{distinctive_ratio:.2%}, AUC={distinct_auc:.4f}"
                 )
 
             # 3. CORUM consistency (gene level)
-            corum_map, corum_ratio, corum_auc, corum_sweep = None, 0.0, 0.0, 0.0
+            corum_map, corum_ratio, corum_auc = None, 0.0, 0.0
             if metric == "corum":
                 t2 = time.time()
                 corum_map, corum_ratio = phenotypic_consistency_corum(
-                    adata_gene, activity_map, plot_results=False
+                    adata_gene, activity_map, plot_results=False, null_size=ns,
+                    cache_similarity=True,
                 )
                 corum_auc = compute_auc_score(corum_map)
-                corum_sweep = compute_threshold_sweep_auc(corum_map)
                 logger.info(
                     f"    [{run_label}] CORUM ({time.time()-t2:.1f}s): "
                     f"{corum_ratio:.2%}, AUC={corum_auc:.4f}"
                 )
 
             # 4. CHAD consistency (gene level)
-            chad_map, chad_ratio, chad_auc, chad_sweep = None, 0.0, 0.0, 0.0
+            chad_map, chad_ratio, chad_auc = None, 0.0, 0.0
             if metric == "chad":
                 t3 = time.time()
                 chad_map, chad_ratio = phenotypic_consistency_manual_annotation(
-                    adata_gene, activity_map, plot_results=False
+                    adata_gene, activity_map, plot_results=False, null_size=ns,
+                    cache_similarity=True,
                 )
                 chad_auc = compute_auc_score(chad_map)
-                chad_sweep = compute_threshold_sweep_auc(chad_map)
                 logger.info(
                     f"    [{run_label}] CHAD ({time.time()-t3:.1f}s): "
                     f"{chad_ratio:.2%}, AUC={chad_auc:.4f}"
@@ -1013,19 +1284,15 @@ class OrganelleAttributionStage(BaseStage):
                 "activity_map": activity_map,
                 "active_ratio": active_ratio,
                 "activity_auc": activity_auc,
-                "activity_sweep": activity_sweep,
                 "distinct_map": distinct_map,
                 "distinctive_ratio": distinctive_ratio,
                 "distinct_auc": distinct_auc,
-                "distinct_sweep": distinct_sweep,
                 "corum_map": corum_map,
                 "corum_ratio": corum_ratio,
                 "corum_auc": corum_auc,
-                "corum_sweep": corum_sweep,
                 "chad_map": chad_map,
                 "chad_ratio": chad_ratio,
                 "chad_auc": chad_auc,
-                "chad_sweep": chad_sweep,
             }
 
         except Exception as e:
@@ -1059,12 +1326,6 @@ class OrganelleAttributionStage(BaseStage):
                 baseline["distinct_auc"],
                 baseline["corum_auc"],
                 baseline["chad_auc"],
-            ],
-            "sweep_auc": [
-                baseline["activity_sweep"],
-                baseline["distinct_sweep"],
-                baseline["corum_sweep"],
-                baseline["chad_sweep"],
             ],
         }
         summary_path = baseline_dir / "baseline_summary.csv"
@@ -1117,122 +1378,171 @@ class OrganelleAttributionStage(BaseStage):
             "metric_ratio": self._get_metric_ratio(baseline),
         })
 
-        # Determine parallelism: use threads (PCA/numpy release GIL)
-        import os
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        n_workers = max(1, min(8, int(os.environ.get("SLURM_CPUS_PER_TASK", "4")) // 2))
-        logger.info(f"  Backward elimination across {n_labels} channel groups (workers={n_workers})...")
+        # Use joblib with loky backend — spawns separate processes so no
+        # OpenMP/BLAS thread deadlocks. Cap at 8 to limit memory usage.
+        from joblib import Parallel, delayed
+        from ops_utils.hpc.resource_manager import get_optimal_workers
+        n_workers = min(get_optimal_workers(use_gpu=False, model_ram_gb=0.1, data_ram_gb=4.0, verbose=False), 8)
 
-        for step_num in range(1, n_labels):
-            # At each step, try removing each remaining channel from the current set
-            best_label = None
-            best_score = -np.inf
-            best_result_dict = None
+        # Pre-compute integer index arrays (optimization #3)
+        label_to_idx_guide = self._precompute_label_indices(adata_guide, label_to_cols)
+        label_to_idx_gene = self._precompute_label_indices(adata_gene, label_to_cols)
 
-            n_candidates = len(remaining)
-            logger.info(f"  Step {step_num}/{n_labels-1}: testing {n_candidates} candidates...")
+        pool = None  # kept for legacy branch guards
+        logger.info(f"  Backward elimination across {n_labels} channel groups (joblib loky workers={n_workers})...")
 
-            def _eval_bwd_candidate(candidate):
-                """Evaluate removing one candidate channel."""
-                keep_labels = remaining - {candidate}
-                subset_guide, subset_gene = self._subset_channels(
-                    adata_guide, adata_gene, label_to_cols, keep_labels
-                )
-                if subset_guide.n_vars == 0:
-                    return candidate, None
-                if self.fast_mode:
-                    subset_guide, subset_gene, _, _ = self._pca_reduce_combined(
-                        subset_guide, subset_gene, label=f"bwd_without_{candidate}"
-                    )
-                r = self._run_map_battery(
-                    subset_guide, subset_gene, f"bwd_without_{candidate}"
-                )
-                return candidate, r
+        try:
+            for step_num in range(1, n_labels):
+                # At each step, try removing each remaining channel from the current set
+                best_label = None
+                best_score = -np.inf
+                best_result_dict = None
 
-            candidates_sorted = sorted(remaining)
-            if n_workers > 1 and n_candidates > 1:
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = {pool.submit(_eval_bwd_candidate, c): c for c in candidates_sorted}
-                    for j, future in enumerate(as_completed(futures), 1):
-                        candidate, r = future.result()
+                n_candidates = len(remaining)
+                logger.info(f"  Step {step_num}/{n_labels-1}: testing {n_candidates} candidates...")
+
+                candidates_sorted = sorted(remaining)
+
+                if pool is not None and n_candidates > 1:
+                    # Process pool path (fork-based, lightweight mode)
+                    args_list = [
+                        (c, list(remaining - {c}), f"bwd_without_{c}")
+                        for c in candidates_sorted
+                    ]
+                    results = pool.map(_eval_candidate_process, args_list)
+                    for j, (candidate, score, ratio) in enumerate(results, 1):
                         logger.info(f"    [{step_num}/{n_labels-1}] completed {j}/{n_candidates}: {candidate}")
-                        if r is None:
+                        if score is None:
                             continue
-                        score = self._get_metric_score(r)
                         if score > best_score:
                             best_score = score
                             best_label = candidate
-                            best_result_dict = r
-            else:
-                for j, candidate in enumerate(candidates_sorted, 1):
-                    logger.info(f"    [{step_num}/{n_labels-1}] candidate {j}/{n_candidates}: {candidate}")
-                    candidate, r = _eval_bwd_candidate(candidate)
-                    if r is None:
-                        continue
-                    score = self._get_metric_score(r)
-                    if score > best_score:
-                        best_score = score
-                        best_label = candidate
-                        best_result_dict = r
+                else:
+                    # joblib parallel evaluation (loky backend — no fork deadlocks)
+                    def _eval_bwd_candidate(candidate):
+                        """Evaluate removing one candidate channel."""
+                        keep_labels = remaining - {candidate}
+                        subset_guide, subset_gene = self._subset_channels(
+                            adata_guide, adata_gene, label_to_cols, keep_labels
+                        )
+                        if subset_guide.n_vars == 0:
+                            return candidate, None
+                        if self.fast_mode and self.pca_optimized_dir is None:
+                            subset_guide, subset_gene, _, _ = self._pca_reduce_combined(
+                                subset_guide, subset_gene, label=f"bwd_without_{candidate}"
+                            )
+                        r = self._run_map_battery(
+                            subset_guide, subset_gene, f"bwd_without_{candidate}",
+                            lightweight=True,
+                        )
+                        return candidate, r
 
-            if best_label is None:
-                logger.warning(f"  Step {step_num}: no valid candidate, stopping")
-                break
+                    if n_workers > 1 and n_candidates > 1:
+                        results_list = Parallel(n_jobs=n_workers, backend="loky")(
+                            delayed(_eval_bwd_candidate)(c) for c in candidates_sorted
+                        )
+                        for j, (candidate, r) in enumerate(results_list, 1):
+                            logger.info(f"    [{step_num}/{n_labels-1}] completed {j}/{n_candidates}: {candidate}")
+                            if r is None:
+                                continue
+                            score = self._get_metric_score(r)
+                            if score > best_score:
+                                best_score = score
+                                best_label = candidate
+                                best_result_dict = r
+                    else:
+                        for j, candidate in enumerate(candidates_sorted, 1):
+                            logger.info(f"    [{step_num}/{n_labels-1}] candidate {j}/{n_candidates}: {candidate}")
+                            candidate, r = _eval_bwd_candidate(candidate)
+                            if r is None:
+                                continue
+                            score = self._get_metric_score(r)
+                            if score > best_score:
+                                best_score = score
+                                best_label = candidate
+                                best_result_dict = r
 
-            # Permanently remove the least impactful channel
-            remaining.discard(best_label)
-            elimination_order.append(best_label)
+                if best_label is None:
+                    logger.warning(f"  Step {step_num}: no valid candidate, stopping")
+                    break
 
-            # Compute per-perturbation deltas (against previous step, not baseline)
-            per_pert_delta = self._compute_per_perturbation_delta(
-                prev_result, best_result_dict, best_label
-            )
+                # Permanently remove the least impactful channel
+                remaining.discard(best_label)
+                elimination_order.append(best_label)
 
-            n_feats_remaining = sum(len(label_to_cols[l]) for l in remaining)
+                # Re-evaluate winner with moderate precision (null_size=100K)
+                # for per-step CSV storage. Only the baseline uses full 1M.
+                keep_labels = set(remaining)
+                subset_guide, subset_gene = self._subset_channels(
+                    adata_guide, adata_gene, label_to_cols, keep_labels
+                )
+                if self.fast_mode and self.pca_optimized_dir is None:
+                    subset_guide, subset_gene, _, _ = self._pca_reduce_combined(
+                        subset_guide, subset_gene, label=f"bwd_without_{best_label}_full"
+                    )
+                best_result_dict = self._run_map_battery(
+                    subset_guide, subset_gene, f"bwd_without_{best_label}",
+                    null_size=self._REEVAL_NULL_SIZE,
+                )
+                if best_result_dict is None:
+                    best_result_dict = {"activity_map": prev_result["activity_map"],
+                                        **{k: 0.0 for k in ["active_ratio", "distinctive_ratio",
+                                            "corum_ratio", "chad_ratio", "activity_auc", "distinct_auc",
+                                            "corum_auc", "chad_auc"]}}
 
-            ablation_results.append({
-                "label": best_label,
-                "step": step_num,
-                "n_features_removed": len(label_to_cols[best_label]),
-                "n_features_remaining": n_feats_remaining,
-                "n_channels_remaining": len(remaining),
-                "active_ratio": best_result_dict["active_ratio"],
-                "distinctive_ratio": best_result_dict["distinctive_ratio"],
-                "corum_ratio": best_result_dict["corum_ratio"],
-                "chad_ratio": best_result_dict["chad_ratio"],
-                "activity_auc": best_result_dict["activity_auc"],
-                "distinct_auc": best_result_dict["distinct_auc"],
-                "corum_auc": best_result_dict["corum_auc"],
-                "chad_auc": best_result_dict["chad_auc"],
-                "activity_sweep": best_result_dict["activity_sweep"],
-                "distinct_sweep": best_result_dict["distinct_sweep"],
-                "corum_sweep": best_result_dict["corum_sweep"],
-                "chad_sweep": best_result_dict["chad_sweep"],
-                "per_pert_delta": per_pert_delta,
-                "full_result": best_result_dict,
-            })
+                # Compute per-perturbation deltas (against previous step, not baseline)
+                per_pert_delta = self._compute_per_perturbation_delta(
+                    prev_result, best_result_dict, best_label
+                )
 
-            steps.append({
-                "step": step_num,
-                "label_removed": best_label,
-                "n_channels_remaining": len(remaining),
-                "n_features_remaining": n_feats_remaining,
-                "metric_auc": self._get_metric_score(best_result_dict),
-                "metric_ratio": self._get_metric_ratio(best_result_dict),
-            })
+                n_feats_remaining = sum(len(label_to_cols[l]) for l in remaining)
 
-            elapsed = time.time() - t_start
-            avg = elapsed / step_num
-            eta = avg * (n_labels - 1 - step_num)
-            logger.info(
-                f"  Step {step_num}/{n_labels-1}: removed '{best_label}' "
-                f"({len(remaining)} channels left) → "
-                f"{self.metric} AUC={self._get_metric_score(best_result_dict):.4f}, "
-                f"ratio={self._get_metric_ratio(best_result_dict):.2%} "
-                f"({avg:.1f}s/step, ETA {eta:.0f}s)"
-            )
+                ablation_results.append({
+                    "label": best_label,
+                    "step": step_num,
+                    "n_features_removed": len(label_to_cols[best_label]),
+                    "n_features_remaining": n_feats_remaining,
+                    "n_channels_remaining": len(remaining),
+                    "active_ratio": best_result_dict["active_ratio"],
+                    "distinctive_ratio": best_result_dict["distinctive_ratio"],
+                    "corum_ratio": best_result_dict["corum_ratio"],
+                    "chad_ratio": best_result_dict["chad_ratio"],
+                    "activity_auc": best_result_dict["activity_auc"],
+                    "distinct_auc": best_result_dict["distinct_auc"],
+                    "corum_auc": best_result_dict["corum_auc"],
+                    "chad_auc": best_result_dict["chad_auc"],
+                    "per_pert_delta": per_pert_delta,
+                    "full_result": best_result_dict,
+                })
 
-            prev_result = best_result_dict
+                steps.append({
+                    "step": step_num,
+                    "label_removed": best_label,
+                    "n_channels_remaining": len(remaining),
+                    "n_features_remaining": n_feats_remaining,
+                    "metric_auc": self._get_metric_score(best_result_dict),
+                    "metric_ratio": self._get_metric_ratio(best_result_dict),
+                })
+
+                elapsed = time.time() - t_start
+                avg = elapsed / step_num
+                eta = avg * (n_labels - 1 - step_num)
+                logger.info(
+                    f"  Step {step_num}/{n_labels-1}: removed '{best_label}' "
+                    f"({len(remaining)} channels left) → "
+                    f"{self.metric} AUC={self._get_metric_score(best_result_dict):.4f}, "
+                    f"ratio={self._get_metric_ratio(best_result_dict):.2%} "
+                    f"({avg:.1f}s/step, ETA {eta:.0f}s)"
+                )
+
+                prev_result = best_result_dict
+
+        finally:
+            # Clean up process pool and shared state
+            if pool is not None:
+                pool.close()
+                pool.join()
+            _POOL_SHARED.clear()
 
         # Save elimination order table
         steps_df = pd.DataFrame(steps)
@@ -1292,9 +1602,9 @@ class OrganelleAttributionStage(BaseStage):
         tick_labels = []
         for _, row in steps_df.iterrows():
             if row["step"] == 0:
-                tick_labels.append("all\nchannels")
+                tick_labels.append("all channels")
             else:
-                tick_labels.append(self._wrap_label(str(row["label_removed"])))
+                tick_labels.append(str(row["label_removed"]))
 
         panels = [
             (ax_auc,   "metric_auc",   f"{metric_label} AUC",              bl_auc),
@@ -1326,9 +1636,9 @@ class OrganelleAttributionStage(BaseStage):
                            linewidth=1.5, alpha=0.7,
                            label=f"Below 95% at step {step_vals[first_drop]}")
 
-            # Use channel names as x-tick labels (horizontal)
+            # Use channel names as x-tick labels (diagonal for readability)
             ax.set_xticks(step_vals)
-            ax.set_xticklabels(tick_labels, fontsize=7, ha="center", rotation=0)
+            ax.set_xticklabels(tick_labels, fontsize=10, ha="right", rotation=45)
 
             ax.set_xlabel("Channel Removed (cumulative, least important first)", fontsize=11)
             ax.set_ylabel(title, fontsize=12)
@@ -1708,81 +2018,152 @@ class OrganelleAttributionStage(BaseStage):
             "metric_ratio": 0.0,
         })
 
-        import os
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        n_workers = max(1, min(8, int(os.environ.get("SLURM_CPUS_PER_TASK", "4")) // 2))
-        n_labels = len(labels)
-        logger.info(f"  Forward selection across {n_labels} organelle groups (workers={n_workers})...")
-
-        for step_num in range(1, n_labels + 1):
-            best_label = None
-            best_score = -1.0
-            best_result_dict = None
-
-            n_candidates = len(remaining)
-            logger.info(f"  Step {step_num}/{n_labels}: testing {n_candidates} candidates...")
-
-            def _eval_fwd_candidate(candidate):
-                """Evaluate adding one candidate channel."""
-                include_labels = set(selected_order + [candidate])
+        # Enforce Phase as first channel if requested
+        if self.enforce_phase:
+            phase_label = None
+            for label in labels:
+                if label.lower() == "phase" or label.lower().startswith("phase,"):
+                    phase_label = label
+                    break
+            if phase_label and phase_label in remaining:
+                logger.info(f"  --enforce-phase: forcing '{phase_label}' as step 1")
+                selected_order.append(phase_label)
+                remaining.discard(phase_label)
+                # Evaluate Phase to record its score
                 subset_guide, subset_gene = self._subset_channels(
-                    adata_guide, adata_gene, label_to_cols, include_labels
+                    adata_guide, adata_gene, label_to_cols, set(selected_order)
                 )
-                if subset_guide.n_vars == 0:
-                    return candidate, None
-                if self.fast_mode:
+                if self.fast_mode and self.pca_optimized_dir is None:
                     subset_guide, subset_gene, _, _ = self._pca_reduce_combined(
-                        subset_guide, subset_gene, label=f"fwd_{candidate}"
+                        subset_guide, subset_gene, label="fwd_phase_enforced"
                     )
-                r = self._run_map_battery(subset_guide, subset_gene, f"fwd_{candidate}")
-                return candidate, r
+                r = self._run_map_battery(subset_guide, subset_gene, "fwd_phase_enforced", lightweight=True)
+                n_feats = sum(len(label_to_cols[l]) for l in selected_order)
+                steps.append({
+                    "step": 1,
+                    "label_added": phase_label,
+                    "n_features": n_feats,
+                    "metric_auc": self._get_metric_score(r) if r else 0.0,
+                    "metric_ratio": self._get_metric_ratio(r) if r else 0.0,
+                })
+                logger.info(
+                    f"  Step 1 (enforced): +'{phase_label}' → "
+                    f"AUC={steps[-1]['metric_auc']:.4f}, "
+                    f"ratio={steps[-1]['metric_ratio']:.2%}, "
+                    f"features={n_feats}"
+                )
+            else:
+                logger.warning(f"  --enforce-phase: no 'Phase' label found among {labels}")
 
-            candidates_sorted = sorted(remaining)
-            if n_workers > 1 and n_candidates > 1:
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = {pool.submit(_eval_fwd_candidate, c): c for c in candidates_sorted}
-                    for j, future in enumerate(as_completed(futures), 1):
-                        candidate, r = future.result()
+        from joblib import Parallel, delayed
+        from ops_utils.hpc.resource_manager import get_optimal_workers
+        n_workers = min(get_optimal_workers(use_gpu=False, model_ram_gb=0.1, data_ram_gb=4.0, verbose=False), 8)
+        n_labels = len(labels)
+
+        # Pre-compute integer index arrays (optimization #3)
+        label_to_idx_guide = self._precompute_label_indices(adata_guide, label_to_cols)
+        label_to_idx_gene = self._precompute_label_indices(adata_gene, label_to_cols)
+
+        pool = None  # kept for legacy branch guards
+        logger.info(f"  Forward selection across {n_labels} organelle groups (joblib loky workers={n_workers})...")
+
+        start_step = len(selected_order) + 1
+        try:
+            for step_num in range(start_step, n_labels + 1):
+                best_label = None
+                best_score = -1.0
+                best_ratio = 0.0
+
+                n_candidates = len(remaining)
+                logger.info(f"  Step {step_num}/{n_labels}: testing {n_candidates} candidates...")
+
+                candidates_sorted = sorted(remaining)
+
+                if pool is not None and n_candidates > 1:
+                    # Process pool path (fork-based, lightweight mode)
+                    args_list = [
+                        (c, list(set(selected_order + [c])), f"fwd_{c}")
+                        for c in candidates_sorted
+                    ]
+                    results = pool.map(_eval_candidate_process, args_list)
+                    for j, (candidate, score, ratio) in enumerate(results, 1):
                         logger.info(f"    [{step_num}/{n_labels}] completed {j}/{n_candidates}: {candidate}")
-                        if r is None:
+                        if score is None:
                             continue
-                        score = self._get_metric_score(r)
                         if score > best_score:
                             best_score = score
+                            best_ratio = ratio
                             best_label = candidate
-                            best_result_dict = r
-            else:
-                for j, candidate in enumerate(candidates_sorted, 1):
-                    logger.info(f"    [{step_num}/{n_labels}] candidate {j}/{n_candidates}: {candidate}")
-                    candidate, r = _eval_fwd_candidate(candidate)
-                    if r is None:
-                        continue
-                    score = self._get_metric_score(r)
-                    if score > best_score:
-                        best_score = score
-                        best_label = candidate
-                        best_result_dict = r
+                else:
+                    # joblib parallel evaluation (loky backend — no fork deadlocks)
+                    def _eval_fwd_candidate(candidate):
+                        """Evaluate adding one candidate channel."""
+                        include_labels = set(selected_order + [candidate])
+                        subset_guide, subset_gene = self._subset_channels(
+                            adata_guide, adata_gene, label_to_cols, include_labels
+                        )
+                        if subset_guide.n_vars == 0:
+                            return candidate, None
+                        if self.fast_mode and self.pca_optimized_dir is None:
+                            subset_guide, subset_gene, _, _ = self._pca_reduce_combined(
+                                subset_guide, subset_gene, label=f"fwd_{candidate}"
+                            )
+                        r = self._run_map_battery(
+                            subset_guide, subset_gene, f"fwd_{candidate}",
+                            lightweight=True,
+                        )
+                        return candidate, r
 
-            if best_label is None:
-                logger.warning(f"  Step {step_num}: no valid candidate, stopping")
-                break
+                    if n_workers > 1 and n_candidates > 1:
+                        results_list = Parallel(n_jobs=n_workers, backend="loky")(
+                            delayed(_eval_fwd_candidate)(c) for c in candidates_sorted
+                        )
+                        for j, (candidate, r) in enumerate(results_list, 1):
+                            logger.info(f"    [{step_num}/{n_labels}] completed {j}/{n_candidates}: {candidate}")
+                            if r is None:
+                                continue
+                            score = self._get_metric_score(r)
+                            if score > best_score:
+                                best_score = score
+                                best_ratio = self._get_metric_ratio(r)
+                                best_label = candidate
+                    else:
+                        for j, candidate in enumerate(candidates_sorted, 1):
+                            logger.info(f"    [{step_num}/{n_labels}] candidate {j}/{n_candidates}: {candidate}")
+                            candidate, r = _eval_fwd_candidate(candidate)
+                            if r is None:
+                                continue
+                            score = self._get_metric_score(r)
+                            if score > best_score:
+                                best_score = score
+                                best_ratio = self._get_metric_ratio(r)
+                                best_label = candidate
 
-            selected_order.append(best_label)
-            remaining.discard(best_label)
+                if best_label is None:
+                    logger.warning(f"  Step {step_num}: no valid candidate, stopping")
+                    break
 
-            n_feats = sum(len(label_to_cols[l]) for l in selected_order)
-            steps.append({
-                "step": step_num,
-                "label_added": best_label,
-                "n_features": n_feats,
-                "metric_auc": self._get_metric_score(best_result_dict),
-                "metric_ratio": self._get_metric_ratio(best_result_dict),
-            })
+                selected_order.append(best_label)
+                remaining.discard(best_label)
+
+                n_feats = sum(len(label_to_cols[l]) for l in selected_order)
+                steps.append({
+                    "step": step_num,
+                    "label_added": best_label,
+                    "n_features": n_feats,
+                    "metric_auc": best_score,
+                    "metric_ratio": best_ratio,
+                })
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+            _POOL_SHARED.clear()
 
             logger.info(
                 f"  Step {step_num}: +'{best_label}' → "
-                f"AUC={self._get_metric_score(best_result_dict):.4f}, "
-                f"ratio={self._get_metric_ratio(best_result_dict):.2%}, "
+                f"AUC={best_score:.4f}, "
+                f"ratio={best_ratio:.2%}, "
                 f"features={n_feats}"
             )
 
@@ -1820,7 +2201,7 @@ class OrganelleAttributionStage(BaseStage):
         plot_df = steps_df[steps_df["step"] > 0].reset_index(drop=True)
 
         # Build x-tick labels from channel names
-        tick_labels = [self._wrap_label(str(row["label_added"])) for _, row in plot_df.iterrows()]
+        tick_labels = [str(row["label_added"]) for _, row in plot_df.iterrows()]
 
         n_steps = len(plot_df)
         fig_width = max(14, n_steps * 1.2)
@@ -1857,9 +2238,9 @@ class OrganelleAttributionStage(BaseStage):
                            linewidth=1.5, alpha=0.7,
                            label=f"95% reached at step {step_vals[first_95]}")
 
-            # Use channel names as x-tick labels (horizontal)
+            # Use channel names as x-tick labels (diagonal for readability)
             ax.set_xticks(step_vals)
-            ax.set_xticklabels(tick_labels, fontsize=7, ha="center", rotation=0)
+            ax.set_xticklabels(tick_labels, fontsize=10, ha="right", rotation=45)
 
             ax.set_xlabel("Channel Added (cumulative, most important first)", fontsize=11)
             ax.set_ylabel(title, fontsize=12)
@@ -1892,6 +2273,10 @@ def run_attribution_job(
     variance_threshold: float = 0.95,
     mode: str = "all",
     metric: str = "activity",
+    variance_sweep: Optional[List[float]] = None,
+    agg_funcs: Optional[List[str]] = None,
+    pca_optimized_dir: Optional[str] = None,
+    enforce_phase: bool = False,
 ) -> str:
     """
     Run organelle attribution as a standalone SLURM job.
@@ -1925,8 +2310,12 @@ def run_attribution_job(
             config_path=Path(config_path),
             fast_mode=fast_mode,
             variance_threshold=variance_threshold,
+            pca_optimized_dir=pca_optimized_dir,
             mode=mode,
             metric=metric,
+            variance_sweep=variance_sweep,
+            agg_funcs=agg_funcs,
+            enforce_phase=enforce_phase,
         )
         # Override output_dir directly since we're not going through orchestrator
         stage._output_dir = output_dir / "13_organelle_attribution"
@@ -1982,6 +2371,25 @@ def main():
     parser.add_argument("--baseline-only", action="store_true",
                         help="Only compute the baseline mAP (no elimination). "
                              "Useful for comparing --fast vs full-feature baselines.")
+    parser.add_argument("--variance-sweep", action="store_true",
+                        help="With --baseline-only: sweep multiple PCA variance thresholds "
+                             "(95%%, 99%%, 99.5%%, 99.9%%) to measure how PCA affects mAP. "
+                             "PCA is fit once, then sliced — fast and memory-efficient.")
+    parser.add_argument("--multi-agg", action="store_true",
+                        help="Use multi-statistic aggregation (mean,std,min,max,median,sum) "
+                             "instead of mean-only. Produces 6x more features but enables "
+                             "NTC normalization to have an effect on DINO features.")
+    parser.add_argument("--pca-optimized", type=str,
+                        default="/hpc/projects/icd.fast.ops/organelle_attribution/pca_optimized",
+                        help="Path to directory containing guide_pca_optimized.h5ad and "
+                             "gene_pca_optimized.h5ad from the PCA optimization stage. "
+                             "When set, loads pre-reduced data instead of building from scratch.")
+    parser.add_argument("--enforce-phase", action="store_true",
+                        help="Force Phase as the first channel in forward selection (knockin). "
+                             "Useful when Phase is the baseline morphology channel.")
+    parser.add_argument("--downsampled", action="store_true",
+                        help="Use downsampled signal-group PCA data. Appends /downsampled "
+                             "to --pca-optimized path.")
 
     # SLURM options
     slurm_group = parser.add_argument_group("SLURM options")
@@ -1992,13 +2400,17 @@ def main():
     slurm_group.add_argument("--yes", "-y", action="store_true",
                              help="Skip confirmation prompt")
     slurm_group.add_argument("--slurm-memory", type=str, default="500GB",
-                             help="Memory (default: 500GB)")
-    slurm_group.add_argument("--slurm-time", type=int, default=480,
-                             help="Time limit in minutes (default: 120)")
-    slurm_group.add_argument("--slurm-cpus", type=int, default=16,
-                             help="CPUs (default: 16)")
+                             help="Memory (default: 200GB)")
+    slurm_group.add_argument("--slurm-time", type=int, default=720,
+                             help="Time limit in minutes (default: 720)")
+    slurm_group.add_argument("--slurm-cpus", type=int, default=64,
+                             help="CPUs (default: 64)")
 
     args = parser.parse_args()
+
+    # Resolve --downsampled: append /downsampled to pca-optimized path
+    if args.downsampled and args.pca_optimized:
+        args.pca_optimized = str(Path(args.pca_optimized) / "downsampled")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -2007,6 +2419,8 @@ def main():
         output_dir = Path(args.output_dir)
     else:
         output_dir = Path("/hpc/projects/icd.fast.ops/organelle_attribution")
+    if args.enforce_phase:
+        output_dir = output_dir / "phase_first"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     config_path = Path(args.config)
@@ -2040,6 +2454,9 @@ def main():
         # Default to single metric if not specified
         if args.metric == "all":
             args.metric = "activity"
+        # Enable fast mode for sweep (PCA is always used in sweep)
+        if args.variance_sweep:
+            args.fast = True
 
     # --- SLURM mode ---
     if args.slurm:
@@ -2061,6 +2478,14 @@ def main():
         )
         config_shim = SimpleNamespace(experiment="cross_experiment")
 
+        sweep_thresholds = None
+        if getattr(args, "variance_sweep", False):
+            sweep_thresholds = [0.90, 0.95, 0.99, 0.995, 0.999]
+
+        multi_agg = None
+        if getattr(args, "multi_agg", False):
+            multi_agg = ["mean", "std", "min", "max", "median", "sum"]
+
         stage = OrganelleAttributionStage(
             data_context=data_shim,
             config=config_shim,
@@ -2069,8 +2494,12 @@ def main():
             config_path=config_path,
             fast_mode=args.fast,
             variance_threshold=args.variance_threshold,
+            pca_optimized_dir=args.pca_optimized,
             mode=args.mode,
             metric=metric,
+            variance_sweep=sweep_thresholds,
+            agg_funcs=multi_agg,
+            enforce_phase=args.enforce_phase,
         )
         stage._output_dir = output_dir / "13_organelle_attribution"
         stage._output_dir.mkdir(parents=True, exist_ok=True)
@@ -2103,12 +2532,25 @@ def _run_slurm_mode(
         "slurm_partition": "cpu,gpu",
     }
 
+    # Variance sweep thresholds (if requested)
+    sweep_thresholds = None
+    if getattr(args, "variance_sweep", False):
+        sweep_thresholds = [0.90, 0.95, 0.99, 0.995, 0.999]
+
+    multi_agg = None
+    if getattr(args, "multi_agg", False):
+        multi_agg = ["mean", "std", "min", "max", "median", "sum"]
+
     common_kwargs = {
         "output_dir": str(output_dir),
         "config_path": str(config_path),
         "norm_methods": norm_methods,
         "fast_mode": args.fast,
         "variance_threshold": args.variance_threshold,
+        "variance_sweep": sweep_thresholds,
+        "agg_funcs": multi_agg,
+        "pca_optimized_dir": args.pca_optimized,
+        "enforce_phase": getattr(args, "enforce_phase", False),
     }
 
     # Resolve metric and mode lists
@@ -2139,7 +2581,10 @@ def _run_slurm_mode(
         print(f"  Metrics:   {', '.join(metrics)}")
         print(f"  Modes:     {', '.join(modes)}")
         print(f"  Jobs:      {mode_desc}")
-        print(f"  Fast:      {args.fast}" + (f" (variance threshold: {args.variance_threshold})" if args.fast else ""))
+        if args.pca_optimized:
+            print(f"  PCA:       pre-optimized ({args.pca_optimized})")
+        else:
+            print(f"  Fast:      {args.fast}" + (f" (variance threshold: {args.variance_threshold})" if args.fast else ""))
         print(f"  Partition: cpu,gpu")
         print(f"  Memory:    {args.slurm_memory}")
         print(f"  Time:      {args.slurm_time} min")
