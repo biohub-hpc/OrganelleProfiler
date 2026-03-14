@@ -55,6 +55,9 @@ from ops_utils.analysis.normalization import zscore_normalize
 from ops_model.features.anndata_utils import aggregate_to_level
 
 DEFAULT_SWEEP_THRESHOLDS = [0.60, 0.70, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84, 0.88, 0.90, 0.95]
+# CellProfiler features are hand-crafted and independent (not redundant like DINO embeddings),
+# so PCA is destructive at high thresholds. Optimal region is ~50% variance explained.
+DEFAULT_SWEEP_THRESHOLDS_CP = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
 MIN_PCS = 10  # Minimum PCs for peak selection (avoids degenerate 1-PC artifact)
 
 
@@ -276,6 +279,17 @@ def _n_pcs_for_threshold(cumvar: np.ndarray, threshold: float) -> int:
 
 def _score_activity(adata_guide: ad.AnnData, null_size: int = 100_000) -> Tuple[float, float]:
     """Score guide-level AnnData. Returns (active_ratio, auc)."""
+    # Strip obs to only copairs-required columns — extra string/categorical columns
+    # (e.g. label_str, experiment) cause 'ufunc isnan not supported' in copairs
+    if "n_cells" not in adata_guide.obs.columns:
+        adata_guide.obs["n_cells"] = 1
+    keep = [c for c in ["sgRNA", "perturbation", "n_cells"] if c in adata_guide.obs.columns]
+    adata_guide.obs = adata_guide.obs[keep].copy()
+    for col in adata_guide.obs.columns:
+        if adata_guide.obs[col].dtype.name == "category":
+            adata_guide.obs[col] = adata_guide.obs[col].astype(str)
+    adata_guide.X = np.asarray(adata_guide.X, dtype=np.float64)
+
     activity_map, active_ratio = phenotypic_activity_assesment(
         adata_guide, plot_results=False, null_size=null_size,
     )
@@ -818,6 +832,12 @@ def process_single_channel(
     X_raw = np.asarray(adata_cells.X, dtype=np.float32)
     del adata_cells
 
+    # Global z-score before PCA for CellProfiler features (different scales need standardization)
+    if feature_dir_override and "cell-profiler" in feature_dir_override:
+        from sklearn.preprocessing import StandardScaler
+        X_raw = StandardScaler().fit_transform(X_raw)
+        _logger.info(f"  Applied global z-score scaling (CellProfiler mode)")
+
     # Fit PCA once
     X_pcs, cumvar, pca_model = _fit_pca(X_raw)
     del X_raw, pca_model
@@ -1103,6 +1123,12 @@ def process_signal_group(
     X_raw = np.asarray(adata_cells.X, dtype=np.float32)
     del adata_cells
 
+    # Global z-score before PCA for CellProfiler features (different scales need standardization)
+    if feature_dir_override and "cell-profiler" in feature_dir_override:
+        from sklearn.preprocessing import StandardScaler
+        X_raw = StandardScaler().fit_transform(X_raw)
+        _logger.info(f"  Applied global z-score scaling (CellProfiler mode)")
+
     # --- Fit PCA once ---
     X_pcs, cumvar, pca_model = _fit_pca(X_raw)
     del X_raw, pca_model
@@ -1334,6 +1360,18 @@ def aggregate_channels(
     )
     _logger.info(f"  Guide: {adata_guide.n_obs} obs, {adata_guide.n_vars} features")
     _logger.info(f"  Gene: {adata_gene.n_obs} obs, {adata_gene.n_vars} features")
+
+    # Strip obs to copairs-required columns (extra string cols cause isnan error in copairs)
+    for _ad in [adata_guide, adata_gene]:
+        if _ad is not None:
+            if "n_cells" not in _ad.obs.columns:
+                _ad.obs["n_cells"] = 1
+            keep = [c for c in ["sgRNA", "perturbation", "n_cells"] if c in _ad.obs.columns]
+            _ad.obs = _ad.obs[keep].copy()
+            for col in _ad.obs.columns:
+                if _ad.obs[col].dtype.name == "category":
+                    _ad.obs[col] = _ad.obs[col].astype(str)
+            _ad.X = np.asarray(_ad.X, dtype=np.float64)
 
     # --- Phase 2a: Activity scoring (fast) ---
     _logger.info(f"Running activity scoring...")
@@ -1923,6 +1961,7 @@ def main():
         _cp_feature_dir_override = "cell-profiler"
         output_dir = output_dir / "cellprofiler"
         print(f"CellProfiler mode: features from 3-assembly/cell-profiler/anndata_objects/")
+        print(f"PCA sweep thresholds: {DEFAULT_SWEEP_THRESHOLDS_CP} (lower range — CP features are independent, not redundant like DINO)")
         print(f"Output: {output_dir}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2053,13 +2092,17 @@ def main():
     # Aggregate-only mode (local or SLURM)
     if args.aggregate_only:
         # Resolve paths and subdir for downsampled mode
-        agg_output = str(output_dir / "downsampled") if args.downsampled else str(output_dir)
-        agg_subdir = "per_signal" if args.downsampled else "per_channel"
+        if args.downsampled:
+            agg_output = str(output_dir / "downsampled")
+            agg_subdir = "per_signal"
+        else:
+            agg_output = str(output_dir)
+            agg_subdir = "per_channel"
         if args.slurm:
             from ops_utils.hpc.slurm_batch_utils import submit_parallel_jobs
             print(f"Submitting aggregation as SLURM job ({args.slurm_agg_memory}, {args.slurm_agg_time}min, {args.slurm_cpus}cpus)...")
-            if args.downsampled:
-                print(f"  Mode: downsampled (reading from {agg_output}/per_signal/)")
+            if is_signal_mode:
+                print(f"  Mode: signal-group (reading from {agg_output}/per_signal/)")
             agg_jobs = [{
                 "name": "pca_aggregate",
                 "func": aggregate_channels,
@@ -2093,12 +2136,12 @@ def main():
         return
 
     # --downsampled mode: pool cells by signal group, downsample, PCA
-    if args.downsampled or args.cell_profiler:
+    if args.downsampled:
         from ops_utils.hpc.slurm_batch_utils import submit_parallel_jobs
         from types import SimpleNamespace
 
         if args.cell_profiler:
-            ds_output_dir = output_dir  # already nested under cellprofiler/
+            ds_output_dir = output_dir / "downsampled"  # {output_dir}/cellprofiler/downsampled/
         else:
             ds_output_dir = output_dir / "downsampled"
         ds_output_dir.mkdir(parents=True, exist_ok=True)
@@ -2204,6 +2247,7 @@ def main():
                 )
                 if _cp_feature_dir_override:
                     sg_kwargs["feature_dir_override"] = _cp_feature_dir_override
+                    sg_kwargs["sweep_thresholds"] = DEFAULT_SWEEP_THRESHOLDS_CP
                 result = process_signal_group(**sg_kwargs)
                 print(f"  {result}")
             # Aggregate
@@ -2229,6 +2273,7 @@ def main():
                     "target_n_cells": target_n_cells,
                     "norm_method": args.norm_method,
                     **({"feature_dir_override": _cp_feature_dir_override} if _cp_feature_dir_override else {}),
+                    **({"sweep_thresholds": DEFAULT_SWEEP_THRESHOLDS_CP} if _cp_feature_dir_override else {}),
                 },
                 "metadata": {"signal": signal, "n_experiments": len(pairs)},
             })
@@ -2297,18 +2342,29 @@ def main():
         from types import SimpleNamespace
 
         # Discover experiments
-        data_shim = SimpleNamespace(experiment="pca_opt", graph_output_path=output_dir)
-        config_shim = SimpleNamespace(experiment="pca_opt")
-        stage = OrganelleAttributionStage(
-            data_context=data_shim,
-            config=config_shim,
-            level="guide",
-            norm_methods=[args.norm_method],
-            config_path=DEFAULT_CONFIG_PATH,
-            agg_funcs=None,
-        )
-        stage._output_dir = output_dir
-        all_pairs = stage._discover_dino_experiments()
+        if _cp_feature_dir_override:
+            if DEFAULT_CONFIG_PATH.exists():
+                with open(DEFAULT_CONFIG_PATH) as f:
+                    _disc_config = yaml.safe_load(f)
+            else:
+                _disc_config = {}
+            _disc_roots = [
+                Path(p) for p in _disc_config.get("storage_roots", [str(p) for p in DEFAULT_STORAGE_ROOTS])
+            ]
+            all_pairs = _discover_cellprofiler_experiments(_disc_roots)
+        else:
+            data_shim = SimpleNamespace(experiment="pca_opt", graph_output_path=output_dir)
+            config_shim = SimpleNamespace(experiment="pca_opt")
+            stage = OrganelleAttributionStage(
+                data_context=data_shim,
+                config=config_shim,
+                level="guide",
+                norm_methods=[args.norm_method],
+                config_path=DEFAULT_CONFIG_PATH,
+                agg_funcs=None,
+            )
+            stage._output_dir = output_dir
+            all_pairs = stage._discover_dino_experiments()
 
         if not all_pairs:
             print("No experiment-channel pairs found!")
@@ -2344,6 +2400,7 @@ def main():
             }
             if _cp_feature_dir_override:
                 job_kwargs["feature_dir_override"] = _cp_feature_dir_override
+                job_kwargs["sweep_thresholds"] = DEFAULT_SWEEP_THRESHOLDS_CP
             jobs.append({
                 "name": f"pca_{sig_safe}_{exp_short}",
                 "func": process_single_channel,
@@ -2414,6 +2471,7 @@ def main():
         # Local mode
         result = run_pca_optimization(
             output_dir=str(output_dir),
+            sweep_thresholds=DEFAULT_SWEEP_THRESHOLDS_CP if _cp_feature_dir_override else None,
             norm_method=args.norm_method,
         )
         print(result)
