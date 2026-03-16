@@ -1071,13 +1071,11 @@ def process_signal_group(
         if adata is None:
             continue
 
-        # Validate feature space alignment
+        # Track feature counts (no longer skip — use inner join on concat)
         if n_vars_expected is None:
             n_vars_expected = adata.n_vars
         elif adata.n_vars != n_vars_expected:
-            _logger.warning(f"  {exp}/{ch}: {adata.n_vars} features (expected {n_vars_expected}), skipping")
-            del adata
-            continue
+            _logger.info(f"  {exp}/{ch}: {adata.n_vars} features (vs {n_vars_expected}), will use shared features")
 
         # Proportional subsample: each experiment contributes proportionally to its cell count
         fraction = adata.n_obs / n_cells_pooled
@@ -1098,6 +1096,7 @@ def process_signal_group(
         all_blocks.append(ad.AnnData(
             X=np.asarray(adata.X, dtype=np.float32),
             obs=obs,
+            var=adata.var.copy(),
         ))
         loaded_exps.append(exp)
         _logger.info(f"  {exp.split('_')[0]}/{ch}: {exp_cell_counts[(exp, ch)]:,} → {n_take:,} cells")
@@ -1106,12 +1105,15 @@ def process_signal_group(
     if not all_blocks:
         return f"FAILED: {signal} — no cell data found for any experiment"
 
-    # Concatenate subsampled blocks
-    adata_cells = ad.concat(all_blocks, join="outer")
+    # Concatenate subsampled blocks — inner join keeps only features shared across all experiments
+    adata_cells = ad.concat(all_blocks, join="inner")
     del all_blocks
+    # Fill any NaNs from partial feature overlap
+    if np.isnan(adata_cells.X).any():
+        adata_cells.X = np.nan_to_num(adata_cells.X, nan=0.0)
     n_cells = adata_cells.n_obs
     n_feats = adata_cells.n_vars
-    _logger.info(f"  Pooled: {n_cells_pooled} total cells → {n_cells} downsampled ({n_feats} features)")
+    _logger.info(f"  Pooled: {n_cells_pooled} total cells → {n_cells} downsampled ({n_feats} shared features from {len(loaded_exps)} experiments)")
 
     # Keep obs and raw X
     # Note: 'experiment' is kept for provenance but must be dropped before scoring
@@ -1123,11 +1125,19 @@ def process_signal_group(
     X_raw = np.asarray(adata_cells.X, dtype=np.float32)
     del adata_cells
 
-    # Global z-score before PCA for CellProfiler features (different scales need standardization)
+    # Per-experiment z-score before PCA for CellProfiler features (different scales need standardization)
+    # Must be per-experiment to avoid batch effects dominating variance across experiments
     if feature_dir_override and "cell-profiler" in feature_dir_override:
         from sklearn.preprocessing import StandardScaler
-        X_raw = StandardScaler().fit_transform(X_raw)
-        _logger.info(f"  Applied global z-score scaling (CellProfiler mode)")
+        experiments = obs_df_full["experiment"].values if "experiment" in obs_df_full.columns else None
+        if experiments is not None:
+            for exp_id in np.unique(experiments):
+                mask = experiments == exp_id
+                X_raw[mask] = StandardScaler().fit_transform(X_raw[mask])
+            _logger.info(f"  Applied per-experiment z-score scaling (CellProfiler mode, {len(np.unique(experiments))} experiments)")
+        else:
+            X_raw = StandardScaler().fit_transform(X_raw)
+            _logger.info(f"  Applied global z-score scaling (CellProfiler mode, no experiment info)")
 
     # --- Fit PCA once ---
     X_pcs, cumvar, pca_model = _fit_pca(X_raw)
