@@ -1,0 +1,320 @@
+# Gene Super-Category Mapping for Reporter Radar Plots
+#
+# Maps genes to 8 high-level cell biology categories via three passes:
+#   1. chad_clusters: Named clusters from CHAD v5 hierarchy (highest priority)
+#   2. pathway_keywords: Reactome + GO annotation keyword matching
+#   3. gene_patterns: Regex fallback on gene name
+#
+# Categories are assigned in priority order (first match wins).
+# Designed for ~1009-gene OPS panel → ~90% coverage, 57-228 genes per category.
+#
+# Sources:
+#   CHAD: /hpc/projects/icd.ops/configs/gene_clusters/chad_positive_controls_v5_hierarchy.yml
+#   Gene panel: /hpc/projects/intracellular_dashboard/ops/configs/annotated_gene_panel_July2025.csv
+
+chad_hierarchy_path: /hpc/projects/icd.ops/configs/gene_clusters/chad_positive_controls_v5_hierarchy.yml
+gene_panel_path: /hpc/projects/intracellular_dashboard/ops/configs/annotated_gene_panel_July2025.csv
+
+super_categories:
+  Translation:
+    description: "Ribosome biogenesis, tRNA, translation initiation"
+    chad_clusters:
+      - translation
+      - ribosome
+      - "ribosome 40s"
+      - "ribosome 60s"
+      - "Ribosome 60s Biogenesis"
+      - "Ribosome 40s Biogenesis"
+      - tRNA
+      - "tRNA synthetase"
+      - eIF2
+    pathway_keywords:
+      - translation
+      - ribosom
+      - "trna synthetase"
+      - "aminoacyl-trna"
+      - "rrna processing"
+      - "rrna modification"
+      - "eukaryotic translation"
+      - "cap-dependent translation"
+      - "structural constituent of ribosome"
+      - "srp-dependent cotranslational"
+    gene_patterns:
+      - "^RPL\\d"
+      - "^RPS\\d"
+      - "^RPSA"
+      - "^MRPL"
+      - "^MRPS"
+      - "^EIF[2-6]"
+      - "^FAU$"
+      - "^UBA52$"
+
+  Gene Expression:
+    description: "Transcription, splicing, RNA processing, chromatin, mRNA export"
+    chad_clusters:
+      - "RNA Polymerase"
+      - Spliceosome
+      - mediator
+    pathway_keywords:
+      - transcription
+      - "mrna splicing"
+      - spliceosome
+      - "rna polymerase"
+      - "pre-mrna"
+      - snrnp
+      - "mrna processing"
+      - polyadenylation
+      - "mrna export"
+      - "generic transcription pathway"
+      - "rna polymerase ii"
+      - "regulation of transcription"
+      - "dna-templated transcription"
+    gene_patterns:
+      - "^POLR"
+      - "^SRSF"
+      - "^SNRP"
+      - "^PRPF"
+      - "^SF3[AB]"
+      - "^HNRNP"
+      - "^MED\\d"
+      - "^GTF2"
+      - "^TAF\\d"
+
+  Cell Cycle & DNA:
+    description: "Cell cycle, DNA replication, mitosis, cytokinesis, DNA repair, genome stability"
+    chad_clusters:
+      - "Cell Cycle (incomplete)"
+      - "DNA Replication"
+      - "Replication fork"
+      - MuvB
+    pathway_keywords:
+      - "cell cycle"
+      - mitotic
+      - mitosis
+      - "dna replication"
+      - "dna repair"
+      - "s phase"
+      - "m phase"
+      - "g1/s"
+      - "g2/m"
+      - chromosome
+      - "cell division"
+      - "sister chromatid"
+      - kinetochore
+      - spindle
+      - centrosome
+      - fanconi
+      - "homologous recombination"
+      - "base excision repair"
+      - "nucleotide excision repair"
+      - "mismatch repair"
+      - "dna damage"
+      - cytokinesis
+    gene_patterns:
+      - "^KIF\\d"
+      - "^BUB"
+      - "^CDC\\d"
+      - "^CDK\\d"
+      - "^CCN[ABDF]"
+      - "^MCM\\d"
+      - "^ORC\\d"
+      - "^AURKB"
+      - "^PLK\\d"
+      - "^CEP\\d"
+      - "^FANC"
+      - "^BRCA"
+      - "^RAD\\d"
+      - "^XRCC"
+      - "^ERCC"
+      - "^MSH\\d"
+      - "^MLH\\d"
+      - "^H2AFX$"
+
+  Signaling:
+    description: "mTOR, KRAS, RTKs, kinase cascades, receptor signaling"
+    chad_clusters:
+      - mTOR
+      - KRAS
+    pathway_keywords:
+      - "signal transduction"
+      - mapk
+      - "pi3k"
+      - akt
+      - mtor
+      - "ras signaling"
+      - wnt
+      - notch
+      - hedgehog
+      - "receptor tyrosine"
+      - "g protein coupled"
+      - gpcr
+      - "jak-stat"
+      - nfkb
+      - "interleukin signaling"
+      - "cytokine signaling"
+      - "kinase cascade"
+      - phosphatidylinositol
+    gene_patterns:
+      - "^MTOR$"
+      - "^LAMTOR"
+      - "^MAPK\\d"
+      - "^RPTOR$"
+      - "^RICTOR$"
+      - "^KRAS$"
+      - "^NRAS$"
+      - "^TSC[12]$"
+
+  Membrane Trafficking:
+    description: "COPI, ESCRT, SNARE, SRP, dynein, vesicle transport, endocytosis"
+    chad_clusters:
+      - "GOLGI to ER Transport"
+      - SRP
+      - dynein-dynactin
+    pathway_keywords:
+      - vesicle
+      - "membrane trafficking"
+      - golgi
+      - endosom
+      - exocytosis
+      - endocytosis
+      - clathrin
+      - copi
+      - copii
+      - "retrograde transport"
+      - "anterograde transport"
+      - snare
+      - "lysosomal membrane"
+      - "er to golgi"
+      - "intra-golgi"
+      - "intracellular protein transport"
+      - "secretory pathway"
+      - "adaptor complex"
+      - "vesicle-mediated transport"
+    gene_patterns:
+      - "^COP[ABGZE]"
+      - "^VPS\\d"
+      - "^SEC\\d"
+      - "^SRP\\d"
+      - "^SNAP\\d"
+      - "^VAMP"
+      - "^STX\\d"
+      - "^DYNC"
+      - "^DCTN"
+      - "^RAB\\d"
+      - "^AP[123][MSB]"
+      - "^EXOC"
+
+  Metabolism:
+    description: "Electron transport chain, mitochondria, lipid/amino acid metabolism"
+    chad_clusters:
+      - "electronic transport chain"
+      - "mitochondria protein import"
+    pathway_keywords:
+      - "metabolism of lipids"
+      - "fatty acid"
+      - "oxidative phosphorylation"
+      - "electron transport"
+      - "citric acid"
+      - "tca cycle"
+      - glycolysis
+      - gluconeogenesis
+      - "pentose phosphate"
+      - "amino acid metabolism"
+      - mitochondri
+      - "respiratory chain"
+      - "atp synthesis"
+      - cholesterol
+      - steroid
+      - "heme biosynthesis"
+      - "purine metabolism"
+      - pyrimidine
+      - iron
+      - "copper homeostasis"
+    gene_patterns:
+      - "^COX\\d"
+      - "^NDUF"
+      - "^ATP5"
+      - "^TIMM"
+      - "^TOMM"
+      - "^UQCR"
+      - "^ALAS"
+      - "^FECH$"
+      - "^GPX"
+      - "^IDH"
+      - "^HMGCR$"
+      - "^ACSL"
+      - "^ACSS"
+
+  Protein Homeostasis:
+    description: "Proteasome, ubiquitin, glycosylation, ER quality control, autophagy"
+    chad_clusters:
+      - Proteasome
+      - "Ufmylation 60s"
+    pathway_keywords:
+      - proteasom
+      - ubiquitin
+      - sumoylation
+      - neddylation
+      - "unfolded protein"
+      - "protein folding"
+      - chaperone
+      - erad
+      - "er quality"
+      - "n-linked glycosylation"
+      - "asparagine n-linked"
+      - "protein processing in er"
+      - calnexin
+      - autophagy
+      - "protein degradation"
+    gene_patterns:
+      - "^PSM[ABCD]"
+      - "^CCT\\d"
+      - "^HSP[A-Z]"
+      - "^UFM"
+      - "^UBE2"
+      - "^UBR"
+      - "^CUL\\d"
+      - "^SYVN"
+      - "^DERL"
+      - "^STT3"
+      - "^DDOST"
+      - "^DAD1"
+      - "^OST4"
+
+  Cytoskeleton & Morphology:
+    description: "Actin, focal adhesion, tubulin, cell shape, Rho GTPases, migration"
+    chad_clusters:
+      - "Focal adhesion"
+    pathway_keywords:
+      - cytoskeleton
+      - actin
+      - tubulin
+      - "focal adhesion"
+      - integrin
+      - "cell junction"
+      - adherens
+      - "cell-cell"
+      - "cell adhesion"
+      - "extracellular matrix"
+      - "cell morphogenesis"
+      - "cell migration"
+      - "rho gtpase"
+      - cdc42
+      - rac1
+      - "cell polarity"
+      - "axon guidance"
+      - "cell projection"
+    gene_patterns:
+      - "^ARPC"
+      - "^ACTN"
+      - "^KRT\\d"
+      - "^TUB[AB]"
+      - "^MYH\\d"
+      - "^MYO\\d"
+      - "^PXN$"
+      - "^PTK2$"
+      - "^VCL$"
+      - "^RHOA$"
+      - "^RAC[13]$"
+      - "^CFL1$"
+      - "^WASL$"

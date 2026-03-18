@@ -1,0 +1,45 @@
+# Reporter Radar Plot Configuration
+# Per-reporter mAP analysis with radar/spider plots grouped by cell biology categories.
+#
+# Runs mAP (activity + distinctiveness) independently for each reporter and
+# for each reporter-type (organelle category), then visualizes which biological
+# processes each reporter can distinguish via radar plots.
+
+# Storage roots to search for dino features (in priority order)
+storage_roots:
+  - /hpc/projects/icd.fast.ops
+
+# Directory name under 3-assembly containing dino anndata objects
+feature_dir: dino_features
+
+# Feature type for the combiner
+feature_type: dinov3
+
+# Join strategy for combining experiments ("inner" or "outer")
+join: inner
+
+# Gene super-category mapping file (relative to configs/ dir)
+supercategory_mapping: gene_supercategory_mapping.yaml
+
+# mAP null distribution size (1M for full precision, 10K for fast iteration)
+null_size: 1000000
+
+# Normalization method: "ntc" or "global"
+norm_method: ntc
+
+# Radar plot value metric per category axis
+# Options: "fraction_active", "mean_map", "auc_score"
+radar_metric: fraction_active
+
+# Minimum genes in a category for it to appear on the radar
+min_genes_per_category: 3
+
+# Minimum perturbations after join for a reporter to be scored
+min_perturbations: 50
+
+# SLURM settings
+slurm:
+  partition: cpu,gpu
+  mem: 256GB
+  cpus_per_task: 16
+  time_min: 480
