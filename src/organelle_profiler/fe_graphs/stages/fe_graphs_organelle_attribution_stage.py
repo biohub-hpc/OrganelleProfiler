@@ -5,34 +5,65 @@ Answers: **which organelle channels drive phenotypic discrimination of gene pert
 
 Workflow:
 1. Discover all experiments with dino guide_bulked_*.h5ad files, filter bad experiments
-2. Build biology-aware coembedding via concatenate_experiments_comprehensive
+2. Load pre-reduced PCA-optimized coembedding (guide + gene level)
 3. Run the 4 copairs mAP metrics (activity, distinctiveness, CORUM, CHAD) on full features
 4. Greedy backward elimination (knock-out): cumulatively remove least important channel
 5. Greedy forward selection (knock-in): cumulatively add most impactful channel
 6. Compute deltas to reveal each organelle's contribution + which perturbations depend on it
 
-Usage:
-  # Local mode:
-  python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage -o /path/to/output
+Output structure:
+  13_organelle_attribution/
+  ├── all/                     ← full data (default)
+  │   ├── knockout/{score}/{metric}/
+  │   └── knockin/{score}/{metric}/
+  │       └── phase_first/     ← only with --enforce-phase
+  └── downsampled/             ← --downsampled flag
+      ├── knockout/{score}/{metric}/
+      └── knockin/{score}/{metric}/
+          └── phase_first/
 
-  # SLURM mode:
+  score options: ratio (% above p<0.05), mean_map (unweighted mean mAP)
+
+Usage:
+  # SLURM — all 16 jobs (4 metrics × 2 scores × 2 modes), full data:
   python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage --slurm
-  python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage --slurm --slurm-memory 500GB
+
+  # SLURM — downsampled, knockin only (8 jobs):
+  python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage --slurm --downsampled --mode knockin
+
+  # SLURM — downsampled, knockin with phase forced first (8 jobs):
+  python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage --slurm --downsampled --mode knockin --enforce-phase
+
+  # Single job locally:
+  python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage \\
+      --metric corum --mode knockin --score mean_map
+
+  # Dry run (no data loaded):
+  python -m organelle_profiler.fe_graphs.stages.fe_graphs_organelle_attribution_stage --dry-run
 
 CLI arguments:
-  -o, --output-dir      Output directory (default: auto-generated)
-  --config              Path to config YAML (default: organelle_attribution_config.yaml)
-  --norm-method         Normalization method(s): global, ntc, or both (default: both)
-  --fast                Post-aggregation PCA reduction for faster iteration
-  --variance-threshold  Cumulative explained variance for PCA (default: 0.95)
-  --pca-optimized       Path to pre-reduced PCA-optimized h5ad dir (from pca_optimization_stage)
+  -o, --output-dir      Output directory (default: /hpc/projects/icd.fast.ops/organelle_attribution)
+  --metric              activity | distinctiveness | corum | chad | all (default: all)
+  --score               ratio | mean_map | all — scoring function for greedy ranking (default: all)
+  --mode                knockout | knockin | all (default: all)
+  --downsampled         Use downsampled PCA data; outputs under .../downsampled/ instead of .../all/
+  --enforce-phase       Force Phase as the first channel added in knockin; outputs under knockin/phase_first/
+  --config              Path to config YAML
+  --norm-method         Normalization: ntc | global | both (default: ntc)
+  --fast                Enable post-aggregation PCA reduction
+  --variance-threshold  PCA cumulative variance threshold (default: 0.95)
+  --pca-optimized       Path to dir with guide_pca_optimized.h5ad + gene_pca_optimized.h5ad
+                        (default: pca_optimized_v2/dino/all; --downsampled swaps to .../dino/downsampled)
   --dry-run             Discover experiments/channels and print summary without loading data
+  --baseline-only       Compute baseline mAP only, skip elimination
 
 SLURM options:
-  --slurm               Submit as a single SLURM job
-  --slurm-memory        Memory (default: 500GB)
-  --slurm-time          Time limit in minutes (default: 120)
-  --slurm-cpus          CPUs (default: 16)
+  --slurm               Submit as SLURM job(s)
+  --slurm-memory        Memory per job (default: 500GB)
+  --slurm-time          Time limit in minutes (default: 720)
+  --slurm-cpus          CPUs per job (default: 64)
+  --no-wait             Don't wait for jobs to finish
+  -y, --yes             Skip confirmation prompt
 """
 
 import time
@@ -189,6 +220,7 @@ class OrganelleAttributionStage(BaseStage):
     STAGE_NUMBER = 13
     STAGE_NAME = "organelle_attribution"
     VALID_METRICS = ("activity", "distinctiveness", "corum", "chad")
+    VALID_SCORES = ("ratio", "mean_map")
 
     def __init__(
         self,
@@ -204,6 +236,8 @@ class OrganelleAttributionStage(BaseStage):
     ):
         self.mode = kwargs.pop("mode", "all")  # "all", "knockout", or "knockin"
         self.metric = kwargs.pop("metric", "activity")  # which metric drives scoring
+        self.score = kwargs.pop("score", "ratio")  # scoring function: "ratio" (% above threshold) or "mean_map" (unweighted mean mAP)
+        self.downsampled = kwargs.pop("downsampled", False)  # use downsampled PCA data; affects output subdir
         self.variance_sweep = kwargs.pop("variance_sweep", None)  # list of thresholds for baseline sweep
         self.agg_funcs = kwargs.pop("agg_funcs", None)  # multi-stat aggregation e.g. ["mean","std","min","max","median","sum"]
         self.enforce_phase = kwargs.pop("enforce_phase", False)  # force Phase as first channel in forward selection
@@ -237,9 +271,8 @@ class OrganelleAttributionStage(BaseStage):
         """Execute the full organelle attribution pipeline.
 
         Loads data once (steps 1-3), then runs the full mAP analysis
-        (normalize → baseline → leave-one-out → attribution) separately
-        for each requested normalization method.  Results are saved under
-        ``<output_dir>/ntc_norm/`` and ``<output_dir>/global_norm/``.
+        (normalize → baseline → leave-one-out → attribution).
+        Results are saved under ``<output_dir>/{metric}/{score}/``.
         """
         result = StageResult()
         t0 = time.time()
@@ -311,16 +344,18 @@ class OrganelleAttributionStage(BaseStage):
             return result
 
         # Steps 4-7: Run for each normalization method
-        base_output_dir = self.output_dir
+        # Structure: 13_organelle_attribution/all/ or .../downsampled/
+        base_output_dir = self.output_dir / ("downsampled" if self.downsampled else "all")
+        base_output_dir.mkdir(parents=True, exist_ok=True)
         for norm_method in self.norm_methods:
             logger.info(f"\n{'='*70}")
-            logger.info(f"  NORMALIZATION: {norm_method} | METRIC: {self.metric} | MODE: {self.mode}")
+            logger.info(f"  NORMALIZATION: {norm_method} | METRIC: {self.metric} | SCORE: {self.score} | MODE: {self.mode}")
             logger.info(f"{'='*70}")
 
-            # Each norm method + metric gets its own output subdirectory
-            norm_dir = base_output_dir / f"{norm_method}_norm" / self.metric
-            norm_dir.mkdir(parents=True, exist_ok=True)
-            self._output_dir = norm_dir
+            # Output structure: {mode}/{score}/{metric}/
+            # knockout/knockin each get their own top-level subdirectory
+            # baseline sits inside the mode dir since each job computes its own
+            pass  # output_dir set per-mode below
 
             # Copy raw data (normalization writes in-place)
             t_copy = time.time()
@@ -388,18 +423,18 @@ class OrganelleAttributionStage(BaseStage):
                         sweep_guide, sweep_gene, f"sweep_{thresh:.3f}"
                     )
                     if sweep_result is not None:
-                        auc = self._get_metric_score(sweep_result)
+                        score = self._get_metric_score(sweep_result)
                         ratio = self._get_metric_ratio(sweep_result)
                         sweep_rows.append({
                             "variance_threshold": thresh,
                             "n_pcs": n_keep,
                             "actual_variance": actual_var,
-                            "auc": auc,
+                            "metric_score": score,
                             "active_ratio": ratio,
                             "time_s": time.time() - t_step,
                         })
                         logger.info(
-                            f"    AUC={auc:.4f}, ratio={ratio:.2%} "
+                            f"    score={score:.4f}, ratio={ratio:.2%} "
                             f"({time.time()-t_step:.1f}s)"
                         )
 
@@ -455,19 +490,21 @@ class OrganelleAttributionStage(BaseStage):
             logger.info("Step 5: Running baseline mAP battery...")
             baseline = self._run_map_battery(baseline_guide, baseline_gene, "baseline")
             if baseline is None:
-                result.add_error(f"Baseline mAP computation failed ({norm_method} norm)")
+                result.add_error(f"Baseline mAP computation failed (norm={norm_method})")
                 continue
 
-            self._save_baseline(baseline, result)
             logger.info(
-                f"  Baseline ({norm_method}, {self.metric}): "
-                f"AUC={self._get_metric_score(baseline):.4f}, "
+                f"  Baseline ({norm_method}, {self.metric}, score={self.score}): "
+                f"score={self._get_metric_score(baseline):.4f}, "
                 f"ratio={self._get_metric_ratio(baseline):.2%}"
             )
 
             # Step 6: Greedy backward elimination (cumulative knock-out)
             # Pass RAW normalized data + label_to_cols; PCA is redone per candidate
             if self.mode in ("all", "knockout"):
+                self._output_dir = base_output_dir / "knockout" / self.score / self.metric
+                self._output_dir.mkdir(parents=True, exist_ok=True)
+                self._save_baseline(baseline, result)
                 logger.info("Step 6: Greedy backward elimination (knock-out)...")
                 ablation_results = self._greedy_backward_elimination(
                     adata_guide, adata_gene, label_to_cols, baseline,
@@ -483,12 +520,26 @@ class OrganelleAttributionStage(BaseStage):
             # Step 8: Greedy forward selection (cumulative knock-in)
             # Pass RAW normalized data + label_to_cols; PCA is redone per candidate
             if self.mode in ("all", "knockin"):
+                knockin_dir = base_output_dir / "knockin"
+                if self.enforce_phase:
+                    knockin_dir = knockin_dir / "phase_first"
+                self._output_dir = knockin_dir / self.score / self.metric
+                self._output_dir.mkdir(parents=True, exist_ok=True)
+                self._save_baseline(baseline, result)
                 logger.info("Step 8: Greedy forward selection (knock-in)...")
                 self._greedy_minimal_set(
                     adata_guide, adata_gene, label_to_cols, baseline, norm_method, result
                 )
             else:
                 logger.info("Skipping knock-in (mode=%s)", self.mode)
+
+            # --baseline-only: neither mode block ran, save baseline at root
+            if self.mode not in ("all", "knockout", "knockin"):
+                self._output_dir = base_output_dir / self.score / self.metric
+                self._output_dir.mkdir(parents=True, exist_ok=True)
+                self._save_baseline(baseline, result)
+
+            self._output_dir = base_output_dir
 
         # Restore base output dir
         self._output_dir = base_output_dir
@@ -1170,15 +1221,23 @@ class OrganelleAttributionStage(BaseStage):
 
     # Mapping from metric name to result dict keys
     _METRIC_KEYS = {
-        "activity":        {"auc": "activity_auc",  "ratio": "active_ratio"},
-        "distinctiveness": {"auc": "distinct_auc",   "ratio": "distinctive_ratio"},
-        "corum":           {"auc": "corum_auc",      "ratio": "corum_ratio"},
-        "chad":            {"auc": "chad_auc",       "ratio": "chad_ratio"},
+        "activity":        {"auc": "activity_auc",  "ratio": "active_ratio",      "mean_map": "activity_mean_map"},
+        "distinctiveness": {"auc": "distinct_auc",   "ratio": "distinctive_ratio", "mean_map": "distinct_mean_map"},
+        "corum":           {"auc": "corum_auc",      "ratio": "corum_ratio",       "mean_map": "corum_mean_map"},
+        "chad":            {"auc": "chad_auc",       "ratio": "chad_ratio",        "mean_map": "chad_mean_map"},
     }
 
     def _get_metric_score(self, result_dict: Dict) -> float:
-        """Return the AUC score for the configured metric (used for greedy decisions)."""
-        return result_dict[self._METRIC_KEYS[self.metric]["auc"]]
+        """Return the greedy scoring value for the configured metric and score strategy.
+
+        ``self.score`` selects the signal used for channel ranking decisions:
+        - ``"ratio"``    : fraction of perturbations with p < 0.05 (% above threshold)
+        - ``"mean_map"`` : unweighted mean mAP across all perturbations
+
+        AUC (significance-weighted mAP) is always stored in results but is no longer
+        used as the decision metric — it is retained for reporting only.
+        """
+        return result_dict[self._METRIC_KEYS[self.metric][self.score]]
 
     def _get_metric_ratio(self, result_dict: Dict) -> float:
         """Return the ratio score for the configured metric (used for plotting)."""
@@ -1231,50 +1290,82 @@ class OrganelleAttributionStage(BaseStage):
                 adata_guide, plot_results=False, null_size=ns,
             )
             activity_auc = compute_auc_score(activity_map)
+            activity_mean_map = float(activity_map["mean_average_precision"].mean())
             logger.info(
                 f"    [{run_label}] Activity ({time.time()-t0:.1f}s): "
-                f"{active_ratio:.2%} active, AUC={activity_auc:.4f}"
+                f"{active_ratio:.2%} active, mean_mAP={activity_mean_map:.4f}, AUC={activity_auc:.4f}"
             )
 
+            # 2–4. Distinctiveness / CORUM / CHAD — computed on ALL geneKOs
+            #
+            # DESIGN CHOICE: unlike activity (which filters to significant hits),
+            # distinctiveness/CORUM/CHAD are evaluated on *all* perturbations,
+            # not just the active subset.  Filtering by activity makes these
+            # metrics unstable across channel ablations: as channels are removed
+            # the active set shrinks, so the denominator changes and scores
+            # become incomparable between ablation steps.  By passing an
+            # all-active activity_map we decouple the consistency/distinctiveness
+            # metrics from the activity filter, giving a stable reference signal
+            # across the full knockout/knockin trajectory.
+            if metric in ("distinctiveness", "corum", "chad"):
+                logger.warning(
+                    "STABILITY CHOICE: Distinctiveness, CORUM, and CHAD metrics "
+                    "are computed on ALL geneKOs (activity filter bypassed). "
+                    "This keeps the perturbation set constant across channel "
+                    "ablation steps so scores remain comparable. It does mean "
+                    "inactive perturbations contribute to these metrics."
+                )
+                _all_active_guide = pd.DataFrame({
+                    "perturbation": adata_guide.obs["perturbation"].unique(),
+                    "below_corrected_p": True,
+                })
+                _all_active_gene = pd.DataFrame({
+                    "perturbation": adata_gene.obs["perturbation"].unique(),
+                    "below_corrected_p": True,
+                })
+
             # 2. Distinctiveness (guide level)
-            distinct_map, distinctive_ratio, distinct_auc = None, 0.0, 0.0
+            distinct_map, distinctive_ratio, distinct_auc, distinct_mean_map = None, 0.0, 0.0, 0.0
             if metric == "distinctiveness":
                 t1 = time.time()
                 distinct_map, distinctive_ratio = phenotypic_distinctivness(
-                    adata_guide, activity_map, plot_results=False, null_size=ns,
+                    adata_guide, _all_active_guide, plot_results=False, null_size=ns,
                 )
                 distinct_auc = compute_auc_score(distinct_map)
+                distinct_mean_map = float(distinct_map["mean_average_precision"].mean())
                 logger.info(
                     f"    [{run_label}] Distinctiveness ({time.time()-t1:.1f}s): "
-                    f"{distinctive_ratio:.2%}, AUC={distinct_auc:.4f}"
+                    f"{distinctive_ratio:.2%}, mean_mAP={distinct_mean_map:.4f}, AUC={distinct_auc:.4f}"
                 )
 
             # 3. CORUM consistency (gene level)
-            corum_map, corum_ratio, corum_auc = None, 0.0, 0.0
+            corum_map, corum_ratio, corum_auc, corum_mean_map = None, 0.0, 0.0, 0.0
             if metric == "corum":
                 t2 = time.time()
                 corum_map, corum_ratio = phenotypic_consistency_corum(
-                    adata_gene, activity_map, plot_results=False, null_size=ns,
+                    adata_gene, _all_active_gene, plot_results=False, null_size=ns,
                     cache_similarity=True,
                 )
                 corum_auc = compute_auc_score(corum_map)
+                corum_mean_map = float(corum_map["mean_average_precision"].mean())
                 logger.info(
                     f"    [{run_label}] CORUM ({time.time()-t2:.1f}s): "
-                    f"{corum_ratio:.2%}, AUC={corum_auc:.4f}"
+                    f"{corum_ratio:.2%}, mean_mAP={corum_mean_map:.4f}, AUC={corum_auc:.4f}"
                 )
 
             # 4. CHAD consistency (gene level)
-            chad_map, chad_ratio, chad_auc = None, 0.0, 0.0
+            chad_map, chad_ratio, chad_auc, chad_mean_map = None, 0.0, 0.0, 0.0
             if metric == "chad":
                 t3 = time.time()
                 chad_map, chad_ratio = phenotypic_consistency_manual_annotation(
-                    adata_gene, activity_map, plot_results=False, null_size=ns,
+                    adata_gene, _all_active_gene, plot_results=False, null_size=ns,
                     cache_similarity=True,
                 )
                 chad_auc = compute_auc_score(chad_map)
+                chad_mean_map = float(chad_map["mean_average_precision"].mean())
                 logger.info(
                     f"    [{run_label}] CHAD ({time.time()-t3:.1f}s): "
-                    f"{chad_ratio:.2%}, AUC={chad_auc:.4f}"
+                    f"{chad_ratio:.2%}, mean_mAP={chad_mean_map:.4f}, AUC={chad_auc:.4f}"
                 )
 
             logger.info(f"    [{run_label}] Total: {time.time()-t0:.1f}s")
@@ -1284,15 +1375,19 @@ class OrganelleAttributionStage(BaseStage):
                 "activity_map": activity_map,
                 "active_ratio": active_ratio,
                 "activity_auc": activity_auc,
+                "activity_mean_map": activity_mean_map,
                 "distinct_map": distinct_map,
                 "distinctive_ratio": distinctive_ratio,
                 "distinct_auc": distinct_auc,
+                "distinct_mean_map": distinct_mean_map,
                 "corum_map": corum_map,
                 "corum_ratio": corum_ratio,
                 "corum_auc": corum_auc,
+                "corum_mean_map": corum_mean_map,
                 "chad_map": chad_map,
                 "chad_ratio": chad_ratio,
                 "chad_auc": chad_auc,
+                "chad_mean_map": chad_mean_map,
             }
 
         except Exception as e:
@@ -1320,6 +1415,12 @@ class OrganelleAttributionStage(BaseStage):
                 baseline["distinctive_ratio"],
                 baseline["corum_ratio"],
                 baseline["chad_ratio"],
+            ],
+            "mean_map": [
+                baseline["activity_mean_map"],
+                baseline["distinct_mean_map"],
+                baseline["corum_mean_map"],
+                baseline["chad_mean_map"],
             ],
             "auc": [
                 baseline["activity_auc"],
@@ -1374,7 +1475,7 @@ class OrganelleAttributionStage(BaseStage):
             "label_removed": "(none)",
             "n_channels_remaining": n_labels,
             "n_features_remaining": n_raw_features,
-            "metric_auc": self._get_metric_score(baseline),
+            "metric_score": self._get_metric_score(baseline),
             "metric_ratio": self._get_metric_ratio(baseline),
         })
 
@@ -1488,7 +1589,8 @@ class OrganelleAttributionStage(BaseStage):
                     best_result_dict = {"activity_map": prev_result["activity_map"],
                                         **{k: 0.0 for k in ["active_ratio", "distinctive_ratio",
                                             "corum_ratio", "chad_ratio", "activity_auc", "distinct_auc",
-                                            "corum_auc", "chad_auc"]}}
+                                            "corum_auc", "chad_auc", "activity_mean_map",
+                                            "distinct_mean_map", "corum_mean_map", "chad_mean_map"]}}
 
                 # Compute per-perturbation deltas (against previous step, not baseline)
                 per_pert_delta = self._compute_per_perturbation_delta(
@@ -1520,7 +1622,7 @@ class OrganelleAttributionStage(BaseStage):
                     "label_removed": best_label,
                     "n_channels_remaining": len(remaining),
                     "n_features_remaining": n_feats_remaining,
-                    "metric_auc": self._get_metric_score(best_result_dict),
+                    "metric_score": self._get_metric_score(best_result_dict),
                     "metric_ratio": self._get_metric_ratio(best_result_dict),
                 })
 
@@ -1530,7 +1632,7 @@ class OrganelleAttributionStage(BaseStage):
                 logger.info(
                     f"  Step {step_num}/{n_labels-1}: removed '{best_label}' "
                     f"({len(remaining)} channels left) → "
-                    f"{self.metric} AUC={self._get_metric_score(best_result_dict):.4f}, "
+                    f"{self.metric} score={self._get_metric_score(best_result_dict):.4f}, "
                     f"ratio={self._get_metric_ratio(best_result_dict):.2%} "
                     f"({avg:.1f}s/step, ETA {eta:.0f}s)"
                 )
@@ -1547,7 +1649,8 @@ class OrganelleAttributionStage(BaseStage):
         # Save elimination order table
         steps_df = pd.DataFrame(steps)
         steps_df["metric"] = self.metric
-        steps_df["baseline_auc"] = self._get_metric_score(baseline)
+        steps_df["score"] = self.score
+        steps_df["baseline_score"] = self._get_metric_score(baseline)
         steps_df["baseline_ratio"] = self._get_metric_ratio(baseline)
 
         csv_path = self.output_dir / "backward_elimination_order.csv"
@@ -1591,7 +1694,8 @@ class OrganelleAttributionStage(BaseStage):
         X-axis tick labels show which channel was removed at each step.
         """
         metric_label = self.metric.capitalize()
-        bl_auc = self._get_metric_score(baseline)
+        score_label = "mean mAP" if self.score == "mean_map" else "Ratio (p<0.05)"
+        bl_score = self._get_metric_score(baseline)
         bl_ratio = self._get_metric_ratio(baseline)
 
         n_steps = len(steps_df)
@@ -1607,8 +1711,8 @@ class OrganelleAttributionStage(BaseStage):
                 tick_labels.append(str(row["label_removed"]))
 
         panels = [
-            (ax_auc,   "metric_auc",   f"{metric_label} AUC",              bl_auc),
-            (ax_ratio, "metric_ratio", f"{metric_label} Ratio (p<0.05)",   bl_ratio),
+            (ax_auc,   "metric_score", f"{metric_label} {score_label} (greedy score)", bl_score),
+            (ax_ratio, "metric_ratio", f"{metric_label} Ratio (p<0.05)",               bl_ratio),
         ]
 
         for ax, col, title, bl_val in panels:
@@ -2014,7 +2118,7 @@ class OrganelleAttributionStage(BaseStage):
             "step": 0,
             "label_added": "(none)",
             "n_features": 0,
-            "metric_auc": 0.0,
+            "metric_score": 0.0,
             "metric_ratio": 0.0,
         })
 
@@ -2043,12 +2147,12 @@ class OrganelleAttributionStage(BaseStage):
                     "step": 1,
                     "label_added": phase_label,
                     "n_features": n_feats,
-                    "metric_auc": self._get_metric_score(r) if r else 0.0,
+                    "metric_score": self._get_metric_score(r) if r else 0.0,
                     "metric_ratio": self._get_metric_ratio(r) if r else 0.0,
                 })
                 logger.info(
                     f"  Step 1 (enforced): +'{phase_label}' → "
-                    f"AUC={steps[-1]['metric_auc']:.4f}, "
+                    f"score={steps[-1]['metric_score']:.4f}, "
                     f"ratio={steps[-1]['metric_ratio']:.2%}, "
                     f"features={n_feats}"
                 )
@@ -2151,7 +2255,7 @@ class OrganelleAttributionStage(BaseStage):
                     "step": step_num,
                     "label_added": best_label,
                     "n_features": n_feats,
-                    "metric_auc": best_score,
+                    "metric_score": best_score,
                     "metric_ratio": best_ratio,
                 })
         finally:
@@ -2170,7 +2274,8 @@ class OrganelleAttributionStage(BaseStage):
         # Save step table
         steps_df = pd.DataFrame(steps)
         steps_df["metric"] = self.metric
-        steps_df["baseline_auc"] = self._get_metric_score(baseline)
+        steps_df["score"] = self.score
+        steps_df["baseline_score"] = self._get_metric_score(baseline)
         steps_df["baseline_ratio"] = self._get_metric_ratio(baseline)
 
         csv_path = self.output_dir / "minimal_coverage_order.csv"
@@ -2194,7 +2299,8 @@ class OrganelleAttributionStage(BaseStage):
         Two subplots on the same canvas: AUC (scoring metric) and ratio (% significant).
         """
         metric_label = self.metric.capitalize()
-        bl_auc = self._get_metric_score(baseline)
+        score_label = "mean mAP" if self.score == "mean_map" else "Ratio (p<0.05)"
+        bl_score = self._get_metric_score(baseline)
         bl_ratio = self._get_metric_ratio(baseline)
 
         # Skip step 0 (no channels) — start from first channel added
@@ -2208,8 +2314,8 @@ class OrganelleAttributionStage(BaseStage):
         fig, (ax_auc, ax_ratio) = plt.subplots(1, 2, figsize=(fig_width, 8))
 
         panels = [
-            (ax_auc,   "metric_auc",   f"{metric_label} AUC",              bl_auc),
-            (ax_ratio, "metric_ratio", f"{metric_label} Ratio (p<0.05)",   bl_ratio),
+            (ax_auc,   "metric_score", f"{metric_label} {score_label} (greedy score)", bl_score),
+            (ax_ratio, "metric_ratio", f"{metric_label} Ratio (p<0.05)",               bl_ratio),
         ]
 
         for ax, col, title, bl_val in panels:
@@ -2273,6 +2379,8 @@ def run_attribution_job(
     variance_threshold: float = 0.95,
     mode: str = "all",
     metric: str = "activity",
+    score: str = "ratio",
+    downsampled: bool = False,
     variance_sweep: Optional[List[float]] = None,
     agg_funcs: Optional[List[str]] = None,
     pca_optimized_dir: Optional[str] = None,
@@ -2313,6 +2421,8 @@ def run_attribution_job(
             pca_optimized_dir=pca_optimized_dir,
             mode=mode,
             metric=metric,
+            score=score,
+            downsampled=downsampled,
             variance_sweep=variance_sweep,
             agg_funcs=agg_funcs,
             enforce_phase=enforce_phase,
@@ -2362,6 +2472,13 @@ def main():
                         choices=["all", "activity", "distinctiveness", "corum", "chad"],
                         help="Which mAP metric to score by. Default: all. "
                              "With --slurm, 'all' submits a separate job per metric.")
+    parser.add_argument("--score", default="all",
+                        choices=["all", "ratio", "mean_map"],
+                        help="Scoring function used for greedy channel ranking. "
+                             "'ratio' = %% perturbations above significance threshold; "
+                             "'mean_map' = unweighted mean mAP across all perturbations. "
+                             "Default: all (submits both scoring strategies as separate jobs). "
+                             "AUC is always computed and stored but is not used for decisions.")
     parser.add_argument("--mode", default="all", choices=["all", "knockout", "knockin"],
                         help="Run mode: all (both directions), knockout (backward elimination only), "
                              "knockin (forward selection only). Default: all. "
@@ -2380,7 +2497,7 @@ def main():
                              "instead of mean-only. Produces 6x more features but enables "
                              "NTC normalization to have an effect on DINO features.")
     parser.add_argument("--pca-optimized", type=str,
-                        default="/hpc/projects/icd.fast.ops/organelle_attribution/pca_optimized",
+                        default="/hpc/projects/icd.fast.ops/organelle_attribution/pca_optimized_v2/dino/all",
                         help="Path to directory containing guide_pca_optimized.h5ad and "
                              "gene_pca_optimized.h5ad from the PCA optimization stage. "
                              "When set, loads pre-reduced data instead of building from scratch.")
@@ -2408,9 +2525,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Resolve --downsampled: append /downsampled to pca-optimized path
+    # Resolve --downsampled: swap the leaf dir ('all' → 'downsampled') in the pca-optimized path
     if args.downsampled and args.pca_optimized:
-        args.pca_optimized = str(Path(args.pca_optimized) / "downsampled")
+        args.pca_optimized = str(Path(args.pca_optimized).parent / "downsampled")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -2419,8 +2536,6 @@ def main():
         output_dir = Path(args.output_dir)
     else:
         output_dir = Path("/hpc/projects/icd.fast.ops/organelle_attribution")
-    if args.enforce_phase:
-        output_dir = output_dir / "phase_first"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     config_path = Path(args.config)
@@ -2469,49 +2584,57 @@ def main():
         if args.metric == "all"
         else [args.metric]
     )
+    scores = (
+        list(OrganelleAttributionStage.VALID_SCORES)
+        if args.score == "all"
+        else [args.score]
+    )
 
-    for metric in metrics:
-        print(f"\n--- Running metric: {metric} ---")
-        data_shim = SimpleNamespace(
-            experiment="cross_experiment",
-            graph_output_path=output_dir,
-        )
-        config_shim = SimpleNamespace(experiment="cross_experiment")
+    sweep_thresholds = None
+    if getattr(args, "variance_sweep", False):
+        sweep_thresholds = [0.90, 0.95, 0.99, 0.995, 0.999]
 
-        sweep_thresholds = None
-        if getattr(args, "variance_sweep", False):
-            sweep_thresholds = [0.90, 0.95, 0.99, 0.995, 0.999]
+    multi_agg = None
+    if getattr(args, "multi_agg", False):
+        multi_agg = ["mean", "std", "min", "max", "median", "sum"]
 
-        multi_agg = None
-        if getattr(args, "multi_agg", False):
-            multi_agg = ["mean", "std", "min", "max", "median", "sum"]
+    for score in scores:
+        for metric in metrics:
+            print(f"\n--- Running metric: {metric} | score: {score} ---")
+            data_shim = SimpleNamespace(
+                experiment="cross_experiment",
+                graph_output_path=output_dir,
+            )
+            config_shim = SimpleNamespace(experiment="cross_experiment")
 
-        stage = OrganelleAttributionStage(
-            data_context=data_shim,
-            config=config_shim,
-            level="guide",
-            norm_methods=norm_methods,
-            config_path=config_path,
-            fast_mode=args.fast,
-            variance_threshold=args.variance_threshold,
-            pca_optimized_dir=args.pca_optimized,
-            mode=args.mode,
-            metric=metric,
-            variance_sweep=sweep_thresholds,
-            agg_funcs=multi_agg,
-            enforce_phase=args.enforce_phase,
-        )
-        stage._output_dir = output_dir / "13_organelle_attribution"
-        stage._output_dir.mkdir(parents=True, exist_ok=True)
+            stage = OrganelleAttributionStage(
+                data_context=data_shim,
+                config=config_shim,
+                level="guide",
+                norm_methods=norm_methods,
+                config_path=config_path,
+                fast_mode=args.fast,
+                variance_threshold=args.variance_threshold,
+                pca_optimized_dir=args.pca_optimized,
+                mode=args.mode,
+                metric=metric,
+                score=score,
+                variance_sweep=sweep_thresholds,
+                agg_funcs=multi_agg,
+                enforce_phase=args.enforce_phase,
+                downsampled=args.downsampled,
+            )
+            stage._output_dir = output_dir / "13_organelle_attribution"
+            stage._output_dir.mkdir(parents=True, exist_ok=True)
 
-        result = stage.run()
+            result = stage.run()
 
-        print(f"\nOutput: {stage.output_dir}")
-        print(f"Files: {len(result.output_files)}")
-        if result.errors:
-            print(f"Errors: {len(result.errors)}")
-            for err in result.errors:
-                print(f"  - {err}")
+            print(f"\nOutput: {stage.output_dir}")
+            print(f"Files: {len(result.output_files)}")
+            if result.errors:
+                print(f"Errors: {len(result.errors)}")
+                for err in result.errors:
+                    print(f"  - {err}")
 
 
 def _run_slurm_mode(
@@ -2551,27 +2674,34 @@ def _run_slurm_mode(
         "agg_funcs": multi_agg,
         "pca_optimized_dir": args.pca_optimized,
         "enforce_phase": getattr(args, "enforce_phase", False),
+        "downsampled": getattr(args, "downsampled", False),
     }
 
-    # Resolve metric and mode lists
+    # Resolve metric, mode, and score lists
     metrics = (
         list(OrganelleAttributionStage.VALID_METRICS)
         if args.metric == "all"
         else [args.metric]
     )
     modes = ["knockout", "knockin"] if args.mode == "all" else [args.mode]
+    scores = (
+        list(OrganelleAttributionStage.VALID_SCORES)
+        if args.score == "all"
+        else [args.score]
+    )
 
-    # Build job list: one job per (metric, mode) combination
+    # Build job list: one job per (metric, mode, score) combination
     jobs = []
-    for metric in metrics:
-        for mode in modes:
-            jobs.append({
-                "name": f"organelle_attribution_{metric}_{mode}",
-                "func": run_attribution_job,
-                "kwargs": {**common_kwargs, "mode": mode, "metric": metric},
-            })
+    for score in scores:
+        for metric in metrics:
+            for mode in modes:
+                jobs.append({
+                    "name": f"organelle_attribution_{metric}_{mode}_{score}",
+                    "func": run_attribution_job,
+                    "kwargs": {**common_kwargs, "mode": mode, "metric": metric, "score": score},
+                })
 
-    mode_desc = f"{len(metrics)} metrics × {len(modes)} modes = {len(jobs)} parallel jobs"
+    mode_desc = f"{len(scores)} scores × {len(metrics)} metrics × {len(modes)} modes = {len(jobs)} parallel jobs"
 
     if not args.yes:
         print(f"\nOrganelle Attribution SLURM Job(s):")
@@ -2579,6 +2709,7 @@ def _run_slurm_mode(
         print(f"  Config:    {config_path}")
         print(f"  Norm:      {', '.join(norm_methods)}")
         print(f"  Metrics:   {', '.join(metrics)}")
+        print(f"  Scores:    {', '.join(scores)}")
         print(f"  Modes:     {', '.join(modes)}")
         print(f"  Jobs:      {mode_desc}")
         if args.pca_optimized:
