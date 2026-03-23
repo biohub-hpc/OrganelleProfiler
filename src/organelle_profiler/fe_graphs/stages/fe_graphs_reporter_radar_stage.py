@@ -472,6 +472,33 @@ class ReporterRadarStage(BaseStage):
             self._plot_radar_overlay(radar_df, f"{self.metric}_{score}", out_dir, result)
             self._plot_heatmap(radar_df, f"{self.metric}_{score}", out_dir, result)
 
+    def replot_from_csvs(self, out_dir: Path) -> "StageResult":
+        """Regenerate all plots from existing radar_matrix_*.csv files.
+
+        Skips all data loading and mAP computation. Reads CSVs written by a
+        previous run and re-runs the three plot methods for each score.
+        """
+        from organelle_profiler.fe_graphs.stages.stage_result import StageResult
+        result = StageResult()
+        found = 0
+        for score in self.VALID_SCORES:
+            csv_path = out_dir / f"radar_matrix_{score}.csv"
+            if not csv_path.exists():
+                logger.info(f"  Skipping {score}: {csv_path} not found")
+                continue
+            radar_df = pd.read_csv(csv_path, index_col=0)
+            if radar_df.empty:
+                continue
+            self.radar_metric = score
+            metric_type = f"{self.metric}_{score}"
+            self._plot_radar_grid(radar_df, metric_type, out_dir, result)
+            self._plot_radar_overlay(radar_df, metric_type, out_dir, result)
+            self._plot_heatmap(radar_df, metric_type, out_dir, result)
+            found += 1
+            logger.info(f"  Replotted {score}: {len(result.output_files)} files so far")
+        logger.info(f"replot_from_csvs: {found} scores replotted -> {len(result.output_files)} files")
+        return result
+
     def _save_map_csvs(
         self,
         all_results: Dict[str, Dict[str, Any]],
@@ -968,6 +995,8 @@ def main():
                         help="Use downsampled PCA data; outputs under .../downsampled/ instead of .../all/")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover reporters and print summary")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Skip computation; regenerate plots from existing radar_matrix_*.csv files")
 
     slurm_group = parser.add_argument_group("SLURM options")
     slurm_group.add_argument("--slurm", action="store_true",
@@ -1018,6 +1047,28 @@ def main():
             config_path=config_path, supercategory_path=supercategory_path,
         )
         stage.dry_run()
+        return
+
+    # Plot-only — read existing CSVs and regenerate plots, no SLURM/computation
+    if args.plot_only:
+        data_shim = SimpleNamespace(experiment="cross_experiment", graph_output_path=output_dir)
+        config_shim = SimpleNamespace(experiment="cross_experiment")
+        data_subdir = "downsampled" if args.downsampled else "all"
+        n_total = len(levels) * len(metrics) * len(sources)
+        print(f"--plot-only: regenerating plots for {n_total} combinations from {output_dir}")
+        for level in levels:
+            for metric in metrics:
+                for source in sources:
+                    stage = ReporterRadarStage(
+                        data_context=data_shim, config=config_shim, level="guide",
+                        config_path=config_path, supercategory_path=supercategory_path,
+                        analysis_level=level, metric=metric, source=source,
+                        downsampled=args.downsampled,
+                    )
+                    stage._output_dir = output_dir / "14_reporter_radar"
+                    out_dir = stage._output_dir / data_subdir / level / metric / source
+                    logger.info(f"Replotting {level}/{metric}/{source} from {out_dir}")
+                    stage.replot_from_csvs(out_dir)
         return
 
     common_kwargs = {
