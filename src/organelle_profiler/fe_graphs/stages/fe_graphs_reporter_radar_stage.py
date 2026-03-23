@@ -181,11 +181,13 @@ class ReporterRadarStage(BaseStage):
             f"gene: {adata_gene_full.n_obs} obs × {adata_gene_full.n_vars} features"
         )
 
-        # Build label→feature-columns map from var_name prefixes (signal_label_N convention)
+        # Build label→feature-columns map from var_name prefixes (label_PCN convention)
+        import re as _re
+        _pc_re = _re.compile(r'^(.+)_PC\d+$')
         label_to_cols: Dict[str, List[str]] = {}
         for v in adata_guide_full.var_names:
-            parts = v.rsplit("_", 1)
-            prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else v
+            m = _pc_re.match(v)
+            prefix = m.group(1) if m else v
             label_to_cols.setdefault(prefix, []).append(v)
 
         reporter_labels = sorted(label_to_cols.keys())
@@ -459,7 +461,6 @@ class ReporterRadarStage(BaseStage):
 
         # 3. Radar matrices — both scores for this job's metric
         for score in self.VALID_SCORES:
-            self.radar_metric = score
             radar_df = self._compute_radar_matrix(all_results, gene_to_cat, self.metric, score)
             if radar_df is None or radar_df.empty:
                 continue
@@ -478,7 +479,6 @@ class ReporterRadarStage(BaseStage):
         Skips all data loading and mAP computation. Reads CSVs written by a
         previous run and re-runs the three plot methods for each score.
         """
-        from organelle_profiler.fe_graphs.stages.stage_result import StageResult
         result = StageResult()
         found = 0
         for score in self.VALID_SCORES:
@@ -489,7 +489,6 @@ class ReporterRadarStage(BaseStage):
             radar_df = pd.read_csv(csv_path, index_col=0)
             if radar_df.empty:
                 continue
-            self.radar_metric = score
             metric_type = f"{self.metric}_{score}"
             self._plot_radar_grid(radar_df, metric_type, out_dir, result)
             self._plot_radar_overlay(radar_df, metric_type, out_dir, result)
@@ -705,7 +704,7 @@ class ReporterRadarStage(BaseStage):
 
         metric_label = "Activity" if metric_type == "activity" else "Distinctiveness"
         fig.suptitle(
-            f"Reporter Radar — {metric_label} ({self.radar_metric})",
+            f"Reporter Radar — {metric_label}",
             fontsize=14, fontweight="bold", y=1.02,
         )
         plt.tight_layout()
@@ -744,7 +743,7 @@ class ReporterRadarStage(BaseStage):
 
         metric_label = "Activity" if metric_type == "activity" else "Distinctiveness"
         ax.set_title(
-            f"Reporter Overlay — {metric_label} ({self.radar_metric})",
+            f"Reporter Overlay — {metric_label}",
             fontsize=13, fontweight="bold", pad=30,
         )
 
@@ -767,12 +766,12 @@ class ReporterRadarStage(BaseStage):
         fig, ax = plt.subplots(figsize=(12, fig_h))
         sns.heatmap(
             radar_df, cmap="YlOrRd", annot=True, fmt=".2f",
-            ax=ax, cbar_kws={"label": self.radar_metric},
+            ax=ax, cbar_kws={"label": metric_type},
             linewidths=0.5,
         )
         metric_label = "Activity" if metric_type == "activity" else "Distinctiveness"
         ax.set_title(
-            f"Reporter × Category — {metric_label} ({self.radar_metric})",
+            f"Reporter × Category — {metric_label}",
             fontsize=13, fontweight="bold",
         )
         ax.set_ylabel("Reporter")
