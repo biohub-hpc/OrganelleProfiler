@@ -17,7 +17,7 @@ dependencies = [
     "numpy",
     "pandas",
     "zarr",
-    "iohub==0.3.0a6",
+    "iohub>=0.3.0a7",
     "pyyaml",
     "tqdm",
     "joblib",
@@ -56,6 +56,9 @@ all = [
 ]
 
 # Hatch config
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 only-include = ["src"]
 sources = ["src"]
