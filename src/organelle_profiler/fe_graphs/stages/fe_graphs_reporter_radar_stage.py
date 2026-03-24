@@ -888,9 +888,9 @@ class ReporterRadarStage(BaseStage):
             if map_df is None or map_df.empty:
                 continue
 
-            # Consistency metric: ontology_map already has one row per category
+            # Consistency metrics: map already has one row per category
             # (column "category"), not per gene. Pivot directly.
-            if metric_type == "consistency":
+            if metric_type in ("consistency", "chad_consistency"):
                 row: Dict[str, float] = {}
                 for _, cat_row in map_df.iterrows():
                     cat = cat_row.get("category")
