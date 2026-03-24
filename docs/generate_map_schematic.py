@@ -271,7 +271,7 @@ cbox(7.5,6.29,4.2,0.42,['Per-category mean(mAP)  →  reporter[cat]'],CB_LIGHT)
 carr(2.5,6.08,3.8,5.62); carr(7.5,6.08,6.2,5.62)
 cbox(5.0,5.28,5.2,0.62,
      ['Normalization:  spoke[cat]  =  reporter[cat]  /  baseline[cat]',
-      '1.0 = global baseline   |   >1.0 = enriched   |   <1.0 = depleted'],
+      'spoke = signal captured by reporter / signal captured by all reporters'],
      CP_LIGHT,fontsize=9)
 cats=['Mem.\nTraffic','Metab.','Cell\nCycle','Prot.\nHomeo.',
       'Signal.','Cytosk.','Gene\nExpr.','Transl.']
