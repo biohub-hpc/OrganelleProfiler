@@ -102,9 +102,9 @@ for x,y in qpts:
 qcx2=np.mean([p[0] for p in qpts]); qcy2=np.mean([p[1] for p in qpts])
 ax2.text(qcx2,qcy2+0.65,'LAMP1 KO\nguides',fontsize=10,color=CB,
          fontweight='bold',ha='center',zorder=6)
-for idx in [1,2,3,4,5]:
+for idx in [1,2,3,4,5,6,7]:
     ax2.annotate('',xy=(GCTR[idx][0],GCTR[idx][1]),
-                 xytext=(GCTR[0][0]+0.08,GCTR[0][1]-0.32),
+                 xytext=(qcx2,qcy2),
                  arrowprops=dict(arrowstyle='->',color='#aaaaaa',lw=0.85,
                                  connectionstyle=f'arc3,rad={0.07+idx*0.07}'))
 # question inside plot at bottom
