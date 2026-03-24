@@ -676,7 +676,7 @@ class ReporterRadarStage(BaseStage):
 
         ncols = min(4, n)
         nrows = (n + ncols - 1) // ncols
-        fig_w = ncols * 4.5
+        fig_w = ncols * 5.625  # +25% column width to prevent label overlap
         fig_h = nrows * 4.5
 
         fig, axes = plt.subplots(
