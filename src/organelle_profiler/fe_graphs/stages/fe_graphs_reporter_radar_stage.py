@@ -110,7 +110,7 @@ class ReporterRadarStage(BaseStage):
     VALID_SOURCES  = ("chad", "chad_boosted", "reactome_toplevel")
     VALID_SCORES   = ("ratio", "mean_map")
     VALID_LEVELS   = ("individual", "type")
-    VALID_METRICS  = ("activity", "distinctiveness", "corum", "chad")
+    VALID_METRICS  = ("activity", "distinctiveness", "distinctiveness_active", "corum", "chad")
 
     def __init__(
         self,
@@ -287,6 +287,7 @@ class ReporterRadarStage(BaseStage):
     ) -> Dict[str, Dict[str, Any]]:
         """Run mAP for each individual reporter."""
         all_results: Dict[str, Dict[str, Any]] = {}
+        self._label_stats: Dict[str, str] = {}
         n_total = len(reporter_labels)
 
         for i, label in enumerate(sorted(reporter_labels), 1):
@@ -295,6 +296,7 @@ class ReporterRadarStage(BaseStage):
             r = self._score_reporter([label], adata_guide_full, adata_gene_full, label_to_cols)
             if r is not None:
                 all_results[label] = r
+                self._label_stats[label] = f"1 reporter | {r['n_cells']:,} cells"
             else:
                 logger.warning(f"    Skipped {label}")
 
@@ -312,6 +314,7 @@ class ReporterRadarStage(BaseStage):
         """Run mAP for each reporter-type (union of member reporter features)."""
         all_results: Dict[str, Dict[str, Any]] = {}
         self._type_subtitles: Dict[str, str] = {}
+        self._label_stats: Dict[str, str] = {}
         n_total = len(type_groups)
 
         for i, (type_name, members) in enumerate(sorted(type_groups.items()), 1):
@@ -333,6 +336,7 @@ class ReporterRadarStage(BaseStage):
             r = self._score_reporter(members, adata_guide_full, adata_gene_full, label_to_cols)
             if r is not None:
                 all_results[type_name] = r
+                self._label_stats[type_name] = f"{r['n_reporters']} reporters | {r['n_cells']:,} cells (pooled)"
             else:
                 logger.warning(f"    Skipped type {type_name}")
 
@@ -395,19 +399,27 @@ class ReporterRadarStage(BaseStage):
                 "below_corrected_p": True,
             })
 
-            distinct_map, distinctive_ratio, distinct_auc = None, 0.0, 0.0
-            corum_map,    corum_ratio,        corum_auc    = None, 0.0, 0.0
-            chad_map,     chad_ratio,         chad_auc     = None, 0.0, 0.0
+            distinct_map,        distinctive_ratio,        distinct_auc        = None, 0.0, 0.0
+            distinct_active_map, distinctive_active_ratio, distinct_active_auc = None, 0.0, 0.0
+            corum_map,           corum_ratio,              corum_auc           = None, 0.0, 0.0
+            chad_map,            chad_ratio,               chad_auc            = None, 0.0, 0.0
 
-            if metric == "distinctiveness":
+            if metric in ("distinctiveness", "distinctiveness_active"):
                 t1 = time.time()
+                # All-geneKO version (no activity filter)
                 distinct_map, distinctive_ratio = phenotypic_distinctivness(
                     adata_guide, _all_active_guide, plot_results=False, null_size=self._null_size,
                 )
                 distinct_auc = compute_auc_score(distinct_map)
+                # Active-only version (filtered to activity-significant geneKOs)
+                distinct_active_map, distinctive_active_ratio = phenotypic_distinctivness(
+                    adata_guide, activity_map, plot_results=False, null_size=self._null_size,
+                )
+                distinct_active_auc = compute_auc_score(distinct_active_map)
                 logger.info(
-                    f"    Distinctiveness ({time.time()-t1:.1f}s): "
-                    f"{distinctive_ratio:.2%}, AUC={distinct_auc:.4f}"
+                    f"    Distinctiveness (all) ({time.time()-t1:.1f}s): "
+                    f"{distinctive_ratio:.2%}, AUC={distinct_auc:.4f} | "
+                    f"active-only: {distinctive_active_ratio:.2%}, AUC={distinct_active_auc:.4f}"
                 )
 
             elif metric == "corum":
@@ -434,21 +446,27 @@ class ReporterRadarStage(BaseStage):
                     f"{chad_ratio:.2%}, AUC={chad_auc:.4f}"
                 )
 
+            n_cells = int(adata_guide.obs["n_cells"].sum()) if "n_cells" in adata_guide.obs.columns else adata_guide.n_obs
             return {
-                "activity_map":      activity_map,
-                "distinct_map":      distinct_map,
-                "corum_map":         corum_map,
-                "chad_map":          chad_map,
-                "active_ratio":      active_ratio,
-                "distinctive_ratio": distinctive_ratio,
-                "corum_ratio":       corum_ratio,
-                "chad_ratio":        chad_ratio,
-                "activity_auc":      activity_auc,
-                "distinct_auc":      distinct_auc,
-                "corum_auc":         corum_auc,
-                "chad_auc":          chad_auc,
-                "n_perturbations":   adata_guide.n_obs,
-                "n_features":        adata_guide.n_vars,
+                "activity_map":             activity_map,
+                "distinct_map":             distinct_map,
+                "distinct_active_map":      distinct_active_map,
+                "corum_map":                corum_map,
+                "chad_map":                 chad_map,
+                "active_ratio":             active_ratio,
+                "distinctive_ratio":        distinctive_ratio,
+                "distinctive_active_ratio": distinctive_active_ratio,
+                "corum_ratio":              corum_ratio,
+                "chad_ratio":               chad_ratio,
+                "activity_auc":             activity_auc,
+                "distinct_auc":             distinct_auc,
+                "distinct_active_auc":      distinct_active_auc,
+                "corum_auc":                corum_auc,
+                "chad_auc":                 chad_auc,
+                "n_perturbations":          adata_guide.n_obs,
+                "n_features":               adata_guide.n_vars,
+                "n_reporters":              len(labels),
+                "n_cells":                  n_cells,
             }
 
         except Exception as e:
@@ -523,11 +541,12 @@ class ReporterRadarStage(BaseStage):
         out_dir: Path,
         result: StageResult,
     ) -> None:
-        """Save stacked mAP results across all reporters for all 4 metrics."""
+        """Save stacked mAP results across all reporters for all 5 metrics."""
         for metric_type, key in [
-            ("activity",        "activity_map"),
-            ("distinctiveness", "distinct_map"),
-            ("corum",           "corum_map"),
+            ("activity",               "activity_map"),
+            ("distinctiveness",        "distinct_map"),
+            ("distinctiveness_active", "distinct_active_map"),
+            ("corum",                  "corum_map"),
             ("chad",            "chad_map"),
         ]:
             frames = []
@@ -594,8 +613,11 @@ class ReporterRadarStage(BaseStage):
           - auc_score: significance-weighted AUC for genes in that category
         """
         _map_keys = {
-            "activity": "activity_map", "distinctiveness": "distinct_map",
-            "corum": "corum_map",       "chad": "chad_map",
+            "activity":                "activity_map",
+            "distinctiveness":         "distinct_map",
+            "distinctiveness_active":  "distinct_active_map",
+            "corum":                   "corum_map",
+            "chad":                    "chad_map",
         }
         map_key = _map_keys[metric_type]
         rows: Dict[str, Dict[str, float]] = {}
@@ -721,6 +743,10 @@ class ReporterRadarStage(BaseStage):
                 ax.text(0.5, -0.18, subtitle, transform=ax.transAxes,
                         fontsize=7, ha="center", va="top",
                         color="#444444", linespacing=1.4)
+            stats = getattr(self, "_label_stats", {}).get(reporter)
+            if stats:
+                ax.text(0.5, 1.18, stats, transform=ax.transAxes,
+                        fontsize=6, ha="center", va="bottom", color="#666666")
 
         # Hide unused axes
         for j in range(n, len(axes)):
