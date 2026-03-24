@@ -251,6 +251,12 @@ class ReporterRadarStage(BaseStage):
             f"Step 3: mAP scoring "
             f"(level={self.analysis_level}, metric={self.metric}, source={self.source})..."
         )
+        # Compute global baseline (all reporters combined) for normalized radar
+        logger.info("Computing global baseline (all reporters combined)...")
+        self._global_scored_result = self._score_reporter(
+            reporter_labels, adata_guide_full, adata_gene_full, label_to_cols
+        )
+
         if self.analysis_level == "individual":
             scored_results = self._run_all_reporters(
                 reporter_labels, adata_guide_full, adata_gene_full, label_to_cols, gene_to_cat, result
@@ -508,10 +514,12 @@ class ReporterRadarStage(BaseStage):
         self._category_counts = dict(_cat_counts)
 
         # 3. Radar matrices — both scores for this job's metric
+        radar_dfs: Dict[str, pd.DataFrame] = {}
         for score in self.VALID_SCORES:
             radar_df = self._compute_radar_matrix(all_results, gene_to_cat, self.metric, score)
             if radar_df is None or radar_df.empty:
                 continue
+            radar_dfs[score] = radar_df
 
             csv_path = out_dir / f"radar_matrix_{score}.csv"
             radar_df.to_csv(csv_path)
@@ -520,6 +528,39 @@ class ReporterRadarStage(BaseStage):
             self._plot_radar_grid(radar_df, f"{self.metric}_{score}", out_dir, result)
             self._plot_radar_overlay(radar_df, f"{self.metric}_{score}", out_dir, result)
             self._plot_heatmap(radar_df, f"{self.metric}_{score}", out_dir, result)
+
+        # 4. Normalized radar — reporter score / global baseline, shared scale across both scores
+        global_result = getattr(self, "_global_scored_result", None)
+        if global_result and radar_dfs:
+            norm_dfs: Dict[str, pd.DataFrame] = {}
+            for score, radar_df in radar_dfs.items():
+                global_df = self._compute_radar_matrix(
+                    {"__global__": global_result}, gene_to_cat, self.metric, score
+                )
+                if global_df is None or global_df.empty:
+                    continue
+                global_series = global_df.iloc[0].reindex(radar_df.columns).fillna(1e-6)
+                global_series = global_series.replace(0, 1e-6)
+                norm_df = radar_df.div(global_series, axis=1)
+                norm_df = norm_df.replace([np.inf, -np.inf], 0).fillna(0)
+                norm_dfs[score] = norm_df
+
+                csv_path = out_dir / f"radar_matrix_{score}_normalized.csv"
+                norm_df.to_csv(csv_path)
+                result.add_file(csv_path)
+
+            if norm_dfs:
+                # Single scale across both score types
+                joint_max = max(df.values.max() for df in norm_dfs.values())
+                joint_max = max(joint_max * 1.15, 1.1)  # always show at least 1.1x baseline
+                for score, norm_df in norm_dfs.items():
+                    self._plot_radar_grid(
+                        norm_df, f"{self.metric}_{score}_normalized", out_dir, result,
+                        max_val_override=joint_max,
+                    )
+                    self._plot_radar_overlay(
+                        norm_df, f"{self.metric}_{score}_normalized", out_dir, result,
+                    )
 
     def replot_from_csvs(self, out_dir: Path) -> "StageResult":
         """Regenerate all plots from existing radar_matrix_*.csv files.
@@ -723,6 +764,7 @@ class ReporterRadarStage(BaseStage):
         metric_type: str,
         out_dir: Path,
         result: StageResult,
+        max_val_override: Optional[float] = None,
     ) -> None:
         """Small multiples grid: one radar per reporter."""
         reporters = list(radar_df.index)
@@ -744,7 +786,8 @@ class ReporterRadarStage(BaseStage):
             axes = np.array([axes])
         axes = axes.flatten()
 
-        global_max = max(radar_df.values.max(), 0.01)
+        global_max = max_val_override if max_val_override is not None else max(radar_df.values.max(), 0.01)
+        is_normalized = max_val_override is not None
         cmap = plt.get_cmap("tab20")
         metric_label = "Activity" if "activity" in metric_type else "Distinctiveness"
 
@@ -761,7 +804,18 @@ class ReporterRadarStage(BaseStage):
                 values = radar_df.loc[reporter].values
                 color = cmap(i / max(n - 1, 1))
                 self._plot_radar_single(ax, values, categories, color, reporter)
-                ylim = min(global_max * 1.15, 1.0) if shared_scale else min(max(values.max(), 0.01) * 1.15, 1.0)
+                if is_normalized:
+                    # Draw reference ring at 1.0 (= global baseline)
+                    n_cats = len(categories)
+                    ref_angles = np.linspace(0, 2 * np.pi, n_cats, endpoint=False).tolist() + [0]
+                    ax.plot(ref_angles, [1.0] * (n_cats + 1),
+                            "--", color="gray", linewidth=0.8, alpha=0.6, zorder=0)
+                if shared_scale:
+                    ylim = global_max  # no 1.0 clamp for ratios
+                elif is_normalized:
+                    ylim = max(values.max(), 0.01) * 1.15
+                else:
+                    ylim = min(max(values.max(), 0.01) * 1.15, 1.0)
                 ax.set_ylim(0, ylim)
                 ax.set_title(_wrap_label(reporter, 25), fontsize=10, fontweight="bold", pad=20)
                 subtitle = getattr(self, "_type_subtitles", {}).get(reporter)
@@ -775,7 +829,10 @@ class ReporterRadarStage(BaseStage):
                             fontsize=6, ha="center", va="bottom", color="#666666")
             for j in range(n, len(axes2)):
                 axes2[j].set_visible(False)
-            scale_label = "shared scale" if shared_scale else "individual scale"
+            if is_normalized:
+                scale_label = "normalized to global baseline — 1.0 = all-reporters baseline"
+            else:
+                scale_label = "shared scale" if shared_scale else "individual scale"
             fig2.suptitle(
                 f"Reporter Radar — {metric_label} ({scale_label})",
                 fontsize=14, fontweight="bold", y=1.02,
