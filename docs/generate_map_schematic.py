@@ -77,7 +77,7 @@ for rx,ry in qpts:
 ax1.text(qcx,qcy+0.65,'LAMP1 KO\nguides',fontsize=10,color=CB,
          fontweight='bold',ha='center',zorder=6)
 # question inside plot at bottom
-ax1.text(0,-2.85,'Does this geneKO perturb\nthe reporter above NTC noise?',
+ax1.text(0,-2.85,'Does this geneKO cause a\ndetectable phenotypic change?',
          fontsize=9.5,ha='center',va='center',color=CDARK,zorder=7,
          bbox=dict(boxstyle='round,pad=0.3',fc='white',ec='#cccccc',lw=0.8,alpha=0.92))
 
