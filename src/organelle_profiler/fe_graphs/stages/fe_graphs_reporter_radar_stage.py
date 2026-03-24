@@ -110,7 +110,7 @@ class ReporterRadarStage(BaseStage):
     VALID_SOURCES  = ("chad", "chad_boosted", "reactome_toplevel")
     VALID_SCORES   = ("ratio", "mean_map")
     VALID_LEVELS   = ("individual", "type")
-    VALID_METRICS  = ("activity", "distinctiveness", "distinctiveness_active", "corum", "chad")
+    VALID_METRICS  = ("activity", "distinctiveness", "distinctiveness_active")
 
     def __init__(
         self,
