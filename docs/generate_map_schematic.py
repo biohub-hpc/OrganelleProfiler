@@ -293,7 +293,7 @@ ax_r.set_yticks([0.5,1.0]); ax_r.set_yticklabels(['0.5×','1×'],fontsize=8,colo
 ax_r.tick_params(pad=5)
 ax_r.legend(loc='upper right',bbox_to_anchor=(1.52,1.12),fontsize=9.5,
             framealpha=0.9,handlelength=1.5)
-ft(0.700,0.503,'Example output — normalized mean_mAP\n(scaled to reporter max = 1)',
+ft(0.700,0.516,'Example output — normalized mean_mAP\n(scaled to reporter max = 1)',
    ha='center',fontsize=10,fontweight='bold',color=CDARK)
 ax_c.text(3.2,0.85,'LAMP1: trafficking\nat outer ring (1.0)',fontsize=9,ha='center',va='center',
     color=CB,bbox=dict(boxstyle='round,pad=0.25',fc='#e8f0f8',ec=CB,lw=0.8))
