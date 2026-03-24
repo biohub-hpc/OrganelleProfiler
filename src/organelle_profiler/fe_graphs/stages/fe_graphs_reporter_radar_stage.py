@@ -2,6 +2,12 @@
 
 Answers: **what biology does each reporter see?**
 
+Three mAP metrics (--metric):
+  - activity: phenotypic activity (are geneKOs different from NTC?)
+  - distinctiveness / distinctiveness_active: are geneKOs distinguishable from each other?
+  - consistency: ontology pathway-level consistency — do genes in the same
+    ontology category cluster together?  Uses cached cosine similarity for speed.
+
 Two analysis levels:
   - Level 1 (per reporter): Each reporter evaluated on its own features
   - Level 2 (per reporter-type): Reporters sharing an organelle type combined
@@ -31,8 +37,7 @@ import logging
 from ops_utils.analysis.map_scores import (
     phenotypic_activity_assesment,
     phenotypic_distinctivness,
-    phenotypic_consistency_corum,
-    phenotypic_consistency_manual_annotation,
+    phenotypic_consistency_ontology,
     compute_auc_score,
 )
 from ops_utils.analysis.normalization import zscore_normalize
@@ -40,6 +45,7 @@ from ops_utils.analysis.gene_supercategories import (
     ALL_SOURCES,
     build_gene_supercategory_map,
     build_reactome_toplevel_map,
+    build_reactome_cell_biology_map,
     assign_genes_to_categories,
     assign_genes_to_categories_multi,
     is_reactome_toplevel_mode,
@@ -107,10 +113,12 @@ class ReporterRadarStage(BaseStage):
 
     DEFAULT_PCA_OPTIMIZED_DIR = "/hpc/projects/icd.fast.ops/organelle_attribution/pca_optimized_v2/dino/all"
 
-    VALID_SOURCES  = ("chad", "chad_boosted", "reactome_toplevel")
+    VALID_SOURCES  = ("chad", "chad_boosted", "reactome_toplevel", "reactome_cell_biology")
     VALID_SCORES   = ("ratio", "mean_map")
     VALID_LEVELS   = ("individual", "type")
-    VALID_METRICS  = ("activity", "distinctiveness", "distinctiveness_active")
+    VALID_METRICS  = ("activity", "distinctiveness", "distinctiveness_active", "consistency")
+    # consistency uses category-level mAP rows, not gene-level — ratio is meaningless for it
+    METRIC_SCORES  = {"consistency": ("mean_map",)}
 
     def __init__(
         self,
@@ -152,6 +160,22 @@ class ReporterRadarStage(BaseStage):
         self._min_perturbations = self.stage_config.get("min_perturbations", 50)
         self._min_genes_per_category = self.stage_config.get("min_genes_per_category", 3)
 
+        # Load pca_report.csv for signal→experiments and signal→n_cells mapping
+        self._signal_to_exps: Dict[str, List[str]] = {}
+        self._signal_to_ncells: Dict[str, int] = {}
+        self._label_stats: Dict[str, str] = {}
+        self._category_counts: Dict[str, int] = {}
+        pca_report_path = self.pca_optimized_dir / "pca_report.csv"
+        if pca_report_path.exists():
+            _pr = pd.read_csv(pca_report_path)
+            for _, row in _pr.iterrows():
+                sig = row["signal"]
+                if "experiment" in _pr.columns:
+                    exps = [e.strip() for e in str(row["experiment"]).split(",") if e.strip()]
+                    self._signal_to_exps[sig] = sorted(set(exps))
+                if "n_cells" in _pr.columns:
+                    self._signal_to_ncells[sig] = int(row["n_cells"])
+
     # ------------------------------------------------------------------
     # Main run
     # ------------------------------------------------------------------
@@ -192,15 +216,6 @@ class ReporterRadarStage(BaseStage):
 
         reporter_labels = sorted(label_to_cols.keys())
 
-        # Load pca_report.csv for signal→experiments mapping (used in type-mode subtitles)
-        self._signal_to_exps: Dict[str, List[str]] = {}
-        pca_report_path = self.pca_optimized_dir / "pca_report.csv"
-        if pca_report_path.exists():
-            _pr = pd.read_csv(pca_report_path, usecols=["signal", "experiment"])
-            for _, row in _pr.iterrows():
-                exps = [e.strip() for e in str(row["experiment"]).split(",") if e.strip()]
-                self._signal_to_exps[row["signal"]] = sorted(set(exps))
-
         # Apply reporter filter if specified
         if self.reporter_filter:
             reporter_labels = [l for l in reporter_labels if l in self.reporter_filter]
@@ -217,7 +232,10 @@ class ReporterRadarStage(BaseStage):
         sources_fs = frozenset({self.source})
         self._multi_mapping = is_reactome_toplevel_mode(sources_fs)
         if self._multi_mapping:
-            self._gene_to_cats = build_reactome_toplevel_map()
+            if self.source == "reactome_cell_biology":
+                self._gene_to_cats = build_reactome_cell_biology_map()
+            else:
+                self._gene_to_cats = build_reactome_toplevel_map()
             gene_to_cat = {}
         else:
             gene_to_cat = build_gene_supercategory_map(
@@ -302,7 +320,19 @@ class ReporterRadarStage(BaseStage):
             r = self._score_reporter([label], adata_guide_full, adata_gene_full, label_to_cols)
             if r is not None:
                 all_results[label] = r
-                self._label_stats[label] = f"1 reporter | {r['n_cells']:,} cells"
+                n_cells = self._signal_to_ncells.get(label, r["n_cells"])
+                exps = self._signal_to_exps.get(label, [])
+                n_exps = len(exps)
+                if n_exps <= 3 and n_exps > 0:
+                    exp_str = f"{n_exps} exps: {', '.join(exps)}"
+                elif n_exps > 3:
+                    exp_str = f"{n_exps} exps"
+                else:
+                    exp_str = ""
+                parts = [f"{n_cells:,} cells"]
+                if exp_str:
+                    parts.append(exp_str)
+                self._label_stats[label] = " | ".join(parts)
             else:
                 logger.warning(f"    Skipped {label}")
 
@@ -342,7 +372,21 @@ class ReporterRadarStage(BaseStage):
             r = self._score_reporter(members, adata_guide_full, adata_gene_full, label_to_cols)
             if r is not None:
                 all_results[type_name] = r
-                self._label_stats[type_name] = f"{r['n_reporters']} reporters | {r['n_cells']:,} cells (pooled)"
+                n_cells = sum(self._signal_to_ncells.get(m, 0) for m in members)
+                if n_cells == 0:
+                    n_cells = r["n_cells"]
+                all_exps = sorted({e for m in members for e in self._signal_to_exps.get(m, [])})
+                n_exps = len(all_exps)
+                if n_exps <= 3 and n_exps > 0:
+                    exp_str = f"{n_exps} exps: {', '.join(all_exps)}"
+                elif n_exps > 3:
+                    exp_str = f"{n_exps} exps"
+                else:
+                    exp_str = ""
+                parts = [f"{r['n_reporters']} reporters", f"{n_cells:,} cells (pooled)"]
+                if exp_str:
+                    parts.append(exp_str)
+                self._label_stats[type_name] = " | ".join(parts)
             else:
                 logger.warning(f"    Skipped type {type_name}")
 
@@ -359,9 +403,10 @@ class ReporterRadarStage(BaseStage):
 
         Data is already normalized — no loading or normalization needed.
 
-        DESIGN CHOICE: distinctiveness, CORUM, and CHAD are computed on ALL geneKOs
-        (not filtered to active ones), matching the attribution stage behaviour. This
-        keeps the perturbation set stable and comparable across reporters.
+        DESIGN CHOICE: distinctiveness and ontology consistency are computed on ALL
+        geneKOs (not filtered to active ones), matching the attribution stage
+        behaviour.  This keeps the perturbation set stable and comparable across
+        reporters.
         """
         label_str = ", ".join(labels)
         try:
@@ -407,8 +452,7 @@ class ReporterRadarStage(BaseStage):
 
             distinct_map,        distinctive_ratio,        distinct_auc        = None, 0.0, 0.0
             distinct_active_map, distinctive_active_ratio, distinct_active_auc = None, 0.0, 0.0
-            corum_map,           corum_ratio,              corum_auc           = None, 0.0, 0.0
-            chad_map,            chad_ratio,               chad_auc            = None, 0.0, 0.0
+            ontology_map,        ontology_ratio,           ontology_auc        = None, 0.0, 0.0
 
             if metric in ("distinctiveness", "distinctiveness_active"):
                 t1 = time.time()
@@ -428,28 +472,42 @@ class ReporterRadarStage(BaseStage):
                     f"active-only: {distinctive_active_ratio:.2%}, AUC={distinct_active_auc:.4f}"
                 )
 
-            elif metric == "corum":
-                t2 = time.time()
-                corum_map, corum_ratio = phenotypic_consistency_corum(
-                    adata_gene, _all_active_gene, plot_results=False,
-                    null_size=self._null_size, cache_similarity=True,
+            elif metric == "consistency":
+                t4 = time.time()
+                # Build gene→categories mapping for ontology consistency.
+                # Uses the same ontology source (chad/chad_boosted/reactome_toplevel)
+                # configured for this stage run.
+                gene_names = adata_gene.obs["perturbation"].unique().tolist()
+                if self._multi_mapping:
+                    # Reactome: gene → [cat1, cat2, ...]
+                    onto_gene_cats = {
+                        g: list(self._gene_to_cats.get(g, []))
+                        for g in gene_names
+                    }
+                else:
+                    # CHAD / CHAD-boosted: gene → single category → wrap as list
+                    from ops_utils.analysis.gene_supercategories import (
+                        build_gene_supercategory_map,
+                    )
+                    _single_map = build_gene_supercategory_map(
+                        self.supercategory_config, boosted=self._boosted,
+                    )
+                    onto_gene_cats = {
+                        g: [_single_map[g]] if g in _single_map else []
+                        for g in gene_names
+                    }
+                ontology_map, ontology_ratio = phenotypic_consistency_ontology(
+                    adata_gene, _all_active_gene,
+                    gene_to_categories=onto_gene_cats,
+                    source_label=self.source,
+                    plot_results=False,
+                    null_size=self._null_size,
+                    min_genes_per_category=self._min_genes_per_category,
                 )
-                corum_auc = compute_auc_score(corum_map)
+                ontology_auc = compute_auc_score(ontology_map)
                 logger.info(
-                    f"    CORUM ({time.time()-t2:.1f}s): "
-                    f"{corum_ratio:.2%}, AUC={corum_auc:.4f}"
-                )
-
-            elif metric == "chad":
-                t3 = time.time()
-                chad_map, chad_ratio = phenotypic_consistency_manual_annotation(
-                    adata_gene, _all_active_gene, plot_results=False,
-                    null_size=self._null_size, cache_similarity=True,
-                )
-                chad_auc = compute_auc_score(chad_map)
-                logger.info(
-                    f"    CHAD ({time.time()-t3:.1f}s): "
-                    f"{chad_ratio:.2%}, AUC={chad_auc:.4f}"
+                    f"    Ontology consistency ({time.time()-t4:.1f}s): "
+                    f"{ontology_ratio:.2%}, AUC={ontology_auc:.4f}"
                 )
 
             n_cells = int(adata_guide.obs["n_cells"].sum()) if "n_cells" in adata_guide.obs.columns else adata_guide.n_obs
@@ -457,18 +515,15 @@ class ReporterRadarStage(BaseStage):
                 "activity_map":             activity_map,
                 "distinct_map":             distinct_map,
                 "distinct_active_map":      distinct_active_map,
-                "corum_map":                corum_map,
-                "chad_map":                 chad_map,
+                "ontology_map":             ontology_map,
                 "active_ratio":             active_ratio,
                 "distinctive_ratio":        distinctive_ratio,
                 "distinctive_active_ratio": distinctive_active_ratio,
-                "corum_ratio":              corum_ratio,
-                "chad_ratio":               chad_ratio,
+                "ontology_ratio":           ontology_ratio,
                 "activity_auc":             activity_auc,
                 "distinct_auc":             distinct_auc,
                 "distinct_active_auc":      distinct_active_auc,
-                "corum_auc":                corum_auc,
-                "chad_auc":                 chad_auc,
+                "ontology_auc":             ontology_auc,
                 "n_perturbations":          adata_guide.n_obs,
                 "n_features":               adata_guide.n_vars,
                 "n_reporters":              len(labels),
@@ -513,9 +568,10 @@ class ReporterRadarStage(BaseStage):
         _cat_counts.pop("Other", None)
         self._category_counts = dict(_cat_counts)
 
-        # 3. Radar matrices — both scores for this job's metric
+        # 3. Radar matrices — scores valid for this metric
+        active_scores = self.METRIC_SCORES.get(self.metric, self.VALID_SCORES)
         radar_dfs: Dict[str, pd.DataFrame] = {}
-        for score in self.VALID_SCORES:
+        for score in active_scores:
             radar_df = self._compute_radar_matrix(all_results, gene_to_cat, self.metric, score)
             if radar_df is None or radar_df.empty:
                 continue
@@ -561,6 +617,9 @@ class ReporterRadarStage(BaseStage):
                     self._plot_radar_overlay(
                         norm_df, f"{self.metric}_{score}_normalized", out_dir, result,
                     )
+                    self._plot_heatmap(
+                        norm_df, f"{self.metric}_{score}_normalized", out_dir, result,
+                    )
 
     def replot_from_csvs(self, out_dir: Path) -> "StageResult":
         """Regenerate all plots from existing radar_matrix_*.csv files.
@@ -569,8 +628,44 @@ class ReporterRadarStage(BaseStage):
         previous run and re-runs the three plot methods for each score.
         """
         result = StageResult()
+
+        # Restore _category_counts from saved gene assignment CSV
+        from collections import Counter
+        cat_csv = out_dir / "gene_supercategory_assignment.csv"
+        if cat_csv.exists():
+            _cat_df = pd.read_csv(cat_csv)
+            _cat_counts = Counter(_cat_df["category"].tolist())
+            _cat_counts.pop("Other", None)
+            self._category_counts = dict(_cat_counts)
+            logger.info(f"  Loaded {len(self._category_counts)} category counts from {cat_csv}")
+
+        # Restore _label_stats from summary CSV (per-reporter cell counts + exp info)
+        summary_csv = out_dir / "summary.csv"
+        if summary_csv.exists() and not hasattr(self, "_label_stats"):
+            self._label_stats = {}
+        if summary_csv.exists():
+            _sum_df = pd.read_csv(summary_csv)
+            for _, row in _sum_df.iterrows():
+                label = row["reporter"]
+                n_cells = self._signal_to_ncells.get(label, 0)
+                exps = self._signal_to_exps.get(label, [])
+                n_exps = len(exps)
+                if n_exps <= 3 and n_exps > 0:
+                    exp_str = f"{n_exps} exps: {', '.join(exps)}"
+                elif n_exps > 3:
+                    exp_str = f"{n_exps} exps"
+                else:
+                    exp_str = ""
+                parts = [f"{n_cells:,} cells"] if n_cells > 0 else []
+                if exp_str:
+                    parts.append(exp_str)
+                if parts:
+                    self._label_stats[label] = " | ".join(parts)
+
         found = 0
-        for score in self.VALID_SCORES:
+        # Collect normalized DFs for joint scale
+        norm_dfs: Dict[str, pd.DataFrame] = {}
+        for score in self.METRIC_SCORES.get(self.metric, self.VALID_SCORES):
             csv_path = out_dir / f"radar_matrix_{score}.csv"
             if not csv_path.exists():
                 logger.info(f"  Skipping {score}: {csv_path} not found")
@@ -583,7 +678,29 @@ class ReporterRadarStage(BaseStage):
             self._plot_radar_overlay(radar_df, metric_type, out_dir, result)
             self._plot_heatmap(radar_df, metric_type, out_dir, result)
             found += 1
+
+            # Load normalized CSV if it exists
+            norm_csv = out_dir / f"radar_matrix_{score}_normalized.csv"
+            if norm_csv.exists():
+                norm_df = pd.read_csv(norm_csv, index_col=0)
+                if not norm_df.empty:
+                    norm_dfs[score] = norm_df
+
             logger.info(f"  Replotted {score}: {len(result.output_files)} files so far")
+
+        # Replot normalized versions with joint scale
+        if norm_dfs:
+            joint_max = max(df.values.max() for df in norm_dfs.values())
+            joint_max = max(joint_max * 1.15, 1.1)
+            for score, norm_df in norm_dfs.items():
+                metric_type = f"{self.metric}_{score}_normalized"
+                self._plot_radar_grid(norm_df, metric_type, out_dir, result,
+                                      max_val_override=joint_max)
+                self._plot_radar_overlay(norm_df, metric_type, out_dir, result)
+                self._plot_heatmap(norm_df, metric_type, out_dir, result)
+                found += 1
+            logger.info(f"  Replotted normalized: {len(norm_dfs)} scores")
+
         logger.info(f"replot_from_csvs: {found} scores replotted -> {len(result.output_files)} files")
         return result
 
@@ -593,13 +710,12 @@ class ReporterRadarStage(BaseStage):
         out_dir: Path,
         result: StageResult,
     ) -> None:
-        """Save stacked mAP results across all reporters for all 5 metrics."""
+        """Save stacked mAP results across all reporters for all 4 metrics."""
         for metric_type, key in [
             ("activity",               "activity_map"),
             ("distinctiveness",        "distinct_map"),
             ("distinctiveness_active", "distinct_active_map"),
-            ("corum",                  "corum_map"),
-            ("chad",            "chad_map"),
+            ("consistency",            "ontology_map"),
         ]:
             frames = []
             for label, r in sorted(all_results.items()):
@@ -621,7 +737,7 @@ class ReporterRadarStage(BaseStage):
         return float(map_df["mean_average_precision"].mean())
 
     def _build_summary(self, all_results: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
-        """Build per-reporter summary table with all 4 mAP metrics × 2 scores."""
+        """Build per-reporter summary table with all 5 mAP metrics × 2 scores."""
         rows = []
         for label, r in sorted(all_results.items()):
             rows.append({
@@ -631,18 +747,15 @@ class ReporterRadarStage(BaseStage):
                 # ratio (% above threshold) — NaN when metric not computed this job
                 "activity_ratio":    r["active_ratio"],
                 "distinct_ratio":    r["distinctive_ratio"],
-                "corum_ratio":       r["corum_ratio"],
-                "chad_ratio":        r["chad_ratio"],
+                "ontology_ratio":    r["ontology_ratio"],
                 # mean_map (unweighted mean mAP)
                 "activity_mean_map": self._mean_map(r["activity_map"]),
                 "distinct_mean_map": self._mean_map(r["distinct_map"]),
-                "corum_mean_map":    self._mean_map(r["corum_map"]),
-                "chad_mean_map":     self._mean_map(r["chad_map"]),
+                "ontology_mean_map": self._mean_map(r["ontology_map"]),
                 # AUC (significance-weighted, stored for reference)
                 "activity_auc":      r["activity_auc"],
                 "distinct_auc":      r["distinct_auc"],
-                "corum_auc":         r["corum_auc"],
-                "chad_auc":          r["chad_auc"],
+                "ontology_auc":      r["ontology_auc"],
             })
         return pd.DataFrame(rows)
 
@@ -668,14 +781,30 @@ class ReporterRadarStage(BaseStage):
             "activity":                "activity_map",
             "distinctiveness":         "distinct_map",
             "distinctiveness_active":  "distinct_active_map",
-            "corum":                   "corum_map",
-            "chad":                    "chad_map",
+            "consistency":             "ontology_map",
         }
         map_key = _map_keys[metric_type]
         rows: Dict[str, Dict[str, float]] = {}
 
         for label, r in all_results.items():
             map_df = r[map_key]
+            if map_df is None or map_df.empty:
+                continue
+
+            # Consistency metric: ontology_map already has one row per category
+            # (column "category"), not per gene. Pivot directly.
+            if metric_type == "consistency":
+                row: Dict[str, float] = {}
+                for _, cat_row in map_df.iterrows():
+                    cat = cat_row.get("category")
+                    if cat is None or cat == "Other":
+                        continue
+                    row[cat] = self._score_category(
+                        map_df[map_df["category"] == cat], score
+                    )
+                rows[label] = row
+                continue
+
             genes = map_df["perturbation"].tolist()
 
             if self._multi_mapping:
@@ -689,7 +818,7 @@ class ReporterRadarStage(BaseStage):
                     all_cats.update(cats)
                 all_cats.discard("Other")
 
-                row: Dict[str, float] = {}
+                row = {}
                 for cat in sorted(all_cats):
                     # Genes belonging to this category
                     cat_genes = {g for g, cats in gene_cats_multi.items() if cat in cats}
@@ -738,10 +867,15 @@ class ReporterRadarStage(BaseStage):
     # Radar / spider plots
     # ------------------------------------------------------------------
 
-    def _spoke_labels(self, categories: List[str]) -> List[str]:
-        """Return category names annotated with geneKO counts, e.g. 'Translation\n(n=94)'."""
+    def _spoke_labels(self, categories: List[str], inline: bool = False) -> List[str]:
+        """Return category names annotated with geneKO counts.
+
+        inline=False (default): 'Translation\\n(n=94)' — for horizontal tick labels.
+        inline=True:            'Translation (n=94)'   — for rotated radial labels.
+        """
         counts = getattr(self, "_category_counts", {})
-        return [f"{c}\n(n={counts[c]})" if c in counts else c for c in categories]
+        sep = " " if inline else "\n"
+        return [f"{c}{sep}(n={counts[c]})" if c in counts else c for c in categories]
 
     def _plot_radar_single(
         self, ax, values: np.ndarray, categories: List[str],
@@ -756,11 +890,53 @@ class ReporterRadarStage(BaseStage):
         ax.plot(angles, vals, "o-", color=color, linewidth=2, markersize=5, label=label)
         ax.fill(angles, vals, alpha=alpha, color=color)
         ax.set_xticks(angles[:-1])
-        # Scale font size and label padding with spoke count to avoid overlap
-        label_fontsize = max(5, 8 - max(0, n - 12) // 3)
-        label_pad = 5 + max(0, n - 10) * 1.5
-        ax.set_xticklabels(self._spoke_labels(categories), fontsize=label_fontsize)
-        ax.tick_params(pad=label_pad)
+
+        is_reactome = is_reactome_toplevel_mode(frozenset({self.source}))
+
+        if is_reactome:
+            # Reactome (29 categories): rotated radial labels jetting outward
+            # along each spoke to minimize overlap. Use inline counts.
+            # Labels are deferred — stored on the axes for placement after
+            # ylim is set. Call _apply_reactome_labels(ax) after set_ylim().
+            spoke_labels = self._spoke_labels(categories)
+            ax.set_xticklabels([])  # we draw our own
+            ax._reactome_spoke_data = (angles[:-1], spoke_labels)
+        else:
+            # Few spokes (CHAD 8 categories): standard horizontal labels
+            spoke_labels = self._spoke_labels(categories)
+            label_fontsize = max(6, 9 - max(0, n - 12) // 3)
+            label_pad = 5 + max(0, n - 10) * 1.5
+            ax.set_xticklabels(spoke_labels, fontsize=label_fontsize)
+            ax.tick_params(pad=label_pad)
+
+    @staticmethod
+    def _apply_reactome_labels(ax):
+        """Place deferred reactome spoke labels now that ylim is set."""
+        data = getattr(ax, "_reactome_spoke_data", None)
+        if data is None:
+            return
+        angles_list, spoke_labels_list = data
+        r_pos = ax.get_ylim()[1] * 1.08
+        for angle, txt in zip(angles_list, spoke_labels_list):
+            angle_deg = np.degrees(angle) % 360
+            # Flip labels on the left half so they read left-to-right
+            if 90 < angle_deg <= 270:
+                ha, rotation = "right", angle_deg - 180
+            else:
+                ha, rotation = "left", angle_deg
+            # Near-horizontal spokes: anchor from the correct side
+            va = "center"
+            if angle_deg < 10 or angle_deg > 350:
+                ha, va = "center", "bottom"
+            elif 170 < angle_deg < 190:
+                ha, va = "center", "top"
+            ax.text(
+                angle, r_pos, txt,
+                fontsize=7, ha=ha, va=va,
+                rotation=rotation, rotation_mode="anchor",
+                color="#333333",
+            )
+        del ax._reactome_spoke_data
 
     def _plot_radar_grid(
         self,
@@ -779,8 +955,9 @@ class ReporterRadarStage(BaseStage):
 
         ncols = min(4, n)
         nrows = (n + ncols - 1) // ncols
-        fig_w = ncols * 5.625  # +25% column width to prevent label overlap
-        fig_h = nrows * 4.5
+        _reactome = is_reactome_toplevel_mode(frozenset({self.source}))
+        fig_w = ncols * (8.0 if _reactome else 5.625)
+        fig_h = nrows * (14.0 if _reactome else 7.5)
 
         fig, axes = plt.subplots(
             nrows, ncols, figsize=(fig_w, fig_h),
@@ -793,7 +970,12 @@ class ReporterRadarStage(BaseStage):
         global_max = max_val_override if max_val_override is not None else max(radar_df.values.max(), 0.01)
         is_normalized = max_val_override is not None
         cmap = plt.get_cmap("tab20")
-        metric_label = "Activity" if "activity" in metric_type else "Distinctiveness"
+        if "consistency" in metric_type:
+            metric_label = "Consistency"
+        elif "activity" in metric_type:
+            metric_label = "Activity"
+        else:
+            metric_label = "Distinctiveness"
 
         def _draw_grid(shared_scale: bool) -> plt.Figure:
             fig2, axes2 = plt.subplots(
@@ -821,16 +1003,35 @@ class ReporterRadarStage(BaseStage):
                 else:
                     ylim = min(max(values.max(), 0.01) * 1.15, 1.0)
                 ax.set_ylim(0, ylim)
-                ax.set_title(_wrap_label(reporter, 25), fontsize=10, fontweight="bold", pad=20)
-                subtitle = getattr(self, "_type_subtitles", {}).get(reporter)
-                if subtitle:
-                    ax.text(0.5, -0.18, subtitle, transform=ax.transAxes,
-                            fontsize=7, ha="center", va="top",
-                            color="#444444", linespacing=1.4)
+                self._apply_reactome_labels(ax)
+                # Title: reporter name (bold, top) + stats (smaller, below title)
+                # Reactome has angled labels that extend above the plot — push title further up
+                _reactome = is_reactome_toplevel_mode(frozenset({self.source}))
                 stats = getattr(self, "_label_stats", {}).get(reporter)
                 if stats:
-                    ax.text(0.5, 1.18, stats, transform=ax.transAxes,
-                            fontsize=6, ha="center", va="bottom", color="#666666")
+                    title_pad = 160 if _reactome else 50
+                    stats_y = 1.55 if _reactome else 1.15
+                    ax.set_title(
+                        _wrap_label(reporter, 25),
+                        fontsize=10, fontweight="bold", pad=title_pad,
+                    )
+                    ax.text(
+                        0.5, stats_y, stats, transform=ax.transAxes,
+                        fontsize=8, ha="center", va="bottom", color="#555555",
+                        style="italic",
+                    )
+                else:
+                    title_pad = 150 if _reactome else 40
+                    ax.set_title(
+                        _wrap_label(reporter, 25),
+                        fontsize=10, fontweight="bold", pad=title_pad,
+                    )
+                subtitle = getattr(self, "_type_subtitles", {}).get(reporter)
+                if subtitle:
+                    sub_y = -0.25 if _reactome else -0.18
+                    ax.text(0.5, sub_y, subtitle, transform=ax.transAxes,
+                            fontsize=7, ha="center", va="top",
+                            color="#444444", linespacing=1.4)
             for j in range(n, len(axes2)):
                 axes2[j].set_visible(False)
             if is_normalized:
@@ -841,7 +1042,9 @@ class ReporterRadarStage(BaseStage):
                 f"Reporter Radar — {metric_label} ({scale_label})",
                 fontsize=14, fontweight="bold", y=1.02,
             )
-            plt.tight_layout()
+            _h = 0.90 if _reactome else 0.75
+            _w = 0.50 if _reactome else 0.40
+            fig2.subplots_adjust(hspace=_h, wspace=_w)
             return fig2
 
         path = save_figure(_draw_grid(shared_scale=True),  out_dir / f"radar_grid_{metric_type}.png")
@@ -870,18 +1073,33 @@ class ReporterRadarStage(BaseStage):
         cmap = plt.get_cmap("tab20")
         max_val = max(radar_df.values.max(), 0.01)
 
+        is_normalized = "normalized" in metric_type
+
         for i, reporter in enumerate(reporters):
             values = radar_df.loc[reporter].values
             color = cmap(i / max(len(reporters) - 1, 1))
             self._plot_radar_single(ax, values, categories, color, reporter, alpha=0.08)
 
-        ax.set_ylim(0, min(max_val * 1.15, 1.0))
+        if is_normalized:
+            # Draw 1.0 reference ring (= global baseline)
+            ref_angles = np.linspace(0, 2 * np.pi, n_spokes, endpoint=False).tolist() + [0]
+            ax.plot(ref_angles, [1.0] * (n_spokes + 1),
+                    "--", color="gray", linewidth=0.8, alpha=0.6, zorder=0)
+            ax.set_ylim(0, max_val * 1.15)
+        else:
+            ax.set_ylim(0, min(max_val * 1.15, 1.0))
+        self._apply_reactome_labels(ax)
         ax.legend(
             loc="upper left", bbox_to_anchor=(1.15, 1.05),
             fontsize=8, framealpha=0.9,
         )
 
-        metric_label = "Activity" if metric_type == "activity" else "Distinctiveness"
+        if "consistency" in metric_type:
+            metric_label = "Consistency"
+        elif "activity" in metric_type:
+            metric_label = "Activity"
+        else:
+            metric_label = "Distinctiveness"
         ax.set_title(
             f"Reporter Overlay — {metric_label}",
             fontsize=13, fontweight="bold", pad=30,
@@ -909,7 +1127,12 @@ class ReporterRadarStage(BaseStage):
             ax=ax, cbar_kws={"label": metric_type},
             linewidths=0.5,
         )
-        metric_label = "Activity" if metric_type == "activity" else "Distinctiveness"
+        if "consistency" in metric_type:
+            metric_label = "Consistency"
+        elif "activity" in metric_type:
+            metric_label = "Activity"
+        else:
+            metric_label = "Distinctiveness"
         ax.set_title(
             f"Reporter × Category — {metric_label}",
             fontsize=13, fontweight="bold",
@@ -973,7 +1196,7 @@ class ReporterRadarStage(BaseStage):
         # Gene super-category summary
         multi = is_reactome_toplevel_mode(self.sources)
         if multi:
-            gene_to_cats = build_reactome_toplevel_map()
+            gene_to_cats = build_reactome_cell_biology_map() if "reactome_cell_biology" in self.sources else build_reactome_toplevel_map()
             cat_counts: Dict[str, int] = defaultdict(int)
             for cats in gene_to_cats.values():
                 for cat in cats:
@@ -1146,7 +1369,7 @@ def main():
                              help="Skip confirmation prompt")
     slurm_group.add_argument("--slurm-memory", type=str, default="256GB",
                              help="Memory (default: 256GB)")
-    slurm_group.add_argument("--slurm-time", type=int, default=480,
+    slurm_group.add_argument("--slurm-time", type=int, default=30,
                              help="Time limit in minutes (default: 480)")
     slurm_group.add_argument("--slurm-cpus", type=int, default=16,
                              help="CPUs (default: 16)")
