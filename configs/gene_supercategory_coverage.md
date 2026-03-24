@@ -1,180 +1,183 @@
-# Gene Super-Category Coverage Analysis
+# Gene Super-Category Coverage
 
-Panel: 1,009 genes from `annotated_gene_panel_July2025.csv`
-
-Three categorization approaches available via `--sources`:
-
-| Source | Categories | Coverage | Mapping | Description |
-|---|---|---|---|---|
-| **chad** | 8 | ~23% (244 genes) | Single | CHAD v5 clusters only |
-| **chad_boosted** | 8 | ~93% (986 genes) | Single | CHAD + keyword/regex/Harmonizome |
-| **reactome_toplevel** | 29 | 78% (788 genes) | Multi | Reactome's own pathway ontology |
+Panel: ~1,009 genes from `annotated_gene_panel_July2025.csv`
 
 ---
 
-## 1. `chad` — CHAD v5 Only
+## The 8 CHAD-derived categories — origin and design
 
-CHAD v5 hierarchy covers ~393 manually curated genes, but many are positive controls
-not in the 1009-gene panel. Only genes present in both CHAD and the panel get assigned.
+The 8 categories used by `chad` and `chad_boosted` are **manually defined buckets
+designed to match what OPS live-cell reporters can actually detect**. They were not
+derived from CHAD — rather, they were designed first by the team to cover the major
+biological axes visible in an OPS screen (organelle identity, trafficking, metabolic
+state, proliferation, etc.), and then CHAD v5 cluster names were mapped into them.
 
-| Category | Genes |
-|---|---|
-| Translation | 93 |
-| Gene Expression | 47 |
-| Cell Cycle & DNA | 43 |
-| Membrane Trafficking | 20 |
-| Metabolism | 13 |
-| Signaling | 11 |
-| Protein Homeostasis | 11 |
-| Cytoskeleton & Morphology | 6 |
-| **Other (unassigned)** | **818** |
+CHAD v5 is a hierarchy of manually curated gene sets representing known protein
+complexes and pathways (positive controls used in OPS screening). Each CHAD cluster
+has a name (e.g. "Proteasome", "mTOR", "DNA Replication"). The 8-category
+design assigns each named CHAD cluster to the most appropriate bucket:
 
----
-
-## 2. `chad_boosted` — CHAD + Extra Annotations
-
-Starts with CHAD clusters, then fills in gaps using:
-1. **Reactome/GO keyword matching** from gene panel CSV annotations (+665 genes)
-2. **Gene name regex patterns** like RPL*, COX*, KIF* (+3 genes after keywords)
-3. **Harmonizome overrides** for 74 specifically-researched poorly-annotated genes (+74 genes)
-
-| Category | Genes | % of panel |
+| Category | What it captures | Example CHAD clusters mapped in |
 |---|---|---|
-| Gene Expression | 240 | 23.8% |
-| Translation | 156 | 15.5% |
-| Cell Cycle & DNA | 153 | 15.2% |
-| Membrane Trafficking | 141 | 14.0% |
-| Metabolism | 89 | 8.8% |
-| Cytoskeleton & Morphology | 73 | 7.2% |
-| Signaling | 70 | 6.9% |
-| Protein Homeostasis | 64 | 6.3% |
-| **Other (unassigned)** | **76** | **7.5%** |
+| **Translation** | Ribosomes, tRNA, translation initiation | ribosome 40s/60s, tRNA synthetase, eIF2 |
+| **Gene Expression** | Transcription, splicing, RNA processing | RNA Polymerase, Spliceosome, mediator |
+| **Cell Cycle & DNA** | Cell cycle, replication, repair, mitosis | DNA Replication, Replication fork, MuvB |
+| **Signaling** | Kinase cascades, receptor signaling | mTOR, KRAS |
+| **Membrane Trafficking** | COPI/COPII, SNARE, dynein, endosomes | GOLGI to ER Transport, SRP, dynein-dynactin |
+| **Metabolism** | ETC, mitochondria, lipid/amino acid metabolism | electronic transport chain, mitochondria protein import |
+| **Protein Homeostasis** | Proteasome, ubiquitin, ER quality control | Proteasome, Ufmylation 60s |
+| **Cytoskeleton & Morphology** | Actin, focal adhesion, cell shape | Focal adhesion |
 
-### Boost breakdown
+The mapping is defined in `gene_supercategory_mapping.yaml`. Each category entry
+lists the CHAD cluster names that belong to it — this is the authoritative source
+of which clusters map where.
 
-| Step | Cumulative assigned | Added |
+---
+
+## How genes end up in a category — the 4-pass pipeline
+
+### `chad` (pass 1 only, ~24% coverage)
+
+Only genes that are explicit members of a named CHAD cluster get assigned. The
+CHAD YAML is traversed recursively; any gene found under a cluster listed in the
+category's `chad_clusters` is assigned to that category. First assignment wins
+(no gene gets two categories).
+
+### `chad_boosted` (all 4 passes, ~98% coverage)
+
+Runs the same pass 1, then applies 3 additional passes **only to genes still
+unassigned**. First match across all passes wins — more curated evidence always
+takes priority over less curated.
+
+**Pass 1 — CHAD clusters** (245 genes)
+Same as above. Only genes in explicitly named CHAD clusters.
+
+**Pass 2 — Reactome/GO keyword matching** (+664 genes)
+Each gene in the panel CSV has `In_REACT_pathways` and `In_go_pathways` columns —
+free-text concatenations of all Reactome pathway names and GO terms that gene
+belongs to. These are lowercased and scored against each category's
+`pathway_keywords` list (e.g. "ubiquitin", "vesicle", "mitochondri"). The
+category with the most keyword hits wins if score ≥ 1. This is where **66% of
+the panel** gets assigned — the bulk of OPS genes have Reactome/GO annotations
+even if they don't appear in CHAD.
+
+**Pass 3 — Gene name regex** (+3 genes)
+Applies compiled regular expressions (e.g. `^RPL\d`, `^PSM[ABCD]`, `^NDUF`)
+to gene names for genes that somehow have no pathway annotation. Only assigns
+3 genes in practice — catches well-named gene families that are poorly annotated
+(e.g. some mitoribosomal genes).
+
+**Pass 4 — Harmonizome overrides** (+74 genes)
+A hardcoded dict (`_HARMONIZOME_OVERRIDES` in `gene_supercategories.py`) of
+74 specific genes manually assigned by querying the Harmonizome REST API and
+cross-checking against Enrichr (GO_Biological_Process_2023, KEGG_2021,
+Reactome_2022). Applied to genes that pass through all 3 earlier steps without
+assignment — mostly poorly characterized or recently renamed genes.
+
+**Remaining unassigned: 76 genes**
+~23 are genuinely uncharacterized (ANKRD20A3, CBWD1-3, MROH6...), ~53 have
+annotations that don't match any category keyword.
+
+---
+
+## Coverage comparison — all 4 sources
+
+| Source | Categories | n genes assigned | Coverage | Cats/gene | Mapping |
+|---|---|---|---|---|---|
+| `chad` | 8 | 245 | 24% | 1.0 | single |
+| `chad_boosted` | 8 | 986 | 98% | 1.0 | single |
+| `reactome_toplevel` | 29 | 788 | 78% | 2.95 avg (max 19) | multi |
+| `reactome_cell_biology` | 17 | 732 | 73% | 2.17 avg (max 15) | multi |
+
+---
+
+## Per-category gene counts
+
+### chad / chad_boosted (8 categories)
+
+| Category | chad | chad_boosted |
 |---|---|---|
-| CHAD clusters | 244 | 244 |
-| + Reactome/GO keywords | 909 | +665 |
-| + Regex patterns | 912 | +3 |
-| + Harmonizome overrides | 986 | +74 |
+| Translation | 94 | 156 |
+| Gene Expression | 47 | 240 |
+| Cell Cycle & DNA | 43 | 153 |
+| Membrane Trafficking | 20 | 141 |
+| Metabolism | 13 | 89 |
+| Signaling | 11 | 70 |
+| Protein Homeostasis | 11 | 64 |
+| Cytoskeleton & Morphology | 6 | 73 |
+| **Other (unassigned)** | **818** | **76** |
 
-### Harmonizome overrides
+`chad` is heavily biased toward Translation/Gene Expression because ribosomal and
+spliceosomal complexes are well-represented in CHAD. `chad_boosted` balances the
+categories substantially — Cytoskeleton goes from 6 → 73 genes once
+actin/tubulin/focal-adhesion GO terms are included.
 
-74 genes validated via Harmonizome REST API functional descriptions and cross-checked
-against Enrichr (GO_Biological_Process_2023, KEGG_2021, Reactome_2022). Applied only
-to genes not covered by the first three steps. See `_HARMONIZOME_OVERRIDES` dict in
-`gene_supercategories.py` for the full list.
+### chad_boosted pass breakdown
 
-### Remaining unassigned (~76 genes)
+| Pass | Genes assigned | Cumulative |
+|---|---|---|
+| 1. CHAD clusters | 245 | 245 |
+| 2. Reactome/GO keyword matching | +664 | 909 |
+| 3. Gene name regex | +3 | 912 |
+| 4. Harmonizome overrides | +74 | 986 |
 
-Includes ~23 genes that are genuinely uncharacterized (ANKRD20A3, CBWD1-3, MROH6, etc.)
-plus ~53 genes that fell through all annotation steps.
+### reactome_toplevel (29 categories, multi-mapped)
 
----
+| Category | n genes | cell_bio ✓ |
+|---|---|---|
+| Metabolism of proteins | 271 | ✓ |
+| Disease | 267 | ✗ |
+| Signal Transduction | 191 | ✓ |
+| Immune System | 178 | ✗ |
+| Metabolism of RNA | 167 | ✓ |
+| Metabolism | 163 | ✓ |
+| Gene expression (Transcription) | 152 | ✓ |
+| Developmental Biology | 145 | ✗ |
+| Cellular responses to stimuli | 129 | ✓ |
+| Vesicle-mediated transport | 106 | ✓ |
+| Cell Cycle | 103 | ✓ |
+| DNA Repair | 52 | ✓ |
+| Transport of small molecules | 46 | ✓ |
+| Hemostasis | 39 | ✗ |
+| Organelle biogenesis and maintenance | 36 | ✓ |
+| Cell-Cell communication | 33 | ✓ |
+| DNA Replication | 31 | ✓ |
+| Autophagy | 31 | ✓ |
+| Chromatin organization | 29 | ✓ |
+| Neuronal System | 27 | ✗ |
+| Programmed Cell Death | 24 | ✓ |
+| Protein localization | 23 | ✓ |
+| Circadian clock | 19 | ✗ |
+| Sensory Perception | 17 | ✗ |
+| Reproduction | 14 | ✗ |
+| Extracellular matrix organization | 13 | ✗ |
+| Muscle contraction | 12 | ✗ |
+| Drug ADME | 4 | ✗ |
+| Digestion and absorption | 1 | ✗ |
 
-## 3. `reactome_toplevel` — Reactome's Own 29 Categories
-
-Uses Reactome's top-level biological process hierarchy directly. Genes can belong to
-**multiple categories** (multi-mapping, avg 2.9 categories/gene).
-
-- **788/1009 genes mapped (78.1%)**
-- **221 genes unmapped** (no NCBI ID in Reactome, or no pathway annotation)
-- **29 Reactome top-level categories**
-
-| Reactome Category | Genes |
-|---|---|
-| Metabolism of proteins | 271 |
-| Disease | 267 |
-| Signal Transduction | 191 |
-| Immune System | 178 |
-| Metabolism of RNA | 167 |
-| Metabolism | 163 |
-| Gene expression (Transcription) | 152 |
-| Developmental Biology | 145 |
-| Cellular responses to stimuli | 129 |
-| Vesicle-mediated transport | 106 |
-| Cell Cycle | 103 |
-| DNA Repair | 52 |
-| Transport of small molecules | 46 |
-| Hemostasis | 39 |
-| Organelle biogenesis and maintenance | 36 |
-| Cell-Cell communication | 33 |
-| DNA Replication | 31 |
-| Autophagy | 31 |
-| Chromatin organization | 29 |
-| Neuronal System | 27 |
-| Programmed Cell Death | 24 |
-| Protein localization | 23 |
-| Circadian clock | 19 |
-| Sensory Perception | 17 |
-| Reproduction | 14 |
-| Extracellular matrix organization | 13 |
-| Muscle contraction | 12 |
-| Drug ADME | 4 |
-| Digestion and absorption | 1 |
-
-### Data files
-
-Pre-computed panel-specific files at:
-- `/hpc/projects/icd.fast.ops/configs/ontologies/reactome/top_level_pathways.tsv`
-- `/hpc/projects/icd.fast.ops/configs/ontologies/reactome/panel_gene_top_level_pathways.tsv`
-- `/hpc/projects/icd.fast.ops/configs/ontologies/reactome/panel_gene_reactome_categories.tsv`
+`reactome_cell_biology` retains the 17 marked ✓. See
+`reactome_cell_biology_filter.md` for full exclusion rationale.
 
 ---
 
-## Comparison
+## Key design differences between the systems
 
-| Property | chad | chad_boosted | reactome_toplevel |
-|---|---|---|---|
-| **Categories** | 8 | 8 | 29 |
-| **Coverage** | 23% | 93% | 78% |
-| **Mapping** | Single | Single | Multi (avg 2.9/gene) |
-| **Category sizes** | 6-93 | 64-240 | 1-271 |
-| **Maintenance** | Auto (CHAD YAML) | Manual (YAML + code) | Auto (Reactome DB) |
-| **Radar readability** | 8 axes, sparse | 8 axes, full | 29 axes, detailed |
-
-### When to use which
-
-- **chad**: Quick look using only manually curated CHAD clusters. Low coverage means many
-  genes excluded — best for focused analysis on well-characterized biology.
-- **chad_boosted** (default): High-coverage 8-axis radar. Best for comparing reporters at
-  a high level with near-complete gene coverage.
-- **reactome_toplevel**: Detailed 29-category biological profiling using Reactome's own
-  ontology. Multi-mapping captures biological reality. Best for characterizing what specific
-  biology a reporter sees.
+| | chad/chad_boosted | reactome_toplevel/cell_bio |
+|---|---|---|
+| **Category origin** | Manually designed to match OPS biology | Reactome's own top-level hierarchy |
+| **Assignment** | Single best category (first match wins) | Multi-mapping (gene belongs to all matching categories) |
+| **Keyword source** | Gene's own Reactome+GO annotations from panel CSV | Pathway membership pre-computed from Reactome DB |
+| **Granularity** | 8 broad buckets, OPS-focused | 17–29 finer process categories |
+| **Unassigned** | 76 genes (7%) | 221–277 genes (22–27%) |
+| **Maintenance** | Manual YAML + hardcoded overrides | Automatic from Reactome DB |
 
 ---
 
-## Implementation
+## Data sources
 
-```bash
-# Default: chad_boosted (8 categories, ~93% coverage)
---sources chad_boosted
-
-# CHAD only (8 categories, ~23% coverage)
---sources chad
-
-# Reactome top-level (29 categories, 78% coverage, multi-mapped)
---sources reactome_toplevel
-```
-
-Each source saves to `sources_{name}/` so runs don't overwrite each other.
-
----
-
-## Other Databases Investigated
-
-### PANTHER Protein Classes (23 top-level categories)
-- Downloaded to `/hpc/projects/icd.fast.ops/configs/ontologies/panther/`
-- Coverage: 728/1009 (72.2%) with symbol rescue via dep_map_gene_name
-- Categories are structural/functional (e.g., "kinase", "transporter") not process-based
-- Not integrated — less suitable for biological process radar plots
-
-### Harmonizome High-Level Categories
-- No built-in high-level system (only hgncRootFamilies: 309 families, incomplete)
-- Used instead as per-gene overrides in chad_boosted (74 genes)
-
-### Enrichr
-- Tested as validation source — high agreement with Harmonizome
-- Not integrated standalone — Reactome top-level is better for database-driven approach
+- CHAD v5: `/hpc/projects/icd.ops/configs/gene_clusters/chad_positive_controls_v5_hierarchy.yml`
+- Gene panel + annotations: `/hpc/projects/intracellular_dashboard/ops/configs/annotated_gene_panel_July2025.csv`
+- Reactome pre-computed: `/hpc/projects/icd.fast.ops/configs/ontologies/reactome/panel_gene_reactome_categories.tsv`
+- Category mapping config: `gene_supercategory_mapping.yaml`
+- Cell biology filter: `reactome_cell_biology_filter.md`
+- Harmonizome overrides: `_HARMONIZOME_OVERRIDES` dict in `ops_utils/analysis/gene_supercategories.py`
