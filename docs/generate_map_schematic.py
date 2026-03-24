@@ -77,7 +77,7 @@ for rx,ry in qpts:
 ax1.text(qcx,qcy+0.65,'LAMP1 KO\nguides',fontsize=10,color=CB,
          fontweight='bold',ha='center',zorder=6)
 # question inside plot at bottom
-ax1.text(0,-2.85,'Does this geneKO cause a\ndetectable phenotypic change?',
+ax1.text(0,-2.85,'Does this geneKO cause a detectable\nphenotypic change from NTCs?',
          fontsize=9.5,ha='center',va='center',color=CDARK,zorder=7,
          bbox=dict(boxstyle='round,pad=0.3',fc='white',ec='#cccccc',lw=0.8,alpha=0.92))
 
@@ -277,6 +277,7 @@ cats=['Mem.\nTraffic','Metab.','Cell\nCycle','Prot.\nHomeo.',
       'Signal.','Cytosk.','Gene\nExpr.','Transl.']
 n=len(cats)
 ang=np.linspace(0,2*np.pi,n,endpoint=False).tolist()+[0]
+# scale each reporter so its max spoke = 1.0 (outer ring)
 raw_L=np.array([2.1,0.4,0.5,0.9,0.6,0.7,0.7,0.5])
 raw_T=np.array([0.5,2.3,0.4,0.8,0.6,0.7,0.7,0.6])
 vL=(raw_L/raw_L.max()).tolist()+[raw_L[0]/raw_L.max()]
@@ -289,15 +290,15 @@ ax_r.fill(ang,vT,alpha=0.18,color=CG,zorder=3)
 ax_r.plot(ang,vT,'o-',color=CG,lw=2.0,ms=4.5,zorder=4,label='TOMM20')
 ax_r.set_xticks(ang[:-1]); ax_r.set_xticklabels(cats,fontsize=9)
 ax_r.set_ylim(0,1.0)
-ax_r.set_yticks([0.5,1.0]); ax_r.set_yticklabels(['0.5×','1×'],fontsize=8,color='#888888')
+ax_r.set_yticks([0.5,1.0]); ax_r.set_yticklabels(['0.5','1.0'],fontsize=8,color='#888888')
 ax_r.tick_params(pad=5)
 ax_r.legend(loc='upper right',bbox_to_anchor=(1.52,1.12),fontsize=9.5,
             framealpha=0.9,handlelength=1.5)
-ft(0.700,0.516,'Example output — normalized mean_mAP\n(scaled to reporter max = 1)',
+ft(0.700,0.516,'Example output — normalized mean_mAP\n(reporter / all-reporters baseline)',
    ha='center',fontsize=10,fontweight='bold',color=CDARK)
-ax_c.text(3.2,0.85,'LAMP1: trafficking\nat outer ring (1.0)',fontsize=9,ha='center',va='center',
+ax_c.text(3.2,0.85,'LAMP1: trafficking\nhighest enrichment',fontsize=9,ha='center',va='center',
     color=CB,bbox=dict(boxstyle='round,pad=0.25',fc='#e8f0f8',ec=CB,lw=0.8))
-ax_c.text(6.8,0.85,'TOMM20: metabolism\nat outer ring (1.0)',fontsize=9,ha='center',va='center',
+ax_c.text(6.8,0.85,'TOMM20: metabolism\nhighest enrichment',fontsize=9,ha='center',va='center',
     color=CG,bbox=dict(boxstyle='round,pad=0.25',fc='#e8f5e9',ec=CG,lw=0.8))
 ax_c.add_patch(FancyBboxPatch((0.1,0.10),9.8,0.36,
     boxstyle='round,pad=0.08',facecolor='#555555',edgecolor='none',zorder=3))
