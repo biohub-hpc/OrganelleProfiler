@@ -192,6 +192,15 @@ class ReporterRadarStage(BaseStage):
 
         reporter_labels = sorted(label_to_cols.keys())
 
+        # Load pca_report.csv for signal→experiments mapping (used in type-mode subtitles)
+        self._signal_to_exps: Dict[str, List[str]] = {}
+        pca_report_path = self.pca_optimized_dir / "pca_report.csv"
+        if pca_report_path.exists():
+            _pr = pd.read_csv(pca_report_path, usecols=["signal", "experiment"])
+            for _, row in _pr.iterrows():
+                exps = [e.strip() for e in str(row["experiment"]).split(",") if e.strip()]
+                self._signal_to_exps[row["signal"]] = sorted(set(exps))
+
         # Apply reporter filter if specified
         if self.reporter_filter:
             reporter_labels = [l for l in reporter_labels if l in self.reporter_filter]
@@ -302,6 +311,7 @@ class ReporterRadarStage(BaseStage):
     ) -> Dict[str, Dict[str, Any]]:
         """Run mAP for each reporter-type (union of member reporter features)."""
         all_results: Dict[str, Dict[str, Any]] = {}
+        self._type_subtitles: Dict[str, str] = {}
         n_total = len(type_groups)
 
         for i, (type_name, members) in enumerate(sorted(type_groups.items()), 1):
@@ -311,6 +321,15 @@ class ReporterRadarStage(BaseStage):
                 f"  [{i}/{n_total}] Type: {type_name} "
                 f"({len(members)} reporters, {n_cols} features) [{members_str}]"
             )
+            # Build per-type subtitle: "LAMP1 (ops0031, ops0037)\nLAMP2 (ops0105)"
+            lines = []
+            for m in sorted(members):
+                short = m.split(",", 1)[-1].strip() if "," in m else m
+                exps = self._signal_to_exps.get(m, [])
+                exp_str = ", ".join(exps) if exps else "?"
+                lines.append(f"{short} ({exp_str})")
+            self._type_subtitles[type_name] = "\n".join(lines)
+
             r = self._score_reporter(members, adata_guide_full, adata_gene_full, label_to_cols)
             if r is not None:
                 all_results[type_name] = r
@@ -697,6 +716,11 @@ class ReporterRadarStage(BaseStage):
             self._plot_radar_single(ax, values, categories, color, reporter)
             ax.set_ylim(0, min(max_val * 1.15, 1.0))
             ax.set_title(_wrap_label(reporter, 25), fontsize=10, fontweight="bold", pad=20)
+            subtitle = getattr(self, "_type_subtitles", {}).get(reporter)
+            if subtitle:
+                ax.text(0.5, -0.18, subtitle, transform=ax.transAxes,
+                        fontsize=7, ha="center", va="top",
+                        color="#444444", linespacing=1.4)
 
         # Hide unused axes
         for j in range(n, len(axes)):
@@ -726,7 +750,10 @@ class ReporterRadarStage(BaseStage):
         if len(reporters) == 0 or len(categories) < 3:
             return
 
-        fig, ax = plt.subplots(figsize=(10, 10), subplot_kw={"projection": "polar"})
+        # Scale canvas: more spokes need more room for spoke labels
+        n_spokes = len(categories)
+        base_size = max(10, 8 + n_spokes * 0.15)
+        fig, ax = plt.subplots(figsize=(base_size, base_size), subplot_kw={"projection": "polar"})
         cmap = plt.get_cmap("tab20")
         max_val = max(radar_df.values.max(), 0.01)
 
@@ -737,7 +764,7 @@ class ReporterRadarStage(BaseStage):
 
         ax.set_ylim(0, min(max_val * 1.15, 1.0))
         ax.legend(
-            loc="upper right", bbox_to_anchor=(1.3, 1.1),
+            loc="upper left", bbox_to_anchor=(1.15, 1.05),
             fontsize=8, framealpha=0.9,
         )
 
