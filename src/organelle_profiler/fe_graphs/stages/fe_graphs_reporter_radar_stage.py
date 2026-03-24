@@ -728,40 +728,50 @@ class ReporterRadarStage(BaseStage):
             axes = np.array([axes])
         axes = axes.flatten()
 
-        max_val = max(radar_df.values.max(), 0.01)
+        global_max = max(radar_df.values.max(), 0.01)
         cmap = plt.get_cmap("tab20")
+        metric_label = "Activity" if "activity" in metric_type else "Distinctiveness"
 
-        for i, reporter in enumerate(reporters):
-            ax = axes[i]
-            values = radar_df.loc[reporter].values
-            color = cmap(i / max(n - 1, 1))
-            self._plot_radar_single(ax, values, categories, color, reporter)
-            ax.set_ylim(0, min(max_val * 1.15, 1.0))
-            ax.set_title(_wrap_label(reporter, 25), fontsize=10, fontweight="bold", pad=20)
-            subtitle = getattr(self, "_type_subtitles", {}).get(reporter)
-            if subtitle:
-                ax.text(0.5, -0.18, subtitle, transform=ax.transAxes,
-                        fontsize=7, ha="center", va="top",
-                        color="#444444", linespacing=1.4)
-            stats = getattr(self, "_label_stats", {}).get(reporter)
-            if stats:
-                ax.text(0.5, 1.18, stats, transform=ax.transAxes,
-                        fontsize=6, ha="center", va="bottom", color="#666666")
+        def _draw_grid(shared_scale: bool) -> plt.Figure:
+            fig2, axes2 = plt.subplots(
+                nrows, ncols, figsize=(fig_w, fig_h),
+                subplot_kw={"projection": "polar"},
+            )
+            if n == 1:
+                axes2 = np.array([axes2])
+            axes2 = axes2.flatten()
+            for i, reporter in enumerate(reporters):
+                ax = axes2[i]
+                values = radar_df.loc[reporter].values
+                color = cmap(i / max(n - 1, 1))
+                self._plot_radar_single(ax, values, categories, color, reporter)
+                ylim = min(global_max * 1.15, 1.0) if shared_scale else min(max(values.max(), 0.01) * 1.15, 1.0)
+                ax.set_ylim(0, ylim)
+                ax.set_title(_wrap_label(reporter, 25), fontsize=10, fontweight="bold", pad=20)
+                subtitle = getattr(self, "_type_subtitles", {}).get(reporter)
+                if subtitle:
+                    ax.text(0.5, -0.18, subtitle, transform=ax.transAxes,
+                            fontsize=7, ha="center", va="top",
+                            color="#444444", linespacing=1.4)
+                stats = getattr(self, "_label_stats", {}).get(reporter)
+                if stats:
+                    ax.text(0.5, 1.18, stats, transform=ax.transAxes,
+                            fontsize=6, ha="center", va="bottom", color="#666666")
+            for j in range(n, len(axes2)):
+                axes2[j].set_visible(False)
+            scale_label = "shared scale" if shared_scale else "individual scale"
+            fig2.suptitle(
+                f"Reporter Radar — {metric_label} ({scale_label})",
+                fontsize=14, fontweight="bold", y=1.02,
+            )
+            plt.tight_layout()
+            return fig2
 
-        # Hide unused axes
-        for j in range(n, len(axes)):
-            axes[j].set_visible(False)
-
-        metric_label = "Activity" if metric_type == "activity" else "Distinctiveness"
-        fig.suptitle(
-            f"Reporter Radar — {metric_label}",
-            fontsize=14, fontweight="bold", y=1.02,
-        )
-        plt.tight_layout()
-
-        path = save_figure(fig, out_dir / f"radar_grid_{metric_type}.png")
+        path = save_figure(_draw_grid(shared_scale=True),  out_dir / f"radar_grid_{metric_type}.png")
         result.add_file(path)
-        logger.info(f"  Saved: {path}")
+        path_ind = save_figure(_draw_grid(shared_scale=False), out_dir / f"radar_grid_{metric_type}_individual_scale.png")
+        result.add_file(path_ind)
+        logger.info(f"  Saved: {path} + individual scale")
 
     def _plot_radar_overlay(
         self,
