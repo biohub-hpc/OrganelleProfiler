@@ -496,6 +496,17 @@ class ReporterRadarStage(BaseStage):
         summary_df.to_csv(summary_path, index=False)
         result.add_file(summary_path)
 
+        # Build category → geneKO count for spoke labels
+        from collections import Counter
+        if self._multi_mapping:
+            _cat_counts = Counter(
+                cat for cats in self._gene_to_cats.values() for cat in cats
+            )
+        else:
+            _cat_counts = Counter(gene_to_cat.values())
+        _cat_counts.pop("Other", None)
+        self._category_counts = dict(_cat_counts)
+
         # 3. Radar matrices — both scores for this job's metric
         for score in self.VALID_SCORES:
             radar_df = self._compute_radar_matrix(all_results, gene_to_cat, self.metric, score)
@@ -686,6 +697,11 @@ class ReporterRadarStage(BaseStage):
     # Radar / spider plots
     # ------------------------------------------------------------------
 
+    def _spoke_labels(self, categories: List[str]) -> List[str]:
+        """Return category names annotated with geneKO counts, e.g. 'Translation\n(n=94)'."""
+        counts = getattr(self, "_category_counts", {})
+        return [f"{c}\n(n={counts[c]})" if c in counts else c for c in categories]
+
     def _plot_radar_single(
         self, ax, values: np.ndarray, categories: List[str],
         color: str, label: str, alpha: float = 0.2,
@@ -699,7 +715,7 @@ class ReporterRadarStage(BaseStage):
         ax.plot(angles, vals, "o-", color=color, linewidth=2, markersize=5, label=label)
         ax.fill(angles, vals, alpha=alpha, color=color)
         ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(categories, fontsize=8)
+        ax.set_xticklabels(self._spoke_labels(categories), fontsize=8)
 
     def _plot_radar_grid(
         self,
