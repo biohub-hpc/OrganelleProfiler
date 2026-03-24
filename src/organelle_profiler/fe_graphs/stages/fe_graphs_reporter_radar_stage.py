@@ -51,6 +51,10 @@ from ops_utils.analysis.gene_supercategories import (
     is_reactome_toplevel_mode,
     parse_sources,
     sources_label,
+    _load_chad_hierarchy,
+    _build_name_index,
+    _collect_genes_recursive,
+    DEFAULT_CHAD_PATH,
 )
 from ops_utils.data.feature_discovery import (
     discover_dino_experiments,
@@ -116,9 +120,9 @@ class ReporterRadarStage(BaseStage):
     VALID_SOURCES  = ("chad", "chad_boosted", "reactome_toplevel", "reactome_cell_biology")
     VALID_SCORES   = ("ratio", "mean_map")
     VALID_LEVELS   = ("individual", "type")
-    VALID_METRICS  = ("activity", "distinctiveness", "distinctiveness_active", "consistency")
-    # consistency uses category-level mAP rows, not gene-level — ratio is meaningless for it
-    METRIC_SCORES  = {"consistency": ("mean_map",)}
+    VALID_METRICS  = ("activity", "distinctiveness", "distinctiveness_active", "consistency", "chad_consistency")
+    # consistency/chad_consistency use category-level mAP rows — ratio is meaningless for them
+    METRIC_SCORES  = {"consistency": ("mean_map",), "chad_consistency": ("mean_map",)}
 
     def __init__(
         self,
@@ -392,6 +396,63 @@ class ReporterRadarStage(BaseStage):
 
         return all_results
 
+    def _build_chad_cluster_gene_map(self) -> tuple:
+        """Build gene→[chad_cluster_names] and cluster_name→supercategory dicts.
+
+        Uses the clusters explicitly listed in gene_supercategory_mapping.yaml
+        (the same ones that define the 8 supercategories). Genes are collected
+        recursively so sub-complexes are included under their parent cluster name.
+
+        Returns
+        -------
+        gene_to_clusters : dict  gene → [cluster_name, ...]
+        cluster_to_supercat : dict  cluster_name → supercategory
+        """
+        chad = _load_chad_hierarchy(DEFAULT_CHAD_PATH)
+        name_index = _build_name_index(chad)
+
+        # cluster_name → supercategory from the yaml config
+        cluster_to_supercat: Dict[str, str] = {}
+        for cat_name, cat_def in self.supercategory_config.get("super_categories", {}).items():
+            for cluster_name in cat_def.get("chad_clusters", []):
+                cluster_to_supercat[cluster_name] = cat_name
+
+        # gene → [cluster_names] (multi-mapping — gene can appear in multiple clusters)
+        gene_to_clusters: Dict[str, List[str]] = {}
+        for cluster_name in cluster_to_supercat:
+            for gene in _collect_genes_recursive(cluster_name, name_index):
+                gene_to_clusters.setdefault(gene, []).append(cluster_name)
+
+        logger.info(
+            f"  CHAD cluster map: {len(gene_to_clusters)} genes across "
+            f"{len(cluster_to_supercat)} clusters → {len(set(cluster_to_supercat.values()))} supercategories"
+        )
+        return gene_to_clusters, cluster_to_supercat
+
+    def _aggregate_clusters_to_supercategories(
+        self, cluster_mAP_df: pd.DataFrame, cluster_to_supercat: Dict[str, str]
+    ) -> pd.DataFrame:
+        """Aggregate per-CHAD-cluster mAP rows to supercategory rows.
+
+        cluster_mAP_df has a 'category' column with cluster names.
+        Returns a DataFrame in the same format but with one row per supercategory
+        (mean mAP across all clusters within that supercategory).
+        """
+        if cluster_mAP_df is None or cluster_mAP_df.empty:
+            return cluster_mAP_df
+        df = cluster_mAP_df.copy()
+        df["supercategory"] = df["category"].map(cluster_to_supercat)
+        df = df.dropna(subset=["supercategory"])
+        if df.empty:
+            return df
+        agg = df.groupby("supercategory").agg(
+            mean_average_precision=("mean_average_precision", "mean"),
+            corrected_p_value=("corrected_p_value", "mean"),
+            below_corrected_p=("below_corrected_p", "any"),
+        ).reset_index().rename(columns={"supercategory": "category"})
+        agg["-log10(p-value)"] = -agg["corrected_p_value"].apply(np.log10)
+        return agg
+
     def _score_reporter(
         self,
         labels: List[str],
@@ -453,6 +514,7 @@ class ReporterRadarStage(BaseStage):
             distinct_map,        distinctive_ratio,        distinct_auc        = None, 0.0, 0.0
             distinct_active_map, distinctive_active_ratio, distinct_active_auc = None, 0.0, 0.0
             ontology_map,        ontology_ratio,           ontology_auc        = None, 0.0, 0.0
+            chad_consistency_map, chad_consistency_ratio                       = None, 0.0
 
             if metric in ("distinctiveness", "distinctiveness_active"):
                 t1 = time.time()
@@ -510,16 +572,49 @@ class ReporterRadarStage(BaseStage):
                     f"{ontology_ratio:.2%}, AUC={ontology_auc:.4f}"
                 )
 
+            elif metric == "chad_consistency":
+                if self._multi_mapping:
+                    logger.info("    chad_consistency skipped for reactome sources")
+                else:
+                    t5 = time.time()
+                    gene_to_clusters, cluster_to_supercat = self._build_chad_cluster_gene_map()
+                    # Filter to genes present in this reporter's adata
+                    gene_names = set(adata_gene.obs["perturbation"].unique())
+                    gene_to_clusters_filtered = {
+                        g: cs for g, cs in gene_to_clusters.items() if g in gene_names
+                    }
+                    # Run per-CHAD-cluster consistency (using cluster names as categories)
+                    cluster_mAP, _ = phenotypic_consistency_ontology(
+                        adata_gene, _all_active_gene,
+                        gene_to_categories=gene_to_clusters_filtered,
+                        source_label="chad_clusters",
+                        plot_results=False,
+                        null_size=self._null_size,
+                        min_genes_per_category=self._min_genes_per_category,
+                    )
+                    # Aggregate per-cluster rows → per-supercategory rows
+                    chad_consistency_map = self._aggregate_clusters_to_supercategories(
+                        cluster_mAP, cluster_to_supercat
+                    )
+                    if chad_consistency_map is not None and not chad_consistency_map.empty:
+                        chad_consistency_ratio = float(chad_consistency_map["below_corrected_p"].mean())
+                    logger.info(
+                        f"    CHAD cluster consistency ({time.time()-t5:.1f}s): "
+                        f"{chad_consistency_ratio:.2%} supercategories significant"
+                    )
+
             n_cells = int(adata_guide.obs["n_cells"].sum()) if "n_cells" in adata_guide.obs.columns else adata_guide.n_obs
             return {
                 "activity_map":             activity_map,
                 "distinct_map":             distinct_map,
                 "distinct_active_map":      distinct_active_map,
                 "ontology_map":             ontology_map,
+                "chad_consistency_map":     chad_consistency_map,
                 "active_ratio":             active_ratio,
                 "distinctive_ratio":        distinctive_ratio,
                 "distinctive_active_ratio": distinctive_active_ratio,
                 "ontology_ratio":           ontology_ratio,
+                "chad_consistency_ratio":   chad_consistency_ratio,
                 "activity_auc":             activity_auc,
                 "distinct_auc":             distinct_auc,
                 "distinct_active_auc":      distinct_active_auc,
@@ -716,6 +811,7 @@ class ReporterRadarStage(BaseStage):
             ("distinctiveness",        "distinct_map"),
             ("distinctiveness_active", "distinct_active_map"),
             ("consistency",            "ontology_map"),
+            ("chad_consistency",       "chad_consistency_map"),
         ]:
             frames = []
             for label, r in sorted(all_results.items()):
@@ -782,6 +878,7 @@ class ReporterRadarStage(BaseStage):
             "distinctiveness":         "distinct_map",
             "distinctiveness_active":  "distinct_active_map",
             "consistency":             "ontology_map",
+            "chad_consistency":        "chad_consistency_map",
         }
         map_key = _map_keys[metric_type]
         rows: Dict[str, Dict[str, float]] = {}
@@ -957,7 +1054,7 @@ class ReporterRadarStage(BaseStage):
         nrows = (n + ncols - 1) // ncols
         _reactome = is_reactome_toplevel_mode(frozenset({self.source}))
         fig_w = ncols * (8.0 if _reactome else 5.625)
-        fig_h = nrows * (14.0 if _reactome else 7.5)
+        fig_h = nrows * (12.0 if _reactome else 7.5)
 
         fig, axes = plt.subplots(
             nrows, ncols, figsize=(fig_w, fig_h),
@@ -1009,8 +1106,8 @@ class ReporterRadarStage(BaseStage):
                 _reactome = is_reactome_toplevel_mode(frozenset({self.source}))
                 stats = getattr(self, "_label_stats", {}).get(reporter)
                 if stats:
-                    title_pad = 160 if _reactome else 50
-                    stats_y = 1.55 if _reactome else 1.15
+                    title_pad = 115 if _reactome else 50
+                    stats_y = 1.38 if _reactome else 1.15
                     ax.set_title(
                         _wrap_label(reporter, 25),
                         fontsize=10, fontweight="bold", pad=title_pad,
@@ -1021,7 +1118,7 @@ class ReporterRadarStage(BaseStage):
                         style="italic",
                     )
                 else:
-                    title_pad = 150 if _reactome else 40
+                    title_pad = 105 if _reactome else 40
                     ax.set_title(
                         _wrap_label(reporter, 25),
                         fontsize=10, fontweight="bold", pad=title_pad,
