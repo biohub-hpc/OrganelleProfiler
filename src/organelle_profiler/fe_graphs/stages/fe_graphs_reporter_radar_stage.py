@@ -756,7 +756,11 @@ class ReporterRadarStage(BaseStage):
         ax.plot(angles, vals, "o-", color=color, linewidth=2, markersize=5, label=label)
         ax.fill(angles, vals, alpha=alpha, color=color)
         ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(self._spoke_labels(categories), fontsize=8)
+        # Scale font size and label padding with spoke count to avoid overlap
+        label_fontsize = max(5, 8 - max(0, n - 12) // 3)
+        label_pad = 5 + max(0, n - 10) * 1.5
+        ax.set_xticklabels(self._spoke_labels(categories), fontsize=label_fontsize)
+        ax.tick_params(pad=label_pad)
 
     def _plot_radar_grid(
         self,
@@ -859,9 +863,9 @@ class ReporterRadarStage(BaseStage):
         if len(reporters) == 0 or len(categories) < 3:
             return
 
-        # Scale canvas: more spokes need more room for spoke labels
+        # Scale canvas: more spokes need more room for spoke labels + padding
         n_spokes = len(categories)
-        base_size = max(10, 8 + n_spokes * 0.15)
+        base_size = max(10, 8 + n_spokes * 0.25)
         fig, ax = plt.subplots(figsize=(base_size, base_size), subplot_kw={"projection": "polar"})
         cmap = plt.get_cmap("tab20")
         max_val = max(radar_df.values.max(), 0.01)
