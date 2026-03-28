@@ -6,11 +6,174 @@
 #   3. gene_patterns: Regex fallback on gene name
 #
 # Categories are assigned in priority order (first match wins).
-# Designed for ~1009-gene OPS panel → ~90% coverage, 57-228 genes per category.
+# Designed for ~1009-gene OPS panel. Coverage: ~98% (pure CHAD), ~99% (boosted).
 #
 # Sources:
-#   CHAD: /hpc/projects/icd.ops/configs/gene_clusters/chad_positive_controls_v5_hierarchy.yml
+#   CHAD v5: /hpc/projects/icd.ops/configs/gene_clusters/chad_positive_controls_v5_hierarchy.yml
 #   Gene panel: /hpc/projects/intracellular_dashboard/ops/configs/annotated_gene_panel_July2025.csv
+#
+# CHAD v5 Cluster → Supercategory Assignment Rationale (2026-03-27)
+# =================================================================
+# The CHAD v5 hierarchy has 138 named clusters with ~440 real genes (excl. NTCs).
+# Every cluster with genes is assigned to one of 8 supercategories below.
+# Coverage: 98.4% pure CHAD, ~99% boosted. 7 genes in 3 poorly-characterized
+# paralog clusters remain intentionally unassigned.
+#
+# Translation (24 clusters):
+#   translation — top-level translation machinery cluster
+#   ribosome — top-level ribosome cluster
+#   ribosome 40s / ribosome 60s — cytoplasmic ribosome subassemblies
+#   Ribosome 40s Biogenesis / Ribosome 60s Biogenesis — ribosome maturation factors
+#   tRNA — tRNA biology cluster
+#   tRNA synthetase — aminoacyl-tRNA synthetases (charge tRNAs for translation)
+#   eIF2 — eIF2 translation initiation factor (ternary complex, GTP-dependent)
+#   subu ribosome 40s — small ribosomal subunit proteins (RPS genes)
+#   subu ribosome 60s — large ribosomal subunit proteins (RPL genes)
+#   subu eIF2 — eIF2 alpha/beta subunits (translation initiation, ISR target)
+#   subu eIF2 GEF — eIF2B guanine nucleotide exchange factor (recycles eIF2·GDP→GTP)
+#   subu eIF3 — eIF3 multi-subunit complex (43S PIC assembly, mRNA recruitment)
+#   subu eIF4 — eIF4F cap-binding complex (cap-dependent translation initiation)
+#   subu MSC — multi-tRNA synthetase complex (9 aminoacyl-tRNA synthetases + 3 scaffold)
+#   subu FARS — phenylalanyl-tRNA synthetase alpha/beta (Phe-tRNA charging)
+#   subu mito ribosome 39s — mitochondrial large ribosomal subunit (mt-rRNA translation)
+#   subu BMS1 — BMS1/RCL1 GTPase complex (18S rRNA processing, 40S biogenesis)
+#   subu SSU processome — small subunit processome (UTP14A, IMP4; 90S pre-ribosome)
+#   subu RPF2 — RPF2/RRS1 complex (5S rRNA incorporation into 60S pre-ribosome)
+#   subu elongator — Elongator complex (tRNA wobble uridine modification, U34)
+#   subu CTU1 — CTU1/CTU2 (tRNA cytidine thiolation at U34, downstream of Elongator)
+#   para NOP (methylation of rRNA) — NOP56/NOP58 (box C/D snoRNP, 2'-O-methylation of rRNA)
+#
+# Gene Expression (25 clusters):
+#   RNA Polymerase — top-level RNA polymerase cluster (shared subunits Pol I/II/III)
+#   Spliceosome — top-level spliceosome cluster
+#   mediator — top-level Mediator transcriptional coactivator complex
+#   subu RNA Pol1 specific — RNA Pol I-specific subunits (rDNA transcription)
+#   subu RNA POL2 specific — RNA Pol II-specific subunits (mRNA transcription)
+#   subu RNA POL3 specific — RNA Pol III-specific subunits (tRNA/5S rRNA transcription)
+#   subu RNA exosome — 3'→5' exoribonuclease complex (RNA surveillance, processing)
+#   subu Integrator Complex — Integrator (snRNA 3'-processing, Pol II pause-release)
+#   subu SF3B (U2 snRNP) — SF3B spliceosome subcomplex (branchpoint recognition)
+#   subu U1 snRNP — U1 small nuclear RNP (5' splice site recognition)
+#   subu U5 snRNP — U5 snRNP (exon alignment during splicing catalysis)
+#   subu Sm ring — Sm heptamer ring (core of U1/U2/U4/U5 snRNPs)
+#   subu LSm ring — LSm1-7 ring (U6 snRNP stability, mRNA decapping)
+#   subu CFIm — cleavage factor Im (CPSF6/NUDT21; pre-mRNA 3'-end recognition)
+#   subu CPSF — cleavage/polyadenylation specificity factor (mRNA 3'-processing)
+#   subu CNOT — CCR4-NOT deadenylase complex (mRNA poly(A) tail shortening, turnover)
+#   subu THO — THO/TREX complex (couples transcription to mRNA nuclear export)
+#   subu core mediator complex — Mediator head/middle module (Pol II PIC assembly)
+#   subu mediator kinase module — CDK8/Cyclin C module (transcriptional regulation)
+#   subu TFIIA — TFIIA general transcription factor (stabilizes TBP-TATA interaction)
+#   subu TFIIIC — TFIIIC (Pol III promoter recognition at A/B boxes)
+#   subu INO80 — INO80 chromatin remodeler (nucleosome sliding, DNA repair access)
+#   subu NuRD — nucleosome remodeling/deacetylase complex (gene silencing)
+#   SWI SNF — SWI/SNF (BAF) chromatin remodeling complex (nucleosome eviction)
+#   TFIIH — TFIIH (Pol II promoter opening via XPB helicase; also NER, but primary
+#     role is transcription initiation — CDK7 subunit listed under Cell Cycle)
+#   hnRNPs — heterogeneous nuclear RNPs (pre-mRNA splicing, mRNA stability)
+#   SR proteins — SR family splicing factors (constitutive/alternative splicing)
+#   Nucleosome — histone octamer (H2A/H2B/H3/H4; fundamental chromatin unit)
+#
+# Cell Cycle & DNA (21 clusters):
+#   Cell Cycle (incomplete) — top-level cell cycle cluster (partially curated)
+#   DNA Replication — top-level DNA replication cluster
+#   Replication fork — replication fork progression machinery
+#   MuvB — MuvB/DREAM complex (cell cycle gene repression in G0/G1)
+#   Cell Cycle — additional cell cycle genes (PKMYT1, CCNF, CDC27)
+#   Mitosis — mitotic genes (CIT, ECT2, BUB1B, KIF23, CEP55, ANLN, PRC1)
+#   DNA damage — DNA damage response signaling (BRCA1, USP10, RFWD3, USP17L)
+#   CCAN — constitutive centromere-associated network (CENPA/C/H/W; kinetochore base)
+#   Condensin II — condensin II complex (NCAPG2, SMC2; mitotic chromosome condensation)
+#   subu cohesin — cohesin ring (SMC1A/SMC3/RAD21; sister chromatid cohesion)
+#   subu CPC — chromosomal passenger complex (AURKB/INCENP; error correction, cytokinesis)
+#   subu CDK7 — CDK7/Cyclin H (CDK-activating kinase; T-loop phosphorylation of CDK1/2/4/6)
+#   subu DNA Polymerase A — Pol alpha-primase (POLA1/POLA2/PRIM1; replication initiation)
+#   subu DNA Polymerase E — Pol epsilon (POLE/POLE2/POLE4; leading-strand replication)
+#   subu DNA polymerase zeta — Pol zeta (REV3L/MAD2L2; translesion synthesis)
+#   subu MCMs — MCM2-7 helicase (MCM3/5/7; replication licensing and unwinding)
+#   subu GINS — GINS complex (GINS1/2, CDC45; CMG helicase activation at origins)
+#   subu Fanconi — Fanconi anemia pathway (FANCC/G/M; ICL repair)
+#   subu TIPIN complex — Timeless-Tipin (replication fork protection, checkpoint coupling)
+#   subu shelterin — shelterin complex (TERF1/2/2IP; telomere capping, length regulation)
+#   subu Augmin — augmin/HAUS complex (HAUS4/5/6; gamma-TuRC recruitment to spindle MTs)
+#
+# Signaling (8 clusters):
+#   mTOR — top-level mTOR signaling cluster
+#   KRAS — top-level RAS signaling cluster
+#   subu mTOR (mTORC1 and mTORC2) — MTOR/RPTOR/RICTOR (mTOR kinase + defining subunits)
+#   subu Ragulator — LAMTOR1-4 (lysosomal scaffold activating mTORC1 via Rag GTPases)
+#   subu TSC — TSC1/TSC2 (tuberous sclerosis GAP complex; Rheb inactivation → mTORC1 off)
+#   subu GRB2 SOS KRAS — GRB2/KRAS (RTK adaptor → SOS → RAS-GTP signal relay)
+#   subu COP9 signalosome — CSN complex (COPS2-6, GPS1; cullin deneddylation regulating
+#     SCF ubiquitin ligases that control NF-κB, p53, HIF-1α, Wnt pathway substrates)
+#   para pro-growth RTK — TBC1D3B/G paralogs (RTK signaling amplification via Rab GAP)
+#
+# Membrane Trafficking (25 clusters):
+#   GOLGI to ER Transport — top-level Golgi→ER retrograde transport cluster
+#   SRP — top-level signal recognition particle cluster
+#   dynein-dynactin — top-level dynein-dynactin motor complex cluster
+#   subu COPI — COPI coat (COPA/B1/B2/Z1; Golgi→ER and intra-Golgi retrograde vesicles)
+#   COPII coat — COPII coat (SEC23B/SEC24A; ER→Golgi anterograde vesicles)
+#   subu ESCRT-III — ESCRT-III (CHMP1A/2A/4B/4C/5; MVB biogenesis, membrane scission)
+#   subu SRP — SRP subunits (SRP19/54/68/72; co-translational ER targeting of nascent chains)
+#   subu SRP receptor — SRP receptor (SRPRA/SRPRB; docks SRP-ribosome at ER translocon)
+#   subu SEC61 — Sec61 translocon (SEC61A1/B/G; protein translocation channel into ER)
+#   subu signal peptidase — signal peptidase complex (SPCS2/3; cleaves ER signal peptides)
+#   subu AP1 — AP-1 adaptor (AP1S1/M1; clathrin-coated vesicles at TGN, endosome sorting)
+#   subu AP2 — AP-2 adaptor (AP2A1/S1/M1; clathrin-mediated endocytosis at plasma membrane)
+#   subu AP3 — AP-3 adaptor (AP3M1/M2/S1; lysosome/melanosome biogenesis, lysosomal sorting)
+#   subu BLOC1 — BLOC-1 complex (BLOC1S2/6; biogenesis of lysosome-related organelles)
+#   subu BORC — BORC complex (BORCS7/8; kinesin-dependent anterograde lysosome positioning)
+#   subu COG — COG complex (COG3/4/6/7/8; Golgi cisterna tethering, glycosylation homeostasis)
+#   subu TRAPP III — TRAPP III (TRAPPC2L/4/11; tethers COPII vesicles to cis-Golgi)
+#   subu exocyst — exocyst complex (EXOC4/5/7; tethers secretory vesicles at plasma membrane)
+#   subu retromer — retromer (VPS26A/29; endosome→TGN cargo recycling, e.g. CI-MPR)
+#   subu V-ATPase — vacuolar ATPase (ATP6V0A1/A2, V1B2/H; endosome/lysosome acidification)
+#   subu dynein-1 — cytoplasmic dynein-1 (DYNC1H1/LI1/LI2/I2, DYNLL1; minus-end MT motor)
+#   subu dynactin — dynactin (DCTN4/5; processivity factor for dynein-1)
+#   subu GGTase — Rab geranylgeranyl transferase (RABGGTA/B; lipid modification for Rab membrane anchoring)
+#   subu NCOA4 Ferritin — NCOA4 + ferritin (FTH1/FTL); ferritinophagy receptor + iron storage cargo
+#   para ARF GTPase — AGAP4/9 (Arf GAP; regulates Arf1/6 GTPase cycling in vesicle coat dynamics)
+#   SNARE — SNARE proteins (STX5/8, STXBP1/3, VAMP2/4, VTI1A/B; membrane fusion machinery)
+#   Rab GTPase — Rab family (RAB4A/10/11A/14; vesicle identity, tethering, and trafficking regulators)
+#
+# Metabolism (12 clusters):
+#   electronic transport chain — top-level ETC cluster (complexes I-IV)
+#   mitochondria protein import — top-level mito import cluster (TOM/TIM)
+#   subu ATP synthase — complex V (ATP5F1B/ME; F1Fo-ATP synthase, oxidative phosphorylation)
+#   subu complex IV — cytochrome c oxidase structural subunits (COX7B/7C)
+#   subu complex IV assembly — complex IV assembly factors (COX11/14/15)
+#   subu coenzyme Q — CoQ biosynthesis (COQ4/7; ubiquinone, ETC electron carrier)
+#   subu isocitrate dehydrogenase 3 — IDH3A/B (NAD+-dependent, TCA cycle, feeds NADH to ETC)
+#   subu TIM23 — TIM23 translocase (TIMM23/17B, DNAJC19; mito inner membrane presequence import)
+#   subu PAM — PAM motor (TIMM44/HSPA9/GRPEL1; drives presequence translocation via mtHsp70)
+#   subu PHB — prohibitin (PHB/PHB2; mito inner membrane ring scaffolds, cristae maintenance)
+#   subu MICOS — MICOS complex (MICOS13/SAMM50; cristae junction formation, cristae morphology)
+#   subu purinisome — purinisome (PPAT/PAICS/ATIC; de novo purine biosynthesis multi-enzyme)
+#
+# Protein Homeostasis (11 clusters):
+#   Proteasome — top-level 26S proteasome cluster
+#   Ufmylation 60s — UFM1 conjugation to 60S ribosome (ER-phagy quality control)
+#   subu Proteasome 19s — 19S regulatory particle (PSMD2/4/11/14, PSMC6; substrate unfolding)
+#   GOI Proteasome 20s — 20S core particle (PSMB6; catalytic beta subunit)
+#   subu CCT1 (TRiC) — TRiC/CCT chaperonin (CCT3/4/6A/7, TCP1; folds actin, tubulin, WD40)
+#   subu OST — oligosaccharyltransferase (STT3A/B, DDOST, OST4, DAD1; N-linked glycosylation in ER)
+#   subu EMC — ER membrane complex (EMC1/2/3; co-translational TM domain insertase + QC)
+#   subu HRD1-SEL1L — HRD1/SEL1L ERAD complex (SYVN1/SEL1L; retrotranslocation + ubiquitination of misfolded ER proteins)
+#   subu UREL — UFL1/DDRGK1 (UFM1 E3 ligase; ufmylates stalled 60S ribosomes at ER)
+#   subu TTT — TELO2-TTI1-TTI2 co-chaperone (HSP90-dependent stabilization of ATM/ATR/DNA-PKcs/mTOR PIKKs)
+#   GOI HSPA5 — BiP/GRP78 (HSPA5; ER-resident Hsp70, master UPR regulator, protein folding)
+#
+# Cytoskeleton & Morphology (3 clusters):
+#   Focal adhesion — top-level focal adhesion / cell-matrix adhesion cluster
+#   subu ARP2/3 — Arp2/3 complex (ARPC2/3/4, ACTR3; actin nucleation at lamellipodia, endocytic pits)
+#   subu Inter. Fillaments — keratin intermediate filaments (KRT8/18; epithelial cytoskeleton)
+#
+# Remaining unassigned (7 genes from 3 paralog clusters):
+#   para CBWD (CBWD1-3) — poorly characterized COBW domain proteins, no clear functional category
+#   para FOXD4 (FOXD4L1, FOXD4L5) — forkhead box transcription factor paralogs, poorly characterized
+#   para SPATA31 (SPATA31A3, SPATA31A5) — spermatogenesis-associated, poorly characterized
+#   para USP17L (USP17L5, USP17L12) — assigned to DNA damage cluster in CHAD; covered there
 
 chad_hierarchy_path: /hpc/projects/icd.ops/configs/gene_clusters/chad_positive_controls_v5_hierarchy.yml
 gene_panel_path: /hpc/projects/intracellular_dashboard/ops/configs/annotated_gene_panel_July2025.csv
@@ -28,6 +191,22 @@ super_categories:
       - tRNA
       - "tRNA synthetase"
       - eIF2
+      # --- CHAD v5 subunit clusters ---
+      - "subu ribosome 40s"
+      - "subu ribosome 60s"
+      - "subu eIF2"
+      - "subu eIF2 GEF"
+      - "subu eIF3"
+      - "subu eIF4"
+      - "subu MSC"             # multi-tRNA synthetase complex
+      - "subu FARS"            # phenylalanyl-tRNA synthetase
+      - "subu mito ribosome 39s"
+      - "subu BMS1"            # rRNA processing
+      - "subu SSU processome"  # 18S rRNA processing
+      - "subu RPF2"            # 60S biogenesis
+      - "subu elongator"       # tRNA modification
+      - "subu CTU1"            # tRNA thiolation
+      - "para NOP (methylation of rRNA)"
     pathway_keywords:
       - translation
       - ribosom
@@ -55,6 +234,32 @@ super_categories:
       - "RNA Polymerase"
       - Spliceosome
       - mediator
+      # --- CHAD v5 subunit clusters ---
+      - "subu RNA POL2 specific"
+      - "subu RNA POL3 specific"
+      - "subu RNA Pol1 specific"
+      - "subu RNA exosome"
+      - "subu Integrator Complex"
+      - "subu SF3B (U2 snRNP)"
+      - "subu U1 snRNP"
+      - "subu U5 snRNP"
+      - "subu Sm ring"
+      - "subu LSm ring"
+      - "subu CFIm"            # cleavage factor Im
+      - "subu CPSF"            # cleavage/polyadenylation
+      - "subu CNOT"            # deadenylase / mRNA decay
+      - "subu THO"             # mRNA export
+      - "subu core mediator complex"
+      - "subu mediator kinase module"
+      - "subu TFIIA"
+      - "subu TFIIIC"
+      - "subu INO80"           # chromatin remodeling
+      - "subu NuRD"            # nucleosome remodeling/deacetylase
+      - "SWI SNF"              # chromatin remodeling
+      - "TFIIH"
+      - "hnRNPs"
+      - "SR proteins"
+      - "Nucleosome"
     pathway_keywords:
       - transcription
       - "mrna splicing"
@@ -87,6 +292,24 @@ super_categories:
       - "DNA Replication"
       - "Replication fork"
       - MuvB
+      # --- CHAD v5 subunit / top-level clusters ---
+      - "Cell Cycle"
+      - "Mitosis"
+      - "DNA damage"
+      - "CCAN"                  # centromere
+      - "Condensin II"
+      - "subu cohesin"
+      - "subu CPC"             # chromosomal passenger complex
+      - "subu CDK7"            # CDK-activating kinase
+      - "subu DNA Polymerase A"
+      - "subu DNA Polymerase E"
+      - "subu DNA polymerase zeta"
+      - "subu MCMs"
+      - "subu GINS"
+      - "subu Fanconi"
+      - "subu TIPIN complex"
+      - "subu shelterin"
+      - "subu Augmin"          # microtubule nucleation in mitosis
     pathway_keywords:
       - "cell cycle"
       - mitotic
@@ -135,6 +358,13 @@ super_categories:
     chad_clusters:
       - mTOR
       - KRAS
+      # --- CHAD v5 subunit clusters ---
+      - "subu mTOR (mTORC1 and mTORC2)"
+      - "subu Ragulator"       # mTORC1 activation
+      - "subu TSC"             # mTORC1 negative regulator
+      - "subu GRB2 SOS KRAS"
+      - "subu COP9 signalosome"
+      - "para pro-growth RTK"
     pathway_keywords:
       - "signal transduction"
       - mapk
@@ -170,6 +400,31 @@ super_categories:
       - "GOLGI to ER Transport"
       - SRP
       - dynein-dynactin
+      # --- CHAD v5 subunit clusters ---
+      - "subu COPI"
+      - "COPII coat"
+      - "subu ESCRT-III"
+      - "subu SRP"
+      - "subu SRP receptor"
+      - "subu SEC61"           # ER translocon
+      - "subu signal peptidase"
+      - "subu AP1"
+      - "subu AP2"
+      - "subu AP3"
+      - "subu BLOC1"          # biogenesis of lysosome-related organelles
+      - "subu BORC"           # lysosome positioning
+      - "subu COG"            # Golgi tethering
+      - "subu TRAPP III"      # ER-to-Golgi tethering
+      - "subu exocyst"
+      - "subu retromer"
+      - "subu V-ATPase"       # endosomal/lysosomal acidification
+      - "subu dynein-1"
+      - "subu dynactin"
+      - "subu GGTase"         # Rab prenylation
+      - "subu NCOA4 Ferritin" # ferritinophagy receptor
+      - "para ARF GTPase"
+      - "SNARE"
+      - "Rab GTPase"
     pathway_keywords:
       - vesicle
       - "membrane trafficking"
@@ -209,6 +464,17 @@ super_categories:
     chad_clusters:
       - "electronic transport chain"
       - "mitochondria protein import"
+      # --- CHAD v5 subunit clusters ---
+      - "subu ATP synthase"
+      - "subu complex IV"
+      - "subu complex IV assembly"
+      - "subu coenzyme Q"
+      - "subu isocitrate dehydrogenase 3"
+      - "subu TIM23"          # mito inner membrane translocase
+      - "subu PAM"            # mito presequence translocase-associated motor
+      - "subu PHB"            # prohibitin — mito inner membrane scaffolds
+      - "subu MICOS"          # mito cristae junction
+      - "subu purinisome"     # de novo purine biosynthesis
     pathway_keywords:
       - "metabolism of lipids"
       - "fatty acid"
@@ -250,6 +516,16 @@ super_categories:
     chad_clusters:
       - Proteasome
       - "Ufmylation 60s"
+      # --- CHAD v5 subunit clusters ---
+      - "subu Proteasome 19s"
+      - "GOI Proteasome 20s"
+      - "subu CCT1 (TRiC) chaperonin"
+      - "subu OST"             # oligosaccharyltransferase (N-glycosylation)
+      - "subu EMC"             # ER membrane complex
+      - "subu HRD1-SEL1L"     # ERAD ubiquitin ligase
+      - "subu UREL"           # UFM1 E3 ligase
+      - "subu TTT"            # PIKK stabilization chaperone
+      - "GOI HSPA5"           # BiP / GRP78
     pathway_keywords:
       - proteasom
       - ubiquitin
@@ -285,6 +561,10 @@ super_categories:
     description: "Actin, focal adhesion, tubulin, cell shape, Rho GTPases, migration"
     chad_clusters:
       - "Focal adhesion"
+      # --- CHAD v5 subunit clusters ---
+      - "subu ARP2/3"         # actin nucleation
+      - "subu Inter. Fillaments"  # keratins
+
     pathway_keywords:
       - cytoskeleton
       - actin
