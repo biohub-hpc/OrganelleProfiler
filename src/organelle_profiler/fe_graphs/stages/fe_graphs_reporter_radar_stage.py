@@ -115,7 +115,7 @@ class ReporterRadarStage(BaseStage):
     STAGE_NUMBER = 14
     STAGE_NAME = "reporter_radar"
 
-    DEFAULT_PCA_OPTIMIZED_DIR = "/hpc/projects/icd.fast.ops/organelle_attribution/pca_optimized_v2/dino/all"
+    DEFAULT_PCA_OPTIMIZED_DIR = "/hpc/projects/icd.fast.ops/organelle_attribution/pca_optimized/dino/all"
 
     VALID_SOURCES  = ("chad", "chad_boosted", "reactome_toplevel", "reactome_cell_biology")
     VALID_SCORES   = ("ratio", "mean_map")
@@ -156,6 +156,11 @@ class ReporterRadarStage(BaseStage):
             base_pca = str(Path(base_pca).parent / "downsampled")
         self.pca_optimized_dir = Path(base_pca)
 
+        # Handle consensus_sweep/cosine nesting (newer PCA runs nest output)
+        nested = self.pca_optimized_dir / "consensus_sweep" / "cosine"
+        if nested.exists() and not (self.pca_optimized_dir / "guide_pca_optimized.h5ad").exists():
+            self.pca_optimized_dir = nested
+
         # Load configs
         self.stage_config = _load_yaml(self.config_path)
         self.supercategory_config = _load_yaml(self.supercategory_path)
@@ -169,6 +174,7 @@ class ReporterRadarStage(BaseStage):
         self._signal_to_ncells: Dict[str, int] = {}
         self._label_stats: Dict[str, str] = {}
         self._category_counts: Dict[str, int] = {}
+        self._cp_reporters: set = set()
         pca_report_path = self.pca_optimized_dir / "pca_report.csv"
         if pca_report_path.exists():
             _pr = pd.read_csv(pca_report_path)
@@ -179,6 +185,11 @@ class ReporterRadarStage(BaseStage):
                     self._signal_to_exps[sig] = sorted(set(exps))
                 if "n_cells" in _pr.columns:
                     self._signal_to_ncells[sig] = int(row["n_cells"])
+                # Identify Cell Painting reporters (CP1_/CP2_ channel prefix)
+                if "channel" in _pr.columns:
+                    channels = str(row.get("channel", "")).split(",")
+                    if any(ch.strip().startswith(("CP1_", "CP2_")) for ch in channels):
+                        self._cp_reporters.add(sig)
 
     # ------------------------------------------------------------------
     # Main run
@@ -1105,12 +1116,18 @@ class ReporterRadarStage(BaseStage):
                 # Reactome has angled labels that extend above the plot — push title further up
                 _reactome = is_reactome_toplevel_mode(frozenset({self.source}))
                 stats = getattr(self, "_label_stats", {}).get(reporter)
+                is_cp = reporter in getattr(self, "_cp_reporters", set())
+                title_text = _wrap_label(reporter, 25)
+                if is_cp:
+                    title_text += " [CP]"
+                title_color = "#2ca02c" if is_cp else "black"
                 if stats:
                     title_pad = 115 if _reactome else 50
                     stats_y = 1.38 if _reactome else 1.15
                     ax.set_title(
-                        _wrap_label(reporter, 25),
+                        title_text,
                         fontsize=10, fontweight="bold", pad=title_pad,
+                        color=title_color,
                     )
                     ax.text(
                         0.5, stats_y, stats, transform=ax.transAxes,
@@ -1120,8 +1137,9 @@ class ReporterRadarStage(BaseStage):
                 else:
                     title_pad = 105 if _reactome else 40
                     ax.set_title(
-                        _wrap_label(reporter, 25),
+                        title_text,
                         fontsize=10, fontweight="bold", pad=title_pad,
+                        color=title_color,
                     )
                 subtitle = getattr(self, "_type_subtitles", {}).get(reporter)
                 if subtitle:
@@ -1175,7 +1193,8 @@ class ReporterRadarStage(BaseStage):
         for i, reporter in enumerate(reporters):
             values = radar_df.loc[reporter].values
             color = cmap(i / max(len(reporters) - 1, 1))
-            self._plot_radar_single(ax, values, categories, color, reporter, alpha=0.08)
+            legend_label = f"{reporter} [CP]" if reporter in self._cp_reporters else reporter
+            self._plot_radar_single(ax, values, categories, color, legend_label, alpha=0.08)
 
         if is_normalized:
             # Draw 1.0 reference ring (= global baseline)
@@ -1238,6 +1257,16 @@ class ReporterRadarStage(BaseStage):
         ax.set_xlabel("Biology Category")
         plt.xticks(rotation=30, ha="right")
         plt.yticks(rotation=0)
+
+        # Mark Cell Painting reporters on y-axis
+        if self._cp_reporters:
+            for label in ax.get_yticklabels():
+                txt = label.get_text()
+                if txt in self._cp_reporters:
+                    label.set_text(f"{txt} [CP]")
+                    label.set_color("#2ca02c")
+                    label.set_fontweight("bold")
+            ax.set_yticklabels(ax.get_yticklabels())
         plt.tight_layout()
 
         path = save_figure(fig, out_dir / f"heatmap_{metric_type}.png")
@@ -1449,9 +1478,12 @@ def main():
     parser.add_argument("--pca-optimized", type=str,
                         default=ReporterRadarStage.DEFAULT_PCA_OPTIMIZED_DIR,
                         help="Path to dir with guide_pca_optimized.h5ad "
-                             "(default: pca_optimized_v2/dino/all)")
+                             "(default: pca_optimized/dino/all)")
     parser.add_argument("--downsampled", action="store_true",
                         help="Use downsampled PCA data; outputs under .../downsampled/ instead of .../all/")
+    parser.add_argument("--include-cellpainting", action="store_true",
+                        help="Use PCA data that includes Cell Painting channels. "
+                             "Reads from <pca-dir>/with_cellpainting/ and writes to <output>/with_cellpainting/.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover reporters and print summary")
     parser.add_argument("--plot-only", action="store_true",
@@ -1489,6 +1521,10 @@ def main():
         reporter_filter = [r.strip() for r in args.reporters.split(",")]
 
     pca_path = args.pca_optimized
+    if args.include_cellpainting:
+        pca_path = str(Path(pca_path).parent / "with_cellpainting" / Path(pca_path).name)
+        output_dir = output_dir / "with_cellpainting"
+        output_dir.mkdir(parents=True, exist_ok=True)
     if args.downsampled:
         pca_path = str(Path(pca_path).parent / "downsampled")
 

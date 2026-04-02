@@ -109,14 +109,14 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from ops_utils.analysis.map_scores import phenotypic_distinctivness
+from ops_utils.analysis.map_scores import phenotypic_activity_assesment, phenotypic_distinctivness
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 logging.getLogger("copairs").setLevel(logging.WARNING)
 
 DEFAULT_PCA_DIR = Path(
-    "/hpc/projects/icd.fast.ops/organelle_attribution/pca_optimized_v2/dino"
+    "/hpc/projects/icd.fast.ops/organelle_attribution/pca_optimized/dino"
 )
 DEFAULT_RADAR_DIR = Path(
     "/home/gav.sturm/linked_folders/icd.fast.ops/reporter_radar/14_reporter_radar"
@@ -198,6 +198,27 @@ def load_reporter_stats(pca_dir: Path) -> Dict[str, str]:
     return stats
 
 
+def load_cellpainting_reporters(pca_dir: Path) -> set:
+    """Identify reporters that originate from Cell Painting (CP1_/CP2_) channels.
+
+    Reads pca_report.csv and checks if any channel in the comma-separated
+    channel list starts with CP1_ or CP2_.
+
+    Returns a set of signal (reporter) labels.
+    """
+    pca_report = pca_dir / "pca_report.csv"
+    if not pca_report.exists():
+        return set()
+
+    df = pd.read_csv(pca_report)
+    cp_reporters = set()
+    for _, row in df.iterrows():
+        channels = str(row.get("channel", "")).split(",")
+        if any(ch.strip().startswith(("CP1_", "CP2_")) for ch in channels):
+            cp_reporters.add(row["signal"])
+    return cp_reporters
+
+
 def build_annotated_labels(reporters: List[str], stats: Dict[str, str]) -> Dict[str, str]:
     """Build reporter -> 'reporter\n(stats)' mapping for plot labels."""
     labels = {}
@@ -236,16 +257,86 @@ def _run_distinctiveness(
     return dmap
 
 
-def compute_all_scores(
-    pca_dir: Path,
+def _run_activity(
+    adata_guide: ad.AnnData,
     null_size: int,
+) -> pd.DataFrame:
+    """Run mAP activity on a guide-level AnnData.
+
+    Activity measures how different each geneKO is from NTC controls.
+    """
+    amap, ratio = phenotypic_activity_assesment(
+        adata_guide, plot_results=False, null_size=null_size,
+    )
+    logger.info(f"    {ratio:.2%} active ({len(amap)} genes)")
+    return amap
+
+
+def _compute_metric_matrix(
+    adata_guide: ad.AnnData,
+    label_to_cols: Dict[str, List[str]],
+    reporter_labels: List[str],
+    null_size: int,
+    metric: str,
 ) -> Tuple[pd.DataFrame, pd.Series]:
-    """Compute per-reporter + global distinctiveness mAP from h5ad files.
+    """Compute per-reporter + global mAP matrix for one metric type.
+
+    Parameters
+    ----------
+    metric : str
+        "distinctiveness" or "activity"
 
     Returns
     -------
     raw_df : genes x (reporters + all_combined) DataFrame
-    global_series : per-gene mAP for global baseline (all features pooled)
+    global_series : per-gene mAP for global baseline
+    """
+    run_fn = _run_distinctiveness if metric == "distinctiveness" else _run_activity
+
+    # Global baseline: ALL reporter features pooled
+    logger.info(f"  Computing global {metric} baseline (all features pooled)...")
+    global_map = run_fn(adata_guide, null_size)
+
+    # Per-reporter
+    reporter_maps: Dict[str, pd.DataFrame] = {}
+    for i, label in enumerate(reporter_labels, 1):
+        cols = label_to_cols[label]
+        logger.info(f"  [{i}/{len(reporter_labels)}] {label} ({len(cols)} features) [{metric}]")
+        col_mask = np.array([v in set(cols) for v in adata_guide.var_names])
+        adata_sub = adata_guide[:, col_mask].copy()
+        reporter_maps[label] = run_fn(adata_sub, null_size)
+
+    # Pivot to genes x reporters
+    all_genes = sorted(set().union(
+        *(dmap["perturbation"].tolist() for dmap in reporter_maps.values()),
+        global_map["perturbation"].tolist(),
+    ))
+
+    data = {}
+    for label, dmap in sorted(reporter_maps.items()):
+        g2m = dict(zip(dmap["perturbation"], dmap["mean_average_precision"]))
+        data[label] = [g2m.get(g, np.nan) for g in all_genes]
+
+    g2m_global = dict(zip(global_map["perturbation"], global_map["mean_average_precision"]))
+    data["all_combined"] = [g2m_global.get(g, np.nan) for g in all_genes]
+    global_series = pd.Series(data["all_combined"], index=all_genes, name="all_combined")
+
+    raw_df = pd.DataFrame(data, index=all_genes)
+    raw_df.index.name = "gene"
+    return raw_df, global_series
+
+
+def compute_all_scores(
+    pca_dir: Path,
+    null_size: int,
+    metrics: List[str] = ("distinctiveness", "activity"),
+) -> Dict[str, Tuple[pd.DataFrame, pd.Series]]:
+    """Compute per-reporter + global mAP from h5ad files for each metric.
+
+    Returns
+    -------
+    dict : metric_name -> (raw_df, global_series)
+        raw_df is genes x (reporters + all_combined)
     """
     guide_path = pca_dir / "guide_pca_optimized.h5ad"
     gene_path = pca_dir / "gene_pca_optimized.h5ad"
@@ -272,37 +363,265 @@ def compute_all_scores(
     reporter_labels = sorted(label_to_cols.keys())
     logger.info(f"  {len(reporter_labels)} reporters to process")
 
-    # --- Global baseline: ALL reporter features pooled ---
-    logger.info("  Computing global baseline (all features pooled)...")
-    global_map = _run_distinctiveness(adata_guide, null_size)
+    results = {}
+    for metric in metrics:
+        logger.info(f"\n  --- Computing {metric} ---")
+        raw_df, global_series = _compute_metric_matrix(
+            adata_guide, label_to_cols, reporter_labels, null_size, metric,
+        )
+        results[metric] = (raw_df, global_series)
 
-    # --- Per-reporter ---
-    reporter_maps: Dict[str, pd.DataFrame] = {}
+    return results
+
+
+# ---------------------------------------------------------------------------
+# UMAP plot
+# ---------------------------------------------------------------------------
+
+def _build_source_gene_maps(supercategory_config: dict) -> Dict[str, Dict[str, str]]:
+    """Build gene->category maps for each source variant.
+
+    Returns dict: source_name -> {gene: category}
+    """
+    from ops_utils.analysis.gene_supercategories import (
+        build_gene_supercategory_map,
+        build_reactome_cell_biology_map,
+    )
+    sources = {}
+
+    # CHAD (strict, no boosting)
+    sources["chad"] = build_gene_supercategory_map(supercategory_config, boosted=False)
+
+    # CHAD boosted (keyword + regex + harmonizome expansion)
+    sources["chad_boosted"] = build_gene_supercategory_map(supercategory_config, boosted=True)
+
+    # Reactome cell biology (multi-mapped → pick first for UMAP coloring)
+    rcb_multi = build_reactome_cell_biology_map()
+    sources["reactome_cell_biology"] = {g: cats[0] for g, cats in rcb_multi.items() if cats}
+
+    return sources
+
+
+def plot_gene_umap(
+    pca_dir: Path,
+    out_path: Path,
+    gene_supercats: Dict[str, str],
+    title: str = "GeneKO UMAP",
+):
+    """Plot UMAP of gene-level embeddings colored by supercategory.
+
+    Reads gene_embedding_pca_optimized.h5ad which has precomputed X_umap.
+    """
+    embed_path = pca_dir / "gene_embedding_pca_optimized.h5ad"
+    if not embed_path.exists():
+        logger.warning(f"  Gene embedding not found: {embed_path}, skipping UMAP")
+        return
+
+    adata = ad.read_h5ad(embed_path)
+    if "X_umap" not in adata.obsm:
+        logger.warning("  No X_umap in gene embedding, skipping UMAP")
+        return
+
+    _save_umap_figure(
+        adata.obsm["X_umap"], adata.obs["perturbation"].values,
+        gene_supercats, out_path, title=title,
+    )
+    logger.info(f"  Saved UMAP: {out_path}")
+
+
+def plot_all_source_umaps(
+    pca_dir: Path,
+    out_dir: Path,
+    supercategory_config: dict,
+    subset_name: str = "",
+):
+    """Generate global + per-reporter UMAPs for each source (chad, chad_boosted, reactome).
+
+    Output structure:
+      <out_dir>/umaps/<source>/umap_all_reporters.png
+      <out_dir>/umaps/<source>/per_reporter/umap_<reporter>.png
+    """
+    embed_path = pca_dir / "gene_embedding_pca_optimized.h5ad"
+    if not embed_path.exists():
+        logger.warning(f"  Gene embedding not found: {embed_path}, skipping source UMAPs")
+        return
+
+    source_maps = _build_source_gene_maps(supercategory_config)
+
+    for source_name, gene_cat_map in source_maps.items():
+        source_dir = out_dir / "umaps" / source_name
+        source_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"  Generating UMAPs for source={source_name} ({len(gene_cat_map)} genes mapped)")
+
+        # Global UMAP (precomputed coords)
+        plot_gene_umap(
+            pca_dir, source_dir / "umap_all_reporters.png",
+            gene_cat_map,
+            title=f"GeneKO UMAP ({source_name}) -- {subset_name}",
+        )
+
+        # Per-reporter UMAPs
+        plot_per_reporter_umaps(
+            pca_dir, source_dir, gene_cat_map, subset_name=f"{subset_name} [{source_name}]",
+        )
+
+
+def plot_per_reporter_umaps(
+    pca_dir: Path,
+    out_dir: Path,
+    gene_supercats: Dict[str, str],
+    subset_name: str = "",
+):
+    """Generate one UMAP per reporter using only that reporter's PC features.
+
+    Also saves a combined all-reporters UMAP (same as plot_gene_umap but
+    placed in the same subdir for convenience).
+
+    UMAPs are computed on the fly via umap-learn since only the global
+    X_umap exists in the h5ad.
+    """
+    embed_path = pca_dir / "gene_embedding_pca_optimized.h5ad"
+    if not embed_path.exists():
+        logger.warning(f"  Gene embedding not found: {embed_path}, skipping per-reporter UMAPs")
+        return
+
+    try:
+        from umap import UMAP
+    except ImportError:
+        logger.warning("  umap-learn not installed, skipping per-reporter UMAPs")
+        return
+
+    adata = ad.read_h5ad(embed_path)
+    genes = adata.obs["perturbation"].values
+
+    # Build reporter -> feature column map
+    pc_re = re.compile(r'^(.+)_PC\d+$')
+    label_to_cols: Dict[str, List[str]] = {}
+    for v in adata.var_names:
+        m = pc_re.match(v)
+        if m:
+            label_to_cols.setdefault(m.group(1), []).append(v)
+
+    umap_dir = out_dir / "umaps_per_reporter"
+    umap_dir.mkdir(parents=True, exist_ok=True)
+
+    # All-reporters UMAP (uses precomputed)
+    if "X_umap" in adata.obsm:
+        _save_umap_figure(
+            adata.obsm["X_umap"], genes, gene_supercats,
+            umap_dir / "umap_all_reporters.png",
+            title=f"GeneKO UMAP -- all reporters -- {subset_name}",
+        )
+
+    # Per-reporter UMAPs
+    reporter_labels = sorted(label_to_cols.keys())
     for i, label in enumerate(reporter_labels, 1):
         cols = label_to_cols[label]
-        logger.info(f"  [{i}/{len(reporter_labels)}] {label} ({len(cols)} features)")
-        col_mask = np.array([v in set(cols) for v in adata_guide.var_names])
-        adata_sub = adata_guide[:, col_mask].copy()
-        reporter_maps[label] = _run_distinctiveness(adata_sub, null_size)
+        col_idx = [list(adata.var_names).index(c) for c in cols]
+        X_sub = adata.X[:, col_idx]
+        if hasattr(X_sub, "toarray"):
+            X_sub = X_sub.toarray()
+        X_sub = np.asarray(X_sub, dtype=np.float32)
 
-    # --- Pivot to genes x reporters ---
-    all_genes = sorted(set().union(
-        *(dmap["perturbation"].tolist() for dmap in reporter_maps.values()),
-        global_map["perturbation"].tolist(),
-    ))
+        # Skip reporters with too few PCs
+        if X_sub.shape[1] < 2:
+            continue
 
-    data = {}
-    for label, dmap in sorted(reporter_maps.items()):
-        g2m = dict(zip(dmap["perturbation"], dmap["mean_average_precision"]))
-        data[label] = [g2m.get(g, np.nan) for g in all_genes]
+        reducer = UMAP(n_components=2, n_neighbors=15, min_dist=0.3, random_state=42)
+        coords = reducer.fit_transform(X_sub)
 
-    g2m_global = dict(zip(global_map["perturbation"], global_map["mean_average_precision"]))
-    data["all_combined"] = [g2m_global.get(g, np.nan) for g in all_genes]
-    global_series = pd.Series(data["all_combined"], index=all_genes, name="all_combined")
+        safe_name = re.sub(r'[^\w\-]', '_', label)
+        _save_umap_figure(
+            coords, genes, gene_supercats,
+            umap_dir / f"umap_{safe_name}.png",
+            title=f"GeneKO UMAP -- {label} -- {subset_name}",
+        )
+        if i % 10 == 0 or i == len(reporter_labels):
+            logger.info(f"  Per-reporter UMAPs: {i}/{len(reporter_labels)}")
 
-    raw_df = pd.DataFrame(data, index=all_genes)
-    raw_df.index.name = "gene"
-    return raw_df, global_series
+    logger.info(f"  Saved {len(reporter_labels)} per-reporter UMAPs to {umap_dir}")
+
+
+def _save_umap_figure(
+    umap_coords: np.ndarray,
+    genes: np.ndarray,
+    gene_supercats: Dict[str, str],
+    out_path: Path,
+    title: str = "GeneKO UMAP",
+):
+    """Shared plotting logic for UMAP figures."""
+    cats = [gene_supercats.get(g, "Uncategorized") for g in genes]
+    is_ntc = np.array([str(g).startswith("NTC") for g in genes])
+    unique_cats = sorted(set(c for c in cats if c != "Uncategorized"))
+
+    # Build color map: use hand-picked colors for known categories, tab20 fallback
+    _KNOWN_COLORS = {
+        "Cell Cycle & DNA": "#e41a1c",
+        "Cytoskeleton & Morphology": "#ff7f00",
+        "Gene Expression": "#4daf4a",
+        "Membrane Trafficking": "#377eb8",
+        "Metabolism": "#984ea3",
+        "Protein Homeostasis": "#a65628",
+        "Signaling": "#f781bf",
+        "Translation": "#17becf",
+    }
+    cat_to_color = {}
+    fallback_palette = sns.color_palette("tab20", max(len(unique_cats), 1))
+    for i, cat in enumerate(unique_cats):
+        cat_to_color[cat] = _KNOWN_COLORS.get(cat, fallback_palette[i % len(fallback_palette)])
+    cat_to_color["Uncategorized"] = (0.75, 0.75, 0.75)
+
+    fig, ax = plt.subplots(figsize=(14, 11))
+
+    # Uncategorized background
+    uncat_mask = np.array([c == "Uncategorized" for c in cats]) & ~is_ntc
+    if uncat_mask.any():
+        ax.scatter(
+            umap_coords[uncat_mask, 0], umap_coords[uncat_mask, 1],
+            c=[(0.75, 0.75, 0.75)], label="Uncategorized", s=40, alpha=0.3,
+            edgecolors="none",
+        )
+
+    # Categorized genes
+    for cat in unique_cats:
+        mask = np.array([c == cat for c in cats]) & ~is_ntc
+        if not mask.any():
+            continue
+        ax.scatter(
+            umap_coords[mask, 0], umap_coords[mask, 1],
+            c=[cat_to_color[cat]], label=cat, s=60, alpha=0.8,
+            edgecolors="white", linewidths=0.3,
+        )
+
+    # NTCs as faded red X
+    if is_ntc.any():
+        ax.scatter(
+            umap_coords[is_ntc, 0], umap_coords[is_ntc, 1],
+            c="#e08080", marker="X", s=100, alpha=0.5,
+            edgecolors="#b05050", linewidths=0.4, label="NTC", zorder=10,
+        )
+
+    # Gene name annotations
+    for i, gene in enumerate(genes):
+        if str(gene).startswith("NTC"):
+            continue
+        ax.annotate(
+            gene, (umap_coords[i, 0], umap_coords[i, 1]),
+            textcoords="offset points", xytext=(0, 5),
+            fontsize=6.25, ha="center", va="bottom", alpha=0.7,
+        )
+
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+    ax.legend(
+        loc="center left", bbox_to_anchor=(1.02, 0.5),
+        fontsize=9, markerscale=1.5, frameon=False,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +666,7 @@ def plot_heatmap(
     vmax: float = None,
     center: float = None,
     power_scale: float = None,
+    cp_reporters: Optional[set] = None,
 ) -> Tuple[List[int], List[int]]:
     """Plot a clustered genes x reporters heatmap and return the leaf orderings.
 
@@ -407,6 +727,17 @@ def plot_heatmap(
         if annot:
             row_colors_df = pd.DataFrame(annot, index=plot_df.index)
 
+    # Build column colour annotation for Cell Painting reporters
+    col_colors_df = None
+    if cp_reporters:
+        cp_colors = [
+            "#2ca02c" if col in cp_reporters else "#dddddd"
+            for col in plot_df.columns
+        ]
+        col_colors_df = pd.DataFrame(
+            {"Cell Painting": cp_colors}, index=plot_df.columns
+        )
+
     # Figure sizing — tall enough for gene labels, narrow columns
     n_genes = len(plot_df)
     n_reporters = len(plot_df.columns)
@@ -420,6 +751,7 @@ def plot_heatmap(
         metric=metric,
         method=method,
         row_colors=row_colors_df,
+        col_colors=col_colors_df,
         cmap=cmap,
         vmin=vmin,
         vmax=vmax,
@@ -446,6 +778,19 @@ def plot_heatmap(
     g.ax_heatmap.set_ylabel("")
     g.ax_heatmap.tick_params(axis="y", labelsize=10)
     g.ax_heatmap.tick_params(axis="x", labelsize=16)
+
+    # Mark CP reporters in x-axis labels
+    if cp_reporters:
+        new_labels = []
+        for label in g.ax_heatmap.get_xticklabels():
+            txt = label.get_text()
+            if txt in cp_reporters:
+                label.set_text(f"{txt} [CP]")
+                label.set_color("#2ca02c")
+                label.set_fontweight("bold")
+            new_labels.append(label)
+        g.ax_heatmap.set_xticklabels(new_labels)
+
     plt.setp(g.ax_heatmap.get_xticklabels(), rotation=45, ha="right")
     g.fig.suptitle(title, fontsize=24, y=1.01)
 
@@ -882,8 +1227,13 @@ def run_for_subset(
     gene_supercats: Dict[str, str],
     gene_clusters: Dict[str, str],
     null_size: int,
+    supercategory_config: Optional[dict] = None,
 ):
     """Compute mAP scores and generate heatmaps for one subset.
+
+    Computes both distinctiveness and activity metrics, saves each in its own
+    subdir.  Also generates filtered variants (genes with global mAP >= 0.05)
+    and a UMAP plot colored by supercategory.
 
     If CSVs from a previous run already exist in the output dir, skips mAP
     computation and just regenerates heatmaps from the cached data.
@@ -895,46 +1245,69 @@ def run_for_subset(
     subset_out = out_dir / subset_name
     subset_out.mkdir(parents=True, exist_ok=True)
 
-    raw_csv = subset_out / "gene_reporter_distinctiveness_raw.csv"
-    global_csv = subset_out / "global_baseline_distinctiveness.csv"
-
-    # Load reporter stats (n_cells, experiments) from pca_report.csv
+    # Resolve PCA path (handle consensus_sweep/cosine nesting)
     pca_subdir = pca_dir / subset_name
+    nested = pca_subdir / "consensus_sweep" / "cosine"
+    if nested.exists() and not (pca_subdir / "guide_pca_optimized.h5ad").exists():
+        pca_subdir = nested
     reporter_stats = load_reporter_stats(pca_subdir) if pca_subdir.exists() else {}
+    cp_reporters = load_cellpainting_reporters(pca_subdir) if pca_subdir.exists() else set()
+    if cp_reporters:
+        logger.info(f"  Cell Painting reporters: {sorted(cp_reporters)}")
 
-    if raw_csv.exists() and global_csv.exists():
-        # Reuse cached CSVs — skip mAP computation
-        logger.info(f"  Found existing CSVs, skipping mAP computation")
-        logger.info(f"    {raw_csv}")
-        logger.info(f"    {global_csv}")
-        raw_df = pd.read_csv(raw_csv, index_col=0)
-        raw_df.index.name = "gene"
-        global_df = pd.read_csv(global_csv, index_col=0)
-        global_series = global_df["mean_average_precision"]
-        global_series.index.name = "gene"
-    else:
-        # Compute fresh mAP scores
-        pca_subdir = pca_dir / subset_name
+    # --- Compute or load both metrics ---
+    metric_data = {}  # metric_name -> (raw_df, global_series)
+    METRICS = ("distinctiveness", "activity")
+
+    all_cached = True
+    for metric_name in METRICS:
+        raw_csv = subset_out / metric_name / f"gene_reporter_{metric_name}_raw.csv"
+        global_csv = subset_out / metric_name / f"global_baseline_{metric_name}.csv"
+        if raw_csv.exists() and global_csv.exists():
+            logger.info(f"  Found cached CSVs for {metric_name}")
+            raw_df = pd.read_csv(raw_csv, index_col=0)
+            raw_df.index.name = "gene"
+            global_df = pd.read_csv(global_csv, index_col=0)
+            global_series = global_df["mean_average_precision"]
+            global_series.index.name = "gene"
+            metric_data[metric_name] = (raw_df, global_series)
+        else:
+            all_cached = False
+
+    if not all_cached:
         if not pca_subdir.exists():
             logger.warning(f"Skipping {subset_name}: {pca_subdir} not found")
             return
 
-        raw_df, global_series = compute_all_scores(pca_subdir, null_size)
+        computed = compute_all_scores(pca_subdir, null_size, metrics=METRICS)
+        for metric_name, (raw_df, global_series) in computed.items():
+            metric_dir = subset_out / metric_name
+            metric_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save CSVs for future reuse
-        raw_df.to_csv(raw_csv)
-        logger.info(f"Saved raw matrix: {raw_csv} ({raw_df.shape})")
+            raw_csv = metric_dir / f"gene_reporter_{metric_name}_raw.csv"
+            raw_df.to_csv(raw_csv)
+            logger.info(f"Saved {metric_name} raw matrix: {raw_csv} ({raw_df.shape})")
 
-        global_series.to_frame("mean_average_precision").to_csv(global_csv)
-        logger.info(f"Saved global baseline: {global_csv}")
+            global_csv = metric_dir / f"global_baseline_{metric_name}.csv"
+            global_series.to_frame("mean_average_precision").to_csv(global_csv)
+            logger.info(f"Saved {metric_name} global baseline: {global_csv}")
 
-    # Return data for two-phase plotting (heatmaps first, then strip/ridge)
-    norm_df = normalize_to_baseline(raw_df, global_series)
-    norm_csv = subset_out / "gene_reporter_distinctiveness_normalized.csv"
-    norm_df.to_csv(norm_csv)
-    logger.info(f"Saved normalized matrix: {norm_csv} ({norm_df.shape})")
+            metric_data[metric_name] = (raw_df, global_series)
 
-    return raw_df, norm_df, subset_out, reporter_stats
+    # --- UMAP plots (per source: chad, chad_boosted, reactome_cell_biology) ---
+    if supercategory_config is not None:
+        plot_all_source_umaps(
+            pca_subdir, subset_out, supercategory_config, subset_name=subset_name,
+        )
+    else:
+        # Fallback: single UMAP with whatever gene_supercats was passed
+        plot_gene_umap(
+            pca_subdir, subset_out / "umaps" / "umap_all_reporters.png",
+            gene_supercats,
+            title=f"GeneKO UMAP (supercategory) -- {subset_name}",
+        )
+
+    return metric_data, subset_out, reporter_stats, cp_reporters
 
 
 def generate_heatmaps(
@@ -945,14 +1318,18 @@ def generate_heatmaps(
     gene_supercats: Dict[str, str],
     gene_clusters: Dict[str, str],
     reporter_stats: Dict[str, str],
+    metric_name: str = "distinctiveness",
+    cp_reporters: Optional[set] = None,
 ):
-    """Generate all heatmaps (PNG + HTML) for one subset.
+    """Generate all heatmaps (PNG + HTML) for one metric/subset.
 
-    Two clustering variants are produced:
+    Three clustering variants are produced:
       - correlation/ : correlation distance + average linkage (pattern-based)
+      - cosine/      : cosine distance + average linkage
       - euclidean/   : euclidean distance + ward linkage (magnitude-sensitive)
     """
     norm_clipped = norm_df.clip(upper=1.0)
+    metric_label = metric_name.replace("_", " ").title()
 
     clustering_variants = [
         ("correlation", "correlation", "average"),
@@ -968,7 +1345,7 @@ def generate_heatmaps(
         # 1. Raw heatmap PNG — seaborn owns clustering; returns leaf order
         raw_ro, raw_co = plot_heatmap(
             raw_df,
-            title=f"Gene x Reporter mAP Distinctiveness -- {subset_name}{suffix}",
+            title=f"Gene x Reporter mAP {metric_label} -- {subset_name}{suffix}",
             out_path=variant_dir / "heatmap_gene_reporter_raw.png",
             gene_supercats=gene_supercats,
             gene_clusters=gene_clusters,
@@ -976,12 +1353,13 @@ def generate_heatmaps(
             metric=metric,
             method=method,
             power_scale=0.5,
+            cp_reporters=cp_reporters,
         )
 
         # 2. Normalized heatmap PNG
         norm_ro, norm_co = plot_heatmap(
             norm_clipped,
-            title=f"Gene x Reporter mAP Distinctiveness (normalized) -- {subset_name}{suffix}",
+            title=f"Gene x Reporter mAP {metric_label} (normalized) -- {subset_name}{suffix}",
             out_path=variant_dir / "heatmap_gene_reporter_normalized.png",
             gene_supercats=gene_supercats,
             gene_clusters=gene_clusters,
@@ -991,12 +1369,13 @@ def generate_heatmaps(
             vmin=0.0,
             vmax=1.0,
             power_scale=0.5,
+            cp_reporters=cp_reporters,
         )
 
         # 3. Raw interactive HTML — reuses PNG leaf order
         plot_interactive_heatmap(
             raw_df,
-            title=f"Gene x Reporter mAP Distinctiveness -- {subset_name}{suffix}",
+            title=f"Gene x Reporter mAP {metric_label} -- {subset_name}{suffix}",
             out_path=variant_dir / "heatmap_gene_reporter_raw.html",
             ordered_genes=raw_ro,
             ordered_reporters=raw_co,
@@ -1008,7 +1387,7 @@ def generate_heatmaps(
         # 4. Normalized interactive HTML — reuses PNG leaf order
         plot_interactive_heatmap(
             norm_clipped,
-            title=f"Gene x Reporter mAP Distinctiveness (normalized) -- {subset_name}{suffix}",
+            title=f"Gene x Reporter mAP {metric_label} (normalized) -- {subset_name}{suffix}",
             out_path=variant_dir / "heatmap_gene_reporter_normalized.html",
             ordered_genes=norm_ro,
             ordered_reporters=norm_co,
@@ -1074,13 +1453,45 @@ def slurm_worker(
             gene_supercats=gene_supercats,
             gene_clusters=gene_clusters,
             null_size=null_size,
+            supercategory_config=supercat_config,
         )
         if result is None:
             return f"SKIPPED: {subset_name}"
-        raw_df, norm_df, subset_out, reporter_stats = result
-        generate_heatmaps(raw_df, norm_df, subset_name, subset_out,
-                          gene_supercats, gene_clusters, reporter_stats)
-        generate_strip_ridge(raw_df, subset_out, gene_supercats, gene_clusters, reporter_stats)
+        metric_data, subset_out, reporter_stats, cp_reporters = result
+
+        MAP_THRESHOLD = 0.05
+
+        for metric_name, (raw_df, global_series) in metric_data.items():
+            metric_dir = subset_out / metric_name
+            norm_df = normalize_to_baseline(raw_df, global_series)
+
+            # Save normalized CSV
+            norm_csv = metric_dir / f"gene_reporter_{metric_name}_normalized.csv"
+            norm_df.to_csv(norm_csv)
+
+            # Full heatmaps
+            generate_heatmaps(raw_df, norm_df, subset_name, metric_dir,
+                              gene_supercats, gene_clusters, reporter_stats,
+                              metric_name=metric_name, cp_reporters=cp_reporters)
+
+            # Filtered heatmaps (genes with global mAP >= threshold)
+            keep = global_series[global_series >= MAP_THRESHOLD].index
+            if len(keep) > 5:
+                raw_filt = raw_df.loc[raw_df.index.isin(keep)]
+                norm_filt = norm_df.loc[norm_df.index.isin(keep)]
+                filt_dir = metric_dir / "filtered"
+                filt_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"  Filtered {metric_name}: {len(raw_filt)}/{len(raw_df)} genes (mAP >= {MAP_THRESHOLD})")
+                generate_heatmaps(raw_filt, norm_filt, f"{subset_name} (filtered)",
+                                  filt_dir, gene_supercats, gene_clusters,
+                                  reporter_stats, metric_name=metric_name,
+                                  cp_reporters=cp_reporters)
+
+            # Strip/ridge only for distinctiveness (main metric)
+            if metric_name == "distinctiveness":
+                generate_strip_ridge(raw_df, metric_dir, gene_supercats,
+                                     gene_clusters, reporter_stats)
+
         return f"OK: {subset_name}"
     except Exception as e:
         traceback.print_exc()
@@ -1112,6 +1523,11 @@ def main():
         help="Run only one subset (default: both)",
     )
     parser.add_argument(
+        "--include-cellpainting", action="store_true",
+        help="Use PCA data that includes Cell Painting channels. "
+             "Reads from <pca-dir>/with_cellpainting/ and writes to <output>/with_cellpainting/.",
+    )
+    parser.add_argument(
         "--null-size", type=int, default=100_000,
         help="Null distribution size for p-value estimation",
     )
@@ -1129,14 +1545,20 @@ def main():
                              help="Skip confirmation prompt")
     slurm_group.add_argument("--slurm-memory", type=str, default="64GB",
                              help="Memory per job (default: 64GB)")
-    slurm_group.add_argument("--slurm-time", type=int, default=10,
-                             help="Time limit in minutes (default: 10)")
+    slurm_group.add_argument("--slurm-time", type=int, default=30,
+                             help="Time limit in minutes (default: 30)")
     slurm_group.add_argument("--slurm-cpus", type=int, default=16,
                              help="CPUs per job (default: 16)")
 
     args = parser.parse_args()
 
+    # Adjust paths for cell-painting mode
+    if args.include_cellpainting:
+        args.pca_dir = args.pca_dir / "with_cellpainting"
+
     out_dir = args.output_dir or (args.radar_dir / "heatmaps")
+    if args.include_cellpainting and not args.output_dir:
+        out_dir = out_dir / "with_cellpainting"
     subsets = [args.subset] if args.subset else ["all", "downsampled"]
 
     # ------------------------------------------------------------------
@@ -1211,7 +1633,9 @@ def main():
     gene_supercats = build_gene_supercategory_map(supercat_config, boosted=True)
     logger.info(f"  Supercategory map: {len(gene_supercats)} genes")
 
-    # Phase 1: Load/compute data + generate all heatmaps (PNG + HTML) for all subsets
+    MAP_THRESHOLD = 0.05
+
+    # Phase 1: Compute/load mAP data for all subsets
     subset_data = {}
     for subset in subsets:
         result = run_for_subset(
@@ -1221,23 +1645,45 @@ def main():
             gene_supercats=gene_supercats,
             gene_clusters=gene_clusters,
             null_size=args.null_size,
+            supercategory_config=supercat_config,
         )
         if result is not None:
             subset_data[subset] = result
 
-    for subset, (raw_df, norm_df, subset_out, reporter_stats) in subset_data.items():
-        logger.info(f"\nGenerating heatmaps for {subset}...")
-        generate_heatmaps(
-            raw_df, norm_df, subset, subset_out,
-            gene_supercats, gene_clusters, reporter_stats,
-        )
+    # Phase 2: Heatmaps for each metric (full + filtered)
+    for subset, (metric_data, subset_out, reporter_stats, cp_reporters) in subset_data.items():
+        for metric_name, (raw_df, global_series) in metric_data.items():
+            metric_dir = subset_out / metric_name
+            norm_df = normalize_to_baseline(raw_df, global_series)
 
-    # Phase 2: Strip + ridge plots (slower, after all heatmaps are done)
-    for subset, (raw_df, norm_df, subset_out, reporter_stats) in subset_data.items():
-        logger.info(f"\nGenerating strip/ridge plots for {subset}...")
-        generate_strip_ridge(
-            raw_df, subset_out, gene_supercats, gene_clusters, reporter_stats,
-        )
+            norm_csv = metric_dir / f"gene_reporter_{metric_name}_normalized.csv"
+            norm_df.to_csv(norm_csv)
+
+            logger.info(f"\nGenerating {metric_name} heatmaps for {subset}...")
+            generate_heatmaps(raw_df, norm_df, subset, metric_dir,
+                              gene_supercats, gene_clusters, reporter_stats,
+                              metric_name=metric_name, cp_reporters=cp_reporters)
+
+            # Filtered heatmaps
+            keep = global_series[global_series >= MAP_THRESHOLD].index
+            if len(keep) > 5:
+                raw_filt = raw_df.loc[raw_df.index.isin(keep)]
+                norm_filt = norm_df.loc[norm_df.index.isin(keep)]
+                filt_dir = metric_dir / "filtered"
+                filt_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"  Filtered {metric_name}: {len(raw_filt)}/{len(raw_df)} genes (mAP >= {MAP_THRESHOLD})")
+                generate_heatmaps(raw_filt, norm_filt, f"{subset} (filtered)",
+                                  filt_dir, gene_supercats, gene_clusters,
+                                  reporter_stats, metric_name=metric_name,
+                                  cp_reporters=cp_reporters)
+
+    # Phase 3: Strip + ridge plots (distinctiveness only, slower)
+    for subset, (metric_data, subset_out, reporter_stats, cp_reporters) in subset_data.items():
+        if "distinctiveness" in metric_data:
+            raw_df, _ = metric_data["distinctiveness"]
+            logger.info(f"\nGenerating strip/ridge plots for {subset}...")
+            generate_strip_ridge(raw_df, subset_out / "distinctiveness",
+                                 gene_supercats, gene_clusters, reporter_stats)
 
     logger.info(f"\nDone in {time.time()-t0:.0f}s. Output: {out_dir}")
 
