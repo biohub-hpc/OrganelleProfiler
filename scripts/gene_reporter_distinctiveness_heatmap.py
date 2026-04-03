@@ -666,7 +666,6 @@ def plot_heatmap(
     vmax: float = None,
     center: float = None,
     power_scale: float = None,
-    cp_reporters: Optional[set] = None,
 ) -> Tuple[List[int], List[int]]:
     """Plot a clustered genes x reporters heatmap and return the leaf orderings.
 
@@ -727,17 +726,6 @@ def plot_heatmap(
         if annot:
             row_colors_df = pd.DataFrame(annot, index=plot_df.index)
 
-    # Build column colour annotation for Cell Painting reporters
-    col_colors_df = None
-    if cp_reporters:
-        cp_colors = [
-            "#2ca02c" if col in cp_reporters else "#dddddd"
-            for col in plot_df.columns
-        ]
-        col_colors_df = pd.DataFrame(
-            {"Cell Painting": cp_colors}, index=plot_df.columns
-        )
-
     # Figure sizing — tall enough for gene labels, narrow columns
     n_genes = len(plot_df)
     n_reporters = len(plot_df.columns)
@@ -751,7 +739,6 @@ def plot_heatmap(
         metric=metric,
         method=method,
         row_colors=row_colors_df,
-        col_colors=col_colors_df,
         cmap=cmap,
         vmin=vmin,
         vmax=vmax,
@@ -778,18 +765,6 @@ def plot_heatmap(
     g.ax_heatmap.set_ylabel("")
     g.ax_heatmap.tick_params(axis="y", labelsize=10)
     g.ax_heatmap.tick_params(axis="x", labelsize=16)
-
-    # Mark CP reporters in x-axis labels
-    if cp_reporters:
-        new_labels = []
-        for label in g.ax_heatmap.get_xticklabels():
-            txt = label.get_text()
-            if txt in cp_reporters:
-                label.set_text(f"{txt} [CP]")
-                label.set_color("#2ca02c")
-                label.set_fontweight("bold")
-            new_labels.append(label)
-        g.ax_heatmap.set_xticklabels(new_labels)
 
     plt.setp(g.ax_heatmap.get_xticklabels(), rotation=45, ha="right")
     g.fig.suptitle(title, fontsize=24, y=1.01)
@@ -913,22 +888,150 @@ def plot_interactive_heatmap(
     tick_vals = real_ticks ** 0.5
     tick_text = [f"{t:.1f}" for t in real_ticks]
 
-    fig = go.Figure(data=go.Heatmap(
-        z=z_display,
-        x=reporters,
-        y=genes,
-        hovertext=hover,
-        hoverinfo="text",
-        colorscale="Inferno",
-        colorbar=dict(title="mAP", tickvals=tick_vals, ticktext=tick_text, len=0.3, y=0.5),
-    ))
+    # --- Build supercategory color annotation column ---
+    _SUPERCAT_HTML_COLORS = {
+        "Cell Cycle & DNA": "#e41a1c",
+        "Cytoskeleton & Morphology": "#ff7f00",
+        "Gene Expression": "#4daf4a",
+        "Membrane Trafficking": "#377eb8",
+        "Metabolism": "#984ea3",
+        "Protein Homeostasis": "#a65628",
+        "Signaling": "#f781bf",
+        "Translation": "#17becf",
+        "Uncategorized": "#cccccc",
+    }
+    supercat_colors = None
+    supercat_hover = None
+    if gene_supercats:
+        supercat_colors = []
+        supercat_hover = []
+        for g in genes:
+            cat = gene_supercats.get(g, "Uncategorized")
+            supercat_colors.append(_SUPERCAT_HTML_COLORS.get(cat, "#cccccc"))
+            supercat_hover.append(f"<b>{g}</b><br>{cat}")
+
+    from plotly.subplots import make_subplots
+
+    def _discrete_colorscale(items, color_map, default="#cccccc"):
+        """Build a Plotly discrete colorscale from category list + color dict."""
+        unique = sorted(set(items))
+        cat_to_num = {c: i for i, c in enumerate(unique)}
+        n = len(unique)
+        cs = []
+        for i, cat in enumerate(unique):
+            lo, hi = i / n, (i + 1) / n
+            color = color_map.get(cat, default)
+            cs.append([lo, color])
+            cs.append([hi, color])
+        vals = [cat_to_num[item] for item in items]
+        return vals, cs, unique, cat_to_num
+
+    has_supercats = gene_supercats is not None and len(gene_supercats) > 0
+    has_clusters = gene_clusters is not None and len(gene_clusters) > 0
+    n_annot_cols = int(has_supercats) + int(has_clusters)
+
+    if n_annot_cols > 0:
+        annot_width = 0.015 * n_annot_cols
+        col_widths = [0.015] * n_annot_cols + [1.0 - annot_width]
+        fig = make_subplots(
+            rows=1, cols=n_annot_cols + 1,
+            column_widths=col_widths,
+            horizontal_spacing=0.002,
+            shared_yaxes=True,
+        )
+
+        col_idx = 1
+
+        # Supercategory annotation bar
+        if has_supercats:
+            sc_items = [gene_supercats.get(g, "Uncategorized") for g in genes]
+            sc_vals, sc_cs, sc_unique, _ = _discrete_colorscale(sc_items, _SUPERCAT_HTML_COLORS)
+            sc_hover = [[f"<b>{g}</b><br>Supercategory: {gene_supercats.get(g, 'Uncategorized')}"] for g in genes]
+            fig.add_trace(go.Heatmap(
+                z=[[v] for v in sc_vals],
+                x=["Supercategory"],
+                y=genes,
+                hovertext=sc_hover,
+                hoverinfo="text",
+                colorscale=sc_cs,
+                showscale=False,
+                xgap=0, ygap=0,
+            ), row=1, col=col_idx)
+            fig.update_xaxes(tickfont=dict(size=5), tickangle=0, row=1, col=col_idx)
+            col_idx += 1
+
+        # CHAD cluster annotation bar
+        if has_clusters:
+            cl_items = [gene_clusters.get(g, "Uncategorized") for g in genes]
+            # Generate colors for CHAD clusters (many unique values)
+            cl_unique = sorted(set(cl_items))
+            import colorsys
+            n_cl = len(cl_unique)
+            cl_color_map = {"Uncategorized": "#cccccc"}
+            for i, cl in enumerate(cl_unique):
+                if cl != "Uncategorized":
+                    hue = i / max(n_cl, 1)
+                    r, g_c, b = colorsys.hls_to_rgb(hue, 0.5, 0.7)
+                    cl_color_map[cl] = f"#{int(r*255):02x}{int(g_c*255):02x}{int(b*255):02x}"
+            cl_vals, cl_cs, _, _ = _discrete_colorscale(cl_items, cl_color_map)
+            cl_hover = [[f"<b>{g}</b><br>CHAD: {gene_clusters.get(g, 'Uncategorized')}"] for g in genes]
+            fig.add_trace(go.Heatmap(
+                z=[[v] for v in cl_vals],
+                x=["CHAD"],
+                y=genes,
+                hovertext=cl_hover,
+                hoverinfo="text",
+                colorscale=cl_cs,
+                showscale=False,
+                xgap=0, ygap=0,
+            ), row=1, col=col_idx)
+            fig.update_xaxes(tickfont=dict(size=5), tickangle=0, row=1, col=col_idx)
+            col_idx += 1
+
+        # Main heatmap
+        heatmap_col = col_idx
+        fig.add_trace(go.Heatmap(
+            z=z_display,
+            x=reporters,
+            y=genes,
+            hovertext=hover,
+            hoverinfo="text",
+            colorscale="Inferno",
+            colorbar=dict(title="mAP", tickvals=tick_vals, ticktext=tick_text, len=0.3, y=0.5),
+        ), row=1, col=heatmap_col)
+
+        fig.update_xaxes(
+            title="Reporter", tickfont=dict(size=9), tickangle=45,
+            side="bottom", row=1, col=heatmap_col,
+        )
+        fig.update_yaxes(tickfont=dict(size=5), autorange="reversed", row=1, col=1)
+
+        # Legend: add invisible scatter traces for supercategory colors
+        if has_supercats:
+            for cat in sorted(set(gene_supercats.get(g, "Uncategorized") for g in genes)):
+                fig.add_trace(go.Scatter(
+                    x=[None], y=[None], mode="markers",
+                    marker=dict(size=10, color=_SUPERCAT_HTML_COLORS.get(cat, "#cccccc")),
+                    name=f"SC: {cat}",
+                    showlegend=True,
+                ))
+    else:
+        fig = go.Figure(data=go.Heatmap(
+            z=z_display,
+            x=reporters,
+            y=genes,
+            hovertext=hover,
+            hoverinfo="text",
+            colorscale="Inferno",
+            colorbar=dict(title="mAP", tickvals=tick_vals, ticktext=tick_text, len=0.3, y=0.5),
+        ))
 
     fig.update_layout(
         title=title,
-        xaxis=dict(title="Reporter", tickfont=dict(size=9), tickangle=45),
-        yaxis=dict(title="", tickfont=dict(size=5), autorange="reversed"),
-        width=max(750, len(reporters) * 18 + 175),
-        height=max(900, len(genes) * 7 + 175),
+        width=max(750, len(reporters) * 18 + 200),
+        height=max(900, len(genes) * 7 + 200),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
     )
 
     fig.write_html(str(out_path), include_plotlyjs="cdn")
@@ -1228,6 +1331,7 @@ def run_for_subset(
     gene_clusters: Dict[str, str],
     null_size: int,
     supercategory_config: Optional[dict] = None,
+    skip_umaps: bool = False,
 ):
     """Compute mAP scores and generate heatmaps for one subset.
 
@@ -1255,6 +1359,9 @@ def run_for_subset(
     if cp_reporters:
         logger.info(f"  Cell Painting reporters: {sorted(cp_reporters)}")
 
+    # Build rename map: CP reporters get "CP_" prefix in column names
+    cp_rename = {r: f"CP_{r}" for r in cp_reporters}
+
     # --- Compute or load both metrics ---
     metric_data = {}  # metric_name -> (raw_df, global_series)
     METRICS = ("distinctiveness", "activity")
@@ -1267,6 +1374,9 @@ def run_for_subset(
             logger.info(f"  Found cached CSVs for {metric_name}")
             raw_df = pd.read_csv(raw_csv, index_col=0)
             raw_df.index.name = "gene"
+            # Apply CP_ rename if not already applied
+            if cp_rename:
+                raw_df = raw_df.rename(columns=cp_rename)
             global_df = pd.read_csv(global_csv, index_col=0)
             global_series = global_df["mean_average_precision"]
             global_series.index.name = "gene"
@@ -1281,6 +1391,10 @@ def run_for_subset(
 
         computed = compute_all_scores(pca_subdir, null_size, metrics=METRICS)
         for metric_name, (raw_df, global_series) in computed.items():
+            # Rename CP reporters in columns
+            if cp_rename:
+                raw_df = raw_df.rename(columns=cp_rename)
+
             metric_dir = subset_out / metric_name
             metric_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1295,7 +1409,9 @@ def run_for_subset(
             metric_data[metric_name] = (raw_df, global_series)
 
     # --- UMAP plots (per source: chad, chad_boosted, reactome_cell_biology) ---
-    if supercategory_config is not None:
+    if skip_umaps:
+        logger.info("  Skipping UMAPs (--no-umaps)")
+    elif supercategory_config is not None:
         plot_all_source_umaps(
             pca_subdir, subset_out, supercategory_config, subset_name=subset_name,
         )
@@ -1307,7 +1423,7 @@ def run_for_subset(
             title=f"GeneKO UMAP (supercategory) -- {subset_name}",
         )
 
-    return metric_data, subset_out, reporter_stats, cp_reporters
+    return metric_data, subset_out, reporter_stats
 
 
 def generate_heatmaps(
@@ -1319,7 +1435,6 @@ def generate_heatmaps(
     gene_clusters: Dict[str, str],
     reporter_stats: Dict[str, str],
     metric_name: str = "distinctiveness",
-    cp_reporters: Optional[set] = None,
 ):
     """Generate all heatmaps (PNG + HTML) for one metric/subset.
 
@@ -1353,7 +1468,6 @@ def generate_heatmaps(
             metric=metric,
             method=method,
             power_scale=0.5,
-            cp_reporters=cp_reporters,
         )
 
         # 2. Normalized heatmap PNG
@@ -1369,7 +1483,6 @@ def generate_heatmaps(
             vmin=0.0,
             vmax=1.0,
             power_scale=0.5,
-            cp_reporters=cp_reporters,
         )
 
         # 3. Raw interactive HTML — reuses PNG leaf order
@@ -1427,6 +1540,8 @@ def slurm_worker(
     out_dir: str,
     supercategory_config_path: str,
     null_size: int,
+    skip_strip_ridge: bool = False,
+    skip_umaps: bool = False,
 ) -> str:
     """Top-level worker function for submit_parallel_jobs.
 
@@ -1454,10 +1569,11 @@ def slurm_worker(
             gene_clusters=gene_clusters,
             null_size=null_size,
             supercategory_config=supercat_config,
+            skip_umaps=skip_umaps,
         )
         if result is None:
             return f"SKIPPED: {subset_name}"
-        metric_data, subset_out, reporter_stats, cp_reporters = result
+        metric_data, subset_out, reporter_stats = result
 
         MAP_THRESHOLD = 0.05
 
@@ -1472,10 +1588,12 @@ def slurm_worker(
             # Full heatmaps
             generate_heatmaps(raw_df, norm_df, subset_name, metric_dir,
                               gene_supercats, gene_clusters, reporter_stats,
-                              metric_name=metric_name, cp_reporters=cp_reporters)
+                              metric_name=metric_name)
 
-            # Filtered heatmaps (genes with global mAP >= threshold)
-            keep = global_series[global_series >= MAP_THRESHOLD].index
+            # Filtered heatmaps (genes where max reporter mAP >= threshold)
+            reporter_cols = [c for c in raw_df.columns if c != "all_combined"]
+            gene_max = raw_df[reporter_cols].max(axis=1)
+            keep = gene_max[gene_max >= MAP_THRESHOLD].index
             if len(keep) > 5:
                 raw_filt = raw_df.loc[raw_df.index.isin(keep)]
                 norm_filt = norm_df.loc[norm_df.index.isin(keep)]
@@ -1484,11 +1602,25 @@ def slurm_worker(
                 logger.info(f"  Filtered {metric_name}: {len(raw_filt)}/{len(raw_df)} genes (mAP >= {MAP_THRESHOLD})")
                 generate_heatmaps(raw_filt, norm_filt, f"{subset_name} (filtered)",
                                   filt_dir, gene_supercats, gene_clusters,
-                                  reporter_stats, metric_name=metric_name,
-                                  cp_reporters=cp_reporters)
+                                  reporter_stats, metric_name=metric_name)
+
+                # Extra: for "all" subset, also drop all_combined + Phase columns
+                if subset_name == "all":
+                    drop_cols = {"all_combined", "Phase"}
+                    kept_cols = [c for c in raw_filt.columns if c not in drop_cols]
+                    if len(kept_cols) >= 3:
+                        raw_filt2 = raw_filt[kept_cols]
+                        norm_filt2 = norm_filt[[c for c in kept_cols if c in norm_filt.columns]]
+                        filt2_dir = metric_dir / "filtered_reporters"
+                        filt2_dir.mkdir(parents=True, exist_ok=True)
+                        logger.info(f"  Filtered reporters: {len(kept_cols)} cols (dropped {drop_cols & set(raw_filt.columns)})")
+                        generate_heatmaps(raw_filt2, norm_filt2,
+                                          f"{subset_name} (filtered genes+reporters)",
+                                          filt2_dir, gene_supercats, gene_clusters,
+                                          reporter_stats, metric_name=metric_name)
 
             # Strip/ridge only for distinctiveness (main metric)
-            if metric_name == "distinctiveness":
+            if metric_name == "distinctiveness" and not skip_strip_ridge:
                 generate_strip_ridge(raw_df, metric_dir, gene_supercats,
                                      gene_clusters, reporter_stats)
 
@@ -1534,6 +1666,15 @@ def main():
     parser.add_argument(
         "--supercategory-config", type=Path, default=DEFAULT_SUPERCATEGORY_CONFIG,
         help="Path to gene_supercategory_mapping.yaml",
+    )
+
+    parser.add_argument(
+        "--no-strip-ridge", action="store_true",
+        help="Skip strip/ridge plot generation (heatmaps + UMAPs only).",
+    )
+    parser.add_argument(
+        "--no-umaps", action="store_true",
+        help="Skip UMAP generation (heatmaps only).",
     )
 
     slurm_group = parser.add_argument_group("SLURM options")
@@ -1585,6 +1726,8 @@ def main():
                     "out_dir": str(out_dir),
                     "supercategory_config_path": str(args.supercategory_config),
                     "null_size": args.null_size,
+                    "skip_strip_ridge": args.no_strip_ridge,
+                    "skip_umaps": args.no_umaps,
                 },
             })
 
@@ -1646,12 +1789,13 @@ def main():
             gene_clusters=gene_clusters,
             null_size=args.null_size,
             supercategory_config=supercat_config,
+            skip_umaps=args.no_umaps,
         )
         if result is not None:
             subset_data[subset] = result
 
     # Phase 2: Heatmaps for each metric (full + filtered)
-    for subset, (metric_data, subset_out, reporter_stats, cp_reporters) in subset_data.items():
+    for subset, (metric_data, subset_out, reporter_stats) in subset_data.items():
         for metric_name, (raw_df, global_series) in metric_data.items():
             metric_dir = subset_out / metric_name
             norm_df = normalize_to_baseline(raw_df, global_series)
@@ -1662,10 +1806,12 @@ def main():
             logger.info(f"\nGenerating {metric_name} heatmaps for {subset}...")
             generate_heatmaps(raw_df, norm_df, subset, metric_dir,
                               gene_supercats, gene_clusters, reporter_stats,
-                              metric_name=metric_name, cp_reporters=cp_reporters)
+                              metric_name=metric_name)
 
             # Filtered heatmaps
-            keep = global_series[global_series >= MAP_THRESHOLD].index
+            reporter_cols = [c for c in raw_df.columns if c != "all_combined"]
+            gene_max = raw_df[reporter_cols].max(axis=1)
+            keep = gene_max[gene_max >= MAP_THRESHOLD].index
             if len(keep) > 5:
                 raw_filt = raw_df.loc[raw_df.index.isin(keep)]
                 norm_filt = norm_df.loc[norm_df.index.isin(keep)]
@@ -1674,16 +1820,31 @@ def main():
                 logger.info(f"  Filtered {metric_name}: {len(raw_filt)}/{len(raw_df)} genes (mAP >= {MAP_THRESHOLD})")
                 generate_heatmaps(raw_filt, norm_filt, f"{subset} (filtered)",
                                   filt_dir, gene_supercats, gene_clusters,
-                                  reporter_stats, metric_name=metric_name,
-                                  cp_reporters=cp_reporters)
+                                  reporter_stats, metric_name=metric_name)
+
+                # Extra: for "all" subset, also drop all_combined + Phase columns
+                if subset == "all":
+                    drop_cols = {"all_combined", "Phase"}
+                    kept_cols = [c for c in raw_filt.columns if c not in drop_cols]
+                    if len(kept_cols) >= 3:
+                        raw_filt2 = raw_filt[kept_cols]
+                        norm_filt2 = norm_filt[[c for c in kept_cols if c in norm_filt.columns]]
+                        filt2_dir = metric_dir / "filtered_reporters"
+                        filt2_dir.mkdir(parents=True, exist_ok=True)
+                        logger.info(f"  Filtered reporters: {len(kept_cols)} cols (dropped {drop_cols & set(raw_filt.columns)})")
+                        generate_heatmaps(raw_filt2, norm_filt2,
+                                          f"{subset} (filtered genes+reporters)",
+                                          filt2_dir, gene_supercats, gene_clusters,
+                                          reporter_stats, metric_name=metric_name)
 
     # Phase 3: Strip + ridge plots (distinctiveness only, slower)
-    for subset, (metric_data, subset_out, reporter_stats, cp_reporters) in subset_data.items():
-        if "distinctiveness" in metric_data:
-            raw_df, _ = metric_data["distinctiveness"]
-            logger.info(f"\nGenerating strip/ridge plots for {subset}...")
-            generate_strip_ridge(raw_df, subset_out / "distinctiveness",
-                                 gene_supercats, gene_clusters, reporter_stats)
+    if not args.no_strip_ridge:
+        for subset, (metric_data, subset_out, reporter_stats) in subset_data.items():
+            if "distinctiveness" in metric_data:
+                raw_df, _ = metric_data["distinctiveness"]
+                logger.info(f"\nGenerating strip/ridge plots for {subset}...")
+                generate_strip_ridge(raw_df, subset_out / "distinctiveness",
+                                     gene_supercats, gene_clusters, reporter_stats)
 
     logger.info(f"\nDone in {time.time()-t0:.0f}s. Output: {out_dir}")
 

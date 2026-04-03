@@ -190,6 +190,13 @@ class ReporterRadarStage(BaseStage):
                     channels = str(row.get("channel", "")).split(",")
                     if any(ch.strip().startswith(("CP1_", "CP2_")) for ch in channels):
                         self._cp_reporters.add(sig)
+            # Rename CP reporters in lookup dicts so downstream uses CP_ prefix
+            for old_name in list(self._cp_reporters):
+                new_name = f"CP_{old_name}"
+                if old_name in self._signal_to_exps:
+                    self._signal_to_exps[new_name] = self._signal_to_exps.pop(old_name)
+                if old_name in self._signal_to_ncells:
+                    self._signal_to_ncells[new_name] = self._signal_to_ncells.pop(old_name)
 
     # ------------------------------------------------------------------
     # Main run
@@ -230,6 +237,15 @@ class ReporterRadarStage(BaseStage):
             label_to_cols.setdefault(prefix, []).append(v)
 
         reporter_labels = sorted(label_to_cols.keys())
+
+        # Rename Cell Painting reporters with CP_ prefix
+        if self._cp_reporters:
+            cp_rename = {r: f"CP_{r}" for r in self._cp_reporters if r in label_to_cols}
+            if cp_rename:
+                for old, new in cp_rename.items():
+                    label_to_cols[new] = label_to_cols.pop(old)
+                reporter_labels = sorted(label_to_cols.keys())
+                logger.info(f"  Renamed {len(cp_rename)} Cell Painting reporters with CP_ prefix")
 
         # Apply reporter filter if specified
         if self.reporter_filter:
@@ -1116,11 +1132,8 @@ class ReporterRadarStage(BaseStage):
                 # Reactome has angled labels that extend above the plot — push title further up
                 _reactome = is_reactome_toplevel_mode(frozenset({self.source}))
                 stats = getattr(self, "_label_stats", {}).get(reporter)
-                is_cp = reporter in getattr(self, "_cp_reporters", set())
                 title_text = _wrap_label(reporter, 25)
-                if is_cp:
-                    title_text += " [CP]"
-                title_color = "#2ca02c" if is_cp else "black"
+                title_color = "black"
                 if stats:
                     title_pad = 115 if _reactome else 50
                     stats_y = 1.38 if _reactome else 1.15
@@ -1193,8 +1206,7 @@ class ReporterRadarStage(BaseStage):
         for i, reporter in enumerate(reporters):
             values = radar_df.loc[reporter].values
             color = cmap(i / max(len(reporters) - 1, 1))
-            legend_label = f"{reporter} [CP]" if reporter in self._cp_reporters else reporter
-            self._plot_radar_single(ax, values, categories, color, legend_label, alpha=0.08)
+            self._plot_radar_single(ax, values, categories, color, reporter, alpha=0.08)
 
         if is_normalized:
             # Draw 1.0 reference ring (= global baseline)
@@ -1258,15 +1270,6 @@ class ReporterRadarStage(BaseStage):
         plt.xticks(rotation=30, ha="right")
         plt.yticks(rotation=0)
 
-        # Mark Cell Painting reporters on y-axis
-        if self._cp_reporters:
-            for label in ax.get_yticklabels():
-                txt = label.get_text()
-                if txt in self._cp_reporters:
-                    label.set_text(f"{txt} [CP]")
-                    label.set_color("#2ca02c")
-                    label.set_fontweight("bold")
-            ax.set_yticklabels(ax.get_yticklabels())
         plt.tight_layout()
 
         path = save_figure(fig, out_dir / f"heatmap_{metric_type}.png")
