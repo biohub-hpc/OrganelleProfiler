@@ -1591,8 +1591,7 @@ def slurm_worker(
                               metric_name=metric_name)
 
             # Filtered heatmaps (genes where max reporter mAP >= threshold)
-            reporter_cols = [c for c in raw_df.columns if c != "all_combined"]
-            gene_max = raw_df[reporter_cols].max(axis=1)
+            gene_max = raw_df.max(axis=1)
             keep = gene_max[gene_max >= MAP_THRESHOLD].index
             if len(keep) > 5:
                 raw_filt = raw_df.loc[raw_df.index.isin(keep)]
@@ -1809,8 +1808,7 @@ def main():
                               metric_name=metric_name)
 
             # Filtered heatmaps
-            reporter_cols = [c for c in raw_df.columns if c != "all_combined"]
-            gene_max = raw_df[reporter_cols].max(axis=1)
+            gene_max = raw_df.max(axis=1)
             keep = gene_max[gene_max >= MAP_THRESHOLD].index
             if len(keep) > 5:
                 raw_filt = raw_df.loc[raw_df.index.isin(keep)]
