@@ -2511,16 +2511,21 @@ def _run_pass2_parallel(
         use_tile_cache = use_tile_cache or _GPU_AVAILABLE
     elif use_tile_cache:
         # No buffer (classic zarr path) but user asked for tile cache.
-        # Guard against OOM on smaller GPUs — the orchestrator's VRAM
-        # check only fires for the shm path.
+        # Guard against OOM on smaller GPUs AND when another workload
+        # on the same GPU is holding VRAM.
         cp = _cp
         tile_cache_bytes = n_tiles_total * (tile_size - tile_overlap) ** 2 * 4
         required_bytes = tile_cache_bytes + 15 * (1024 ** 3)
         try:
-            _, total_bytes = cp.cuda.Device().mem_info
+            free_bytes, total_bytes = cp.cuda.Device().mem_info
             if total_bytes < required_bytes:
                 print(f"    [Pass 2] tile cache needs ~{required_bytes / 2**30:.1f} GB "
-                      f"VRAM but GPU has {total_bytes / 2**30:.1f} GB; disabling.")
+                      f"VRAM but GPU has {total_bytes / 2**30:.1f} GB total; disabling.")
+                use_tile_cache = False
+            elif free_bytes < required_bytes:
+                print(f"    [Pass 2] tile cache needs ~{required_bytes / 2**30:.1f} GB "
+                      f"free VRAM but only {free_bytes / 2**30:.1f} GB available "
+                      f"(total {total_bytes / 2**30:.1f} GB); disabling to avoid OOM.")
                 use_tile_cache = False
         except Exception as _e:
             print(f"    [Pass 2] VRAM probe failed ({_e}); leaving tile_cache on")
@@ -3125,9 +3130,15 @@ def segment_position_frangi_tiled(
         if effective_use_gpu and os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1":
             try:
                 import cupy as _cp_probe
-                _, total_bytes = _cp_probe.cuda.Device().mem_info
+                free_bytes, total_bytes = _cp_probe.cuda.Device().mem_info
                 _total_vram_gb = total_bytes / (1024 ** 3)
-                if total_bytes < required_bytes:
+                # Check BOTH total and free. `total_bytes < required` → GPU
+                # is fundamentally too small. `free_bytes < required` → total
+                # is fine but something else on this GPU is holding VRAM (e.g.
+                # joblib workers from a prior blob Pass 1, or a concurrent
+                # invocation sharing the GPU). In both cases we can't
+                # safely allocate the shm / tile cache.
+                if total_bytes < required_bytes or free_bytes < required_bytes:
                     _vram_ok = False
             except Exception as _e:
                 print(f"  [inmem] could not query GPU VRAM ({_e}); disabling shm path")
@@ -3413,6 +3424,17 @@ def segment_position_frangi_tiled(
                 )
                 for tile_info in tqdm(tile_infos, desc="  Pass 1: Segmenting tiles")
             )
+
+            # Tear down loky's reusable executor so worker subprocesses are
+            # terminated and their CUDA contexts freed before Pass 2 tries
+            # to allocate its tile cache. Without this, 15 joblib workers can
+            # hold ~20 GB of CUDA context VRAM across the Pass 1→Pass 2
+            # boundary and Pass 2's tile cache OOMs on H100/80GB.
+            try:
+                from joblib.externals.loky import get_reusable_executor
+                get_reusable_executor().shutdown(wait=True)
+            except Exception as _e:
+                print(f"  [warn] loky executor shutdown skipped: {_e}")
 
         if effective_use_gpu and pass1_wall_measured is not None:
             pass1_wall = pass1_wall_measured
