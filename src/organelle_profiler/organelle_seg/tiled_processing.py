@@ -17,6 +17,7 @@ Key functions:
 - segment_position_frangi: Entry point (wraps tiled pipeline)
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -40,6 +41,41 @@ from organelle_profiler.organelle_seg.postprocessing import (
     postprocess_tubular_mask,
     watershed_label,
 )
+
+# Optional GPU imports — loaded lazily so CPU-only hosts aren't affected.
+try:
+    import cupy as _cp
+    import cupyx.scipy.ndimage as _cp_ndi
+    from cucim.skimage.exposure import equalize_adapthist as _cu_equalize_adapthist
+    from cucim.skimage.filters import frangi as _cu_frangi
+    _GPU_AVAILABLE = True
+except Exception as _gpu_import_err:  # pragma: no cover
+    _cp = None
+    _cp_ndi = None
+    _cu_equalize_adapthist = None
+    _cu_frangi = None
+    _GPU_AVAILABLE = False
+
+# Simple accumulator used by the GPU worker to report per-phase wall time
+# across all tiles. Cleared and printed around Pass 1 by the orchestrator.
+_GPU_PHASE_TIMERS: dict[str, float] = {}
+
+
+def _reset_gpu_phase_timers() -> None:
+    _GPU_PHASE_TIMERS.clear()
+
+
+def _bump_gpu_phase_timer(name: str, seconds: float) -> None:
+    _GPU_PHASE_TIMERS[name] = _GPU_PHASE_TIMERS.get(name, 0.0) + seconds
+
+
+def _print_gpu_phase_timers(total_wall_sec: float) -> None:
+    if not _GPU_PHASE_TIMERS:
+        return
+    print("  [GPU timing] per-phase total across Pass 1 tiles:")
+    for name, t in sorted(_GPU_PHASE_TIMERS.items(), key=lambda kv: -kv[1]):
+        pct = 100.0 * t / total_wall_sec if total_wall_sec > 0 else 0.0
+        print(f"    {name:20s} {t:8.2f}s  ({pct:5.1f}% of Pass 1 wall)")
 
 from .configs import (
     um_to_sigmas,
@@ -461,6 +497,1114 @@ def _process_single_frangi_tile(
         }
 
 
+def _process_single_frangi_tile_gpu(
+    tile_info: dict,
+    source_zarr_path: str,
+    pos_path: str,
+    channel_index: int,
+    frangi_params: dict,
+    pixel_resolution: dict,
+    use_clahe: bool,
+    clahe_params: dict,
+    post_clahe_smoothing_sigma: float,
+    frangi_postprocess: bool,
+    input_mask_name: str = None,
+    nucleoli_method: str = None,
+    vesicular_method: str = None,
+    output_label_name: str = None,
+    save_vesselness: bool = False,
+    tile_overlap: int = 256,
+    n_tiles_y: int = 1,
+    n_tiles_x: int = 1,
+    output_zarr_path: str = None,
+) -> dict:
+    """GPU version of _process_single_frangi_tile for the frangi tubular path.
+
+    Reads the tile on CPU, runs CLAHE + Gaussian + Frangi + threshold + morphology +
+    connected-components on GPU via cupy/cucim, transfers labels back to CPU, and
+    writes to zarr. Per-phase wall times are accumulated in ``_GPU_PHASE_TIMERS``
+    so the orchestrator can print a breakdown at the end of Pass 1.
+
+    LoG blob paths (nucleoli/vesicular blob) fall back to the CPU implementation
+    since they require ``skimage.feature.blob_log`` which has no cucim equivalent.
+    """
+    if not _GPU_AVAILABLE:
+        raise RuntimeError("GPU path requested but cupy/cucim not importable")
+
+    cp = _cp
+    cp_ndi = _cp_ndi
+
+    # LoG blob paths: fall back to CPU (cucim does not provide blob_log).
+    if (nucleoli_method == "blob") or (vesicular_method == "blob"):
+        return _process_single_frangi_tile(
+            tile_info=tile_info, source_zarr_path=source_zarr_path, pos_path=pos_path,
+            channel_index=channel_index, frangi_params=frangi_params,
+            pixel_resolution=pixel_resolution, use_clahe=use_clahe,
+            clahe_params=clahe_params, post_clahe_smoothing_sigma=post_clahe_smoothing_sigma,
+            frangi_postprocess=frangi_postprocess, input_mask_name=input_mask_name,
+            nucleoli_method=nucleoli_method, vesicular_method=vesicular_method,
+            output_label_name=output_label_name, save_vesselness=save_vesselness,
+            tile_overlap=tile_overlap, n_tiles_y=n_tiles_y, n_tiles_x=n_tiles_x,
+            output_zarr_path=output_zarr_path,
+        )
+
+    def _phase_time(name: str):
+        """Context manager that syncs the GPU and adds to the shared phase timer."""
+        class _T:
+            def __enter__(self_):
+                self_.t0 = time.monotonic()
+                return self_
+            def __exit__(self_, *a):
+                cp.cuda.Stream.null.synchronize()
+                _bump_gpu_phase_timer(name, time.monotonic() - self_.t0)
+        return _T()
+
+    try:
+        tile_idx = tile_info["tile_idx"]
+        ty, tx = tile_info["ty"], tile_info["tx"]
+        src_y_start = tile_info["src_y_start"]
+        src_y_end = tile_info["src_y_end"]
+        src_x_start = tile_info["src_x_start"]
+        src_x_end = tile_info["src_x_end"]
+
+        # 1) Zarr read (CPU) + optional mask read
+        with _phase_time("zarr_read"):
+            input_mask_tile = None
+            with open_ome_zarr(source_zarr_path, mode="r") as ds:
+                source_pos = ds[pos_path]
+                image_array = source_pos["0"]
+                tile_data_np = np.squeeze(
+                    np.asarray(image_array[0, channel_index, :, src_y_start:src_y_end, src_x_start:src_x_end])
+                )
+                if input_mask_name:
+                    labels_group = source_pos.zgroup.get("labels", None)
+                    if labels_group is not None and input_mask_name in labels_group:
+                        mask_array = labels_group[input_mask_name]["0"]
+                        input_mask_tile = np.squeeze(
+                            np.asarray(mask_array[0, 0, :, src_y_start:src_y_end, src_x_start:src_x_end])
+                        )
+
+        # 2) Transfer to GPU
+        with _phase_time("h2d_transfer"):
+            tile_data = cp.asarray(tile_data_np, dtype=cp.float32)
+            if input_mask_tile is not None:
+                if input_mask_tile.shape != tile_data.shape:
+                    mh, mw = input_mask_tile.shape
+                    th, tw = tile_data.shape
+                    new_mask = np.zeros(tile_data.shape, dtype=input_mask_tile.dtype)
+                    new_mask[: min(mh, th), : min(mw, tw)] = input_mask_tile[: min(mh, th), : min(mw, tw)]
+                    input_mask_tile = new_mask
+                mask_gpu = cp.asarray(input_mask_tile) > 0
+                tile_data = cp.where(mask_gpu, tile_data, cp.float32(0.0))
+
+        # 3) CLAHE
+        if use_clahe:
+            with _phase_time("clahe"):
+                if clahe_params is None:
+                    clahe_params = {"clip_limit": 0.03}
+                clip_limit = clahe_params.get("clip_limit", 0.03)
+                kernel_size = clahe_params.get("kernel_size", None)
+                tmin = cp.min(tile_data)
+                tmax = cp.max(tile_data)
+                rng = tmax - tmin
+                if float(rng) > 0:
+                    tile_norm = (tile_data - tmin) / rng
+                else:
+                    tile_norm = cp.zeros_like(tile_data, dtype=cp.float32)
+                tile_data = _cu_equalize_adapthist(
+                    tile_norm, kernel_size=kernel_size, clip_limit=clip_limit,
+                ).astype(cp.float32)
+
+        # 4) Post-CLAHE smoothing
+        if post_clahe_smoothing_sigma and post_clahe_smoothing_sigma > 0:
+            with _phase_time("post_clahe_smooth"):
+                tile_data = cp_ndi.gaussian_filter(tile_data, sigma=post_clahe_smoothing_sigma)
+
+        # 5) Frangi
+        with _phase_time("frangi"):
+            min_r = frangi_params.get("min_radius_um", 0.2)
+            max_r = frangi_params.get("max_radius_um", 1.5)
+            num_sigmas = frangi_params.get("num_sigma", 5)
+            black_ridges = frangi_params.get("black_ridges", False)
+            pixel_size_um = pixel_resolution.get("X", 0.1625)
+            sigmas = um_to_sigmas(min_r, max_r, pixel_size_um, num_sigmas=num_sigmas)
+            vesselness_map = _cu_frangi(
+                tile_data, sigmas=sigmas, black_ridges=black_ridges,
+            ).astype(cp.float32)
+
+        # 6) Threshold
+        with _phase_time("threshold"):
+            if cp.any(vesselness_map > 0):
+                fixed_threshold = frangi_params.get("threshold", 0.01)
+                if fixed_threshold is not None:
+                    threshold = float(fixed_threshold)
+                else:
+                    threshold_mult = frangi_params.get("threshold_mult", 0.01)
+                    threshold = compute_frangi_threshold(vesselness_map, threshold_mult=threshold_mult, xp=cp)
+                binary_mask = vesselness_map > threshold
+            else:
+                binary_mask = cp.zeros_like(vesselness_map, dtype=cp.bool_)
+
+        # 7) Postprocess (tubular-focused; other structure types pass through)
+        do_postprocess = frangi_postprocess or frangi_params.get("postprocess", False)
+        structure_type = frangi_params.get("structure_type", None)
+        is_tubular = structure_type == "tubular"
+        if do_postprocess and is_tubular and bool(cp.any(binary_mask)):
+            with _phase_time("postprocess"):
+                pp_min_size = frangi_params.get("min_object_size", 5)
+                pp_do_opening = frangi_params.get("postprocess_opening", True)
+                pp_opening_size = frangi_params.get("postprocess_opening_size", 2)
+                pp_fill_holes = frangi_params.get("postprocess_fill_holes", False)
+                if pp_fill_holes:
+                    binary_mask = cp_ndi.binary_fill_holes(binary_mask)
+                if pp_do_opening and pp_opening_size > 0:
+                    k = cp.ones((pp_opening_size,) * binary_mask.ndim, dtype=cp.bool_)
+                    binary_mask = cp_ndi.binary_opening(binary_mask, structure=k)
+                footprint = cp_ndi.generate_binary_structure(binary_mask.ndim, 1)
+                lab_tmp, _ = cp_ndi.label(binary_mask, structure=footprint)
+                if int(lab_tmp.max()) > 0 and pp_min_size > 0:
+                    areas = cp.bincount(lab_tmp.ravel())
+                    # labels indexed from 1; background=0
+                    small = cp.where(areas[1:] < pp_min_size)[0] + 1
+                    if int(small.size) > 0:
+                        drop = cp.isin(lab_tmp, small)
+                        binary_mask = cp.where(drop, cp.bool_(False), lab_tmp > 0)
+
+        # 8) Label
+        with _phase_time("label"):
+            if bool(cp.any(binary_mask)):
+                footprint = cp_ndi.generate_binary_structure(binary_mask.ndim, 1)
+                labeled_mask, num_labels = cp_ndi.label(binary_mask, structure=footprint)
+                min_object_size = frangi_params.get("min_object_size", 0)
+                if min_object_size > 0 and int(labeled_mask.max()) > 0:
+                    areas = cp.bincount(labeled_mask.ravel())
+                    small = cp.where(areas[1:] < min_object_size)[0] + 1
+                    if int(small.size) > 0:
+                        drop = cp.isin(labeled_mask, small)
+                        labeled_mask = cp.where(drop, cp.int32(0), labeled_mask.astype(cp.int32))
+                        labeled_mask, _ = cp_ndi.label(labeled_mask > 0, structure=footprint)
+                labeled_mask = labeled_mask.astype(cp.int32)
+            else:
+                labeled_mask = cp.zeros_like(vesselness_map, dtype=cp.int32)
+
+        # 9) Extract core region and transfer back to CPU
+        y_start = tile_info["y_start_tile"]; x_start = tile_info["x_start_tile"]
+        y_end = tile_info["y_end_tile"]; x_end = tile_info["x_end_tile"]
+        actual_height = y_end - y_start; actual_width = x_end - x_start
+        tile_size_full = tile_info["tile_size"]
+        step = tile_size_full - tile_overlap
+        core_y_start_global = ty * step
+        core_y_end_global = min((ty + 1) * step, actual_height + y_start)
+        core_x_start_global = tx * step
+        core_x_end_global = min((tx + 1) * step, actual_width + x_start)
+        core_y_start_local = max(0, core_y_start_global - y_start)
+        core_y_end_local = min(actual_height, core_y_end_global - y_start)
+        core_x_start_local = max(0, core_x_start_global - x_start)
+        core_x_end_local = min(actual_width, core_x_end_global - x_start)
+
+        with _phase_time("d2h_transfer"):
+            core_labels = cp.asnumpy(
+                labeled_mask[core_y_start_local:core_y_end_local, core_x_start_local:core_x_end_local]
+            )
+            core_vesselness = None
+            if save_vesselness:
+                core_vesselness = cp.asnumpy(
+                    vesselness_map[core_y_start_local:core_y_end_local, core_x_start_local:core_x_end_local]
+                )
+
+        # 10) Zarr write (CPU)
+        with _phase_time("zarr_write"):
+            write_path = output_zarr_path if output_zarr_path else source_zarr_path
+            if output_zarr_path:
+                import zarr
+                store = zarr.open(write_path, mode="r+")
+                if output_label_name:
+                    temp_name = f"{output_label_name}_unstitched"
+                    labels_arr = store[pos_path]["labels"][temp_name]["0"]
+                    labels_arr[0, 0, 0,
+                               core_y_start_global:core_y_end_global,
+                               core_x_start_global:core_x_end_global] = core_labels
+                if save_vesselness and output_label_name and core_vesselness is not None:
+                    vesselness_label_name = output_label_name.replace("_seg", "_vesselness")
+                    temp_vesselness_name = f"{vesselness_label_name}_unstitched"
+                    vesselness_arr = store[pos_path]["labels"][temp_vesselness_name]["0"]
+                    vesselness_arr[0, 0, 0,
+                                   core_y_start_global:core_y_end_global,
+                                   core_x_start_global:core_x_end_global] = core_vesselness
+            else:
+                with open_ome_zarr(write_path, mode="r+") as ds:
+                    if output_label_name:
+                        temp_name = f"{output_label_name}_unstitched"
+                        labels_arr = ds[pos_path].zgroup["labels"][temp_name]["0"]
+                        labels_arr[0, 0, 0,
+                                   core_y_start_global:core_y_end_global,
+                                   core_x_start_global:core_x_end_global] = core_labels
+                    if save_vesselness and output_label_name and core_vesselness is not None:
+                        vesselness_label_name = output_label_name.replace("_seg", "_vesselness")
+                        temp_vesselness_name = f"{vesselness_label_name}_unstitched"
+                        vesselness_arr = ds[pos_path].zgroup["labels"][temp_vesselness_name]["0"]
+                        vesselness_arr[0, 0, 0,
+                                       core_y_start_global:core_y_end_global,
+                                       core_x_start_global:core_x_end_global] = core_vesselness
+
+        is_center = tile_info.get("is_center", False)
+        result = {
+            "tile_info": tile_info,
+            "success": True,
+            "vesselness": cp.asnumpy(vesselness_map).astype(np.float32) if is_center else None,
+            "labels": cp.asnumpy(labeled_mask).astype(np.int32) if is_center else None,
+        }
+
+        # Free GPU memory between tiles to keep the pool from growing unbounded.
+        del tile_data, vesselness_map, binary_mask, labeled_mask
+        cp.get_default_memory_pool().free_all_blocks()
+        return result
+
+    except Exception as e:
+        print(f"Error processing GPU Frangi tile {tile_info.get('tile_idx', '?')}: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "tile_info": tile_info,
+            "success": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Pipelined GPU path — split read / compute / write so that reads and writes
+# can overlap with GPU compute across tiles.
+# ---------------------------------------------------------------------------
+
+def _read_tile_for_gpu(
+    source_zarr_path: str,
+    pos_path: str,
+    channel_index: int,
+    tile_info: dict,
+    input_mask_name: str | None,
+    source_image_array=None,
+    input_mask_array=None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Read one tile (and optional input mask) from zarr. Pure CPU work; runs in
+    a reader thread. Returns (tile_data_np, input_mask_np_or_None).
+
+    If ``source_image_array`` is supplied, it's used directly (avoids the
+    Python-heavy ``open_ome_zarr`` path per read, which holds the GIL and
+    serializes threads). Zarr arrays are thread-safe for reads.
+    """
+    src_y_start = tile_info["src_y_start"]
+    src_y_end = tile_info["src_y_end"]
+    src_x_start = tile_info["src_x_start"]
+    src_x_end = tile_info["src_x_end"]
+
+    if source_image_array is not None:
+        tile_data_np = np.squeeze(np.asarray(
+            source_image_array[0, channel_index, :, src_y_start:src_y_end, src_x_start:src_x_end]
+        ))
+        input_mask_tile = None
+        if input_mask_name and input_mask_array is not None:
+            input_mask_tile = np.squeeze(np.asarray(
+                input_mask_array[0, 0, :, src_y_start:src_y_end, src_x_start:src_x_end]
+            ))
+        return tile_data_np, input_mask_tile
+
+    # Backward-compatible fallback path — opens zarr per call.
+    with open_ome_zarr(source_zarr_path, mode="r") as ds:
+        source_pos = ds[pos_path]
+        image_array = source_pos["0"]
+        tile_data_np = np.squeeze(np.asarray(
+            image_array[0, channel_index, :, src_y_start:src_y_end, src_x_start:src_x_end]
+        ))
+        input_mask_tile = None
+        if input_mask_name:
+            labels_group = source_pos.zgroup.get("labels", None)
+            if labels_group is not None and input_mask_name in labels_group:
+                mask_array = labels_group[input_mask_name]["0"]
+                input_mask_tile = np.squeeze(np.asarray(
+                    mask_array[0, 0, :, src_y_start:src_y_end, src_x_start:src_x_end]
+                ))
+    return tile_data_np, input_mask_tile
+
+
+def _compute_tile_on_gpu(
+    tile_data_np: np.ndarray,
+    input_mask_np: np.ndarray | None,
+    tile_info: dict,
+    frangi_params: dict,
+    pixel_resolution: dict,
+    use_clahe: bool,
+    clahe_params: dict | None,
+    post_clahe_smoothing_sigma: float,
+    frangi_postprocess: bool,
+    save_vesselness: bool,
+    tile_overlap: int,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """GPU compute for a pre-read tile. Accumulates per-phase timing in the
+    module-level ``_GPU_PHASE_TIMERS``. Returns
+    (core_labels_np, core_vesselness_np_or_None, debug_labels_np_or_None,
+    debug_vesselness_np_or_None) — last two are populated only for the center tile.
+    """
+    if not _GPU_AVAILABLE:
+        raise RuntimeError("GPU compute called but cupy/cucim not importable")
+    cp = _cp
+    cp_ndi = _cp_ndi
+
+    def _phase_time(name: str):
+        class _T:
+            def __enter__(self_):
+                self_.t0 = time.monotonic()
+                return self_
+            def __exit__(self_, *a):
+                cp.cuda.Stream.null.synchronize()
+                _bump_gpu_phase_timer(name, time.monotonic() - self_.t0)
+        return _T()
+
+    ty, tx = tile_info["ty"], tile_info["tx"]
+
+    # 1) H2D transfer (+ optional mask application)
+    with _phase_time("h2d_transfer"):
+        tile_data = cp.asarray(tile_data_np, dtype=cp.float32)
+        if input_mask_np is not None:
+            if input_mask_np.shape != tile_data.shape:
+                mh, mw = input_mask_np.shape
+                th, tw = tile_data.shape
+                new_mask = np.zeros(tile_data.shape, dtype=input_mask_np.dtype)
+                new_mask[: min(mh, th), : min(mw, tw)] = input_mask_np[: min(mh, th), : min(mw, tw)]
+                input_mask_np = new_mask
+            mask_gpu = cp.asarray(input_mask_np) > 0
+            tile_data = cp.where(mask_gpu, tile_data, cp.float32(0.0))
+
+    # 2) CLAHE
+    if use_clahe:
+        with _phase_time("clahe"):
+            if clahe_params is None:
+                clahe_params = {"clip_limit": 0.03}
+            clip_limit = clahe_params.get("clip_limit", 0.03)
+            kernel_size = clahe_params.get("kernel_size", None)
+            tmin = cp.min(tile_data); tmax = cp.max(tile_data); rng = tmax - tmin
+            if float(rng) > 0:
+                tile_norm = (tile_data - tmin) / rng
+            else:
+                tile_norm = cp.zeros_like(tile_data, dtype=cp.float32)
+            tile_data = _cu_equalize_adapthist(
+                tile_norm, kernel_size=kernel_size, clip_limit=clip_limit,
+            ).astype(cp.float32)
+
+    # 3) Post-CLAHE smoothing
+    if post_clahe_smoothing_sigma and post_clahe_smoothing_sigma > 0:
+        with _phase_time("post_clahe_smooth"):
+            tile_data = cp_ndi.gaussian_filter(tile_data, sigma=post_clahe_smoothing_sigma)
+
+    # 4) Frangi
+    with _phase_time("frangi"):
+        min_r = frangi_params.get("min_radius_um", 0.2)
+        max_r = frangi_params.get("max_radius_um", 1.5)
+        num_sigmas = frangi_params.get("num_sigma", 5)
+        black_ridges = frangi_params.get("black_ridges", False)
+        pixel_size_um = pixel_resolution.get("X", 0.1625)
+        sigmas = um_to_sigmas(min_r, max_r, pixel_size_um, num_sigmas=num_sigmas)
+        vesselness_map = _cu_frangi(
+            tile_data, sigmas=sigmas, black_ridges=black_ridges,
+        ).astype(cp.float32)
+
+    # 5) Threshold
+    with _phase_time("threshold"):
+        if cp.any(vesselness_map > 0):
+            fixed_threshold = frangi_params.get("threshold", 0.01)
+            if fixed_threshold is not None:
+                threshold = float(fixed_threshold)
+            else:
+                threshold_mult = frangi_params.get("threshold_mult", 0.01)
+                threshold = compute_frangi_threshold(vesselness_map, threshold_mult=threshold_mult, xp=cp)
+            binary_mask = vesselness_map > threshold
+        else:
+            binary_mask = cp.zeros_like(vesselness_map, dtype=cp.bool_)
+
+    # 6) Postprocess (tubular-focused)
+    do_postprocess = frangi_postprocess or frangi_params.get("postprocess", False)
+    structure_type = frangi_params.get("structure_type", None)
+    is_tubular = structure_type == "tubular"
+    if do_postprocess and is_tubular and bool(cp.any(binary_mask)):
+        with _phase_time("postprocess"):
+            pp_min_size = frangi_params.get("min_object_size", 5)
+            pp_do_opening = frangi_params.get("postprocess_opening", True)
+            pp_opening_size = frangi_params.get("postprocess_opening_size", 2)
+            pp_fill_holes = frangi_params.get("postprocess_fill_holes", False)
+            if pp_fill_holes:
+                binary_mask = cp_ndi.binary_fill_holes(binary_mask)
+            if pp_do_opening and pp_opening_size > 0:
+                k = cp.ones((pp_opening_size,) * binary_mask.ndim, dtype=cp.bool_)
+                binary_mask = cp_ndi.binary_opening(binary_mask, structure=k)
+            footprint = cp_ndi.generate_binary_structure(binary_mask.ndim, 1)
+            lab_tmp, _ = cp_ndi.label(binary_mask, structure=footprint)
+            if int(lab_tmp.max()) > 0 and pp_min_size > 0:
+                areas = cp.bincount(lab_tmp.ravel())
+                small = cp.where(areas[1:] < pp_min_size)[0] + 1
+                if int(small.size) > 0:
+                    drop = cp.isin(lab_tmp, small)
+                    binary_mask = cp.where(drop, cp.bool_(False), lab_tmp > 0)
+
+    # 7) Label
+    with _phase_time("label"):
+        if bool(cp.any(binary_mask)):
+            footprint = cp_ndi.generate_binary_structure(binary_mask.ndim, 1)
+            labeled_mask, _ = cp_ndi.label(binary_mask, structure=footprint)
+            min_object_size = frangi_params.get("min_object_size", 0)
+            if min_object_size > 0 and int(labeled_mask.max()) > 0:
+                areas = cp.bincount(labeled_mask.ravel())
+                small = cp.where(areas[1:] < min_object_size)[0] + 1
+                if int(small.size) > 0:
+                    drop = cp.isin(labeled_mask, small)
+                    labeled_mask = cp.where(drop, cp.int32(0), labeled_mask.astype(cp.int32))
+                    labeled_mask, _ = cp_ndi.label(labeled_mask > 0, structure=footprint)
+            labeled_mask = labeled_mask.astype(cp.int32)
+        else:
+            labeled_mask = cp.zeros_like(vesselness_map, dtype=cp.int32)
+
+    # 8) Extract core region coordinates + D2H transfer
+    y_start = tile_info["y_start_tile"]; x_start = tile_info["x_start_tile"]
+    y_end = tile_info["y_end_tile"]; x_end = tile_info["x_end_tile"]
+    actual_height = y_end - y_start; actual_width = x_end - x_start
+    tile_size_full = tile_info["tile_size"]
+    step = tile_size_full - tile_overlap
+    core_y_start_global = ty * step
+    core_y_end_global = min((ty + 1) * step, actual_height + y_start)
+    core_x_start_global = tx * step
+    core_x_end_global = min((tx + 1) * step, actual_width + x_start)
+    core_y_start_local = max(0, core_y_start_global - y_start)
+    core_y_end_local = min(actual_height, core_y_end_global - y_start)
+    core_x_start_local = max(0, core_x_start_global - x_start)
+    core_x_end_local = min(actual_width, core_x_end_global - x_start)
+
+    is_center = tile_info.get("is_center", False)
+    with _phase_time("d2h_transfer"):
+        core_labels = cp.asnumpy(
+            labeled_mask[core_y_start_local:core_y_end_local, core_x_start_local:core_x_end_local]
+        )
+        core_vesselness = None
+        if save_vesselness:
+            core_vesselness = cp.asnumpy(
+                vesselness_map[core_y_start_local:core_y_end_local, core_x_start_local:core_x_end_local]
+            )
+        debug_labels = cp.asnumpy(labeled_mask).astype(np.int32) if is_center else None
+        debug_vesselness = cp.asnumpy(vesselness_map).astype(np.float32) if is_center else None
+
+    # Free GPU pool between tiles to bound memory high-water mark
+    del tile_data, vesselness_map, binary_mask, labeled_mask
+    cp.get_default_memory_pool().free_all_blocks()
+
+    # Tuck core coords onto the returned bundle so the write helper doesn't
+    # have to recompute them.
+    tile_info["_core_y_start_global"] = core_y_start_global
+    tile_info["_core_y_end_global"] = core_y_end_global
+    tile_info["_core_x_start_global"] = core_x_start_global
+    tile_info["_core_x_end_global"] = core_x_end_global
+
+    return core_labels, core_vesselness, debug_labels, debug_vesselness
+
+
+def _compute_tile_batch_on_gpu_streams(
+    bundles: list,
+    frangi_params: dict,
+    pixel_resolution: dict,
+    use_clahe: bool,
+    clahe_params: dict | None,
+    post_clahe_smoothing_sigma: float,
+    frangi_postprocess: bool,
+    save_vesselness: bool,
+    tile_overlap: int,
+) -> list:
+    """Process N tiles concurrently using N CUDA streams.
+
+    Each stream handles one tile's full compute pipeline (H2D → CLAHE → Frangi →
+    threshold → postprocess → label → core-slice). Per-phase host-side syncs
+    from the single-tile path are removed — we run all ops unconditionally so
+    the work enqueued on each stream never blocks the main thread.
+
+    After all streams are enqueued, one ``stream.synchronize()`` per stream
+    waits for completion; then we D2H to numpy.
+
+    ``bundles`` is a list of ``(tile_info, tile_data_np, input_mask_np_or_None)``.
+    Returns a list of ``(tile_info, core_labels_np, core_vesselness_np_or_None,
+    debug_labels_np_or_None, debug_vesselness_np_or_None)`` in the same order.
+    """
+    if not _GPU_AVAILABLE:
+        raise RuntimeError("batched GPU compute requested but cupy/cucim not importable")
+    cp = _cp
+    cp_ndi = _cp_ndi
+
+    N = len(bundles)
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(N)]
+
+    # Host-side Frangi/CLAHE params (scalar; no GPU work)
+    min_r = frangi_params.get("min_radius_um", 0.2)
+    max_r = frangi_params.get("max_radius_um", 1.5)
+    num_sigmas = frangi_params.get("num_sigma", 5)
+    black_ridges = frangi_params.get("black_ridges", False)
+    pixel_size_um = pixel_resolution.get("X", 0.1625)
+    sigmas = um_to_sigmas(min_r, max_r, pixel_size_um, num_sigmas=num_sigmas)
+
+    fixed_threshold = frangi_params.get("threshold", 0.01)
+    if fixed_threshold is None:
+        fixed_threshold = 0.01  # dynamic threshold would need host sync
+    fixed_threshold = float(fixed_threshold)
+
+    do_postprocess = frangi_postprocess or frangi_params.get("postprocess", False)
+    structure_type = frangi_params.get("structure_type", None)
+    is_tubular = structure_type == "tubular"
+
+    pp_min_size = frangi_params.get("min_object_size", 5)
+    pp_do_opening = frangi_params.get("postprocess_opening", True)
+    pp_opening_size = frangi_params.get("postprocess_opening_size", 2)
+    pp_fill_holes = frangi_params.get("postprocess_fill_holes", False)
+    min_object_size = frangi_params.get("min_object_size", 0)
+
+    clp_clip = (clahe_params or {"clip_limit": 0.03}).get("clip_limit", 0.03)
+    clp_kernel = (clahe_params or {}).get("kernel_size", None)
+
+    gpu_outputs = [None] * N
+
+    # Launch compute on each stream
+    for i, (ti, td_np, mk_np) in enumerate(bundles):
+        with streams[i]:
+            # H2D
+            tile_data = cp.asarray(td_np, dtype=cp.float32)
+            if mk_np is not None:
+                if mk_np.shape != tile_data.shape:
+                    mh, mw = mk_np.shape
+                    th, tw = tile_data.shape
+                    new_mask = np.zeros(tile_data.shape, dtype=mk_np.dtype)
+                    new_mask[: min(mh, th), : min(mw, tw)] = mk_np[: min(mh, th), : min(mw, tw)]
+                    mk_np = new_mask
+                mask_gpu = cp.asarray(mk_np) > 0
+                tile_data = cp.where(mask_gpu, tile_data, cp.float32(0.0))
+
+            # CLAHE — normalize to [0,1] then equalize. Use cp.where for rng
+            # guard so we never sync with host.
+            if use_clahe:
+                tmin = cp.min(tile_data)
+                tmax = cp.max(tile_data)
+                rng = tmax - tmin
+                safe_rng = cp.where(rng > 0, rng, cp.float32(1.0))
+                tile_norm = cp.where(rng > 0, (tile_data - tmin) / safe_rng, cp.float32(0.0))
+                tile_data = _cu_equalize_adapthist(
+                    tile_norm, kernel_size=clp_kernel, clip_limit=clp_clip,
+                ).astype(cp.float32)
+
+            # Post-CLAHE smoothing
+            if post_clahe_smoothing_sigma and post_clahe_smoothing_sigma > 0:
+                tile_data = cp_ndi.gaussian_filter(tile_data, sigma=post_clahe_smoothing_sigma)
+
+            # Frangi
+            vesselness_map = _cu_frangi(
+                tile_data, sigmas=sigmas, black_ridges=black_ridges,
+            ).astype(cp.float32)
+
+            # Threshold (fixed; dynamic would require host sync)
+            binary_mask = vesselness_map > fixed_threshold
+
+            # Postprocess (tubular-focused; safe to no-op on empty masks)
+            if do_postprocess and is_tubular:
+                if pp_fill_holes:
+                    binary_mask = cp_ndi.binary_fill_holes(binary_mask)
+                if pp_do_opening and pp_opening_size > 0:
+                    k = cp.ones((pp_opening_size,) * binary_mask.ndim, dtype=cp.bool_)
+                    binary_mask = cp_ndi.binary_opening(binary_mask, structure=k)
+                footprint_pp = cp_ndi.generate_binary_structure(binary_mask.ndim, 1)
+                lab_tmp, _ = cp_ndi.label(binary_mask, structure=footprint_pp)
+                if pp_min_size > 0:
+                    areas = cp.bincount(lab_tmp.ravel())
+                    # Pad areas to at least length 1 to avoid index issues on empty
+                    if areas.size < 2:
+                        binary_mask = lab_tmp > 0
+                    else:
+                        small_ids = cp.where(areas[1:] < pp_min_size)[0] + 1
+                        drop = cp.isin(lab_tmp, small_ids)
+                        binary_mask = cp.where(drop, cp.bool_(False), lab_tmp > 0)
+
+            # Final label pass
+            footprint = cp_ndi.generate_binary_structure(binary_mask.ndim, 1)
+            labeled_mask, _ = cp_ndi.label(binary_mask, structure=footprint)
+            if min_object_size > 0:
+                areas = cp.bincount(labeled_mask.ravel())
+                if areas.size >= 2:
+                    small = cp.where(areas[1:] < min_object_size)[0] + 1
+                    drop = cp.isin(labeled_mask, small)
+                    labeled_mask = cp.where(drop, cp.int32(0), labeled_mask.astype(cp.int32))
+                    labeled_mask, _ = cp_ndi.label(labeled_mask > 0, structure=footprint)
+            labeled_mask = labeled_mask.astype(cp.int32)
+
+            # Compute core region coords (host-side, no sync)
+            ty, tx = ti["ty"], ti["tx"]
+            y_start = ti["y_start_tile"]; x_start = ti["x_start_tile"]
+            y_end = ti["y_end_tile"]; x_end = ti["x_end_tile"]
+            actual_height = y_end - y_start; actual_width = x_end - x_start
+            tile_size_full = ti["tile_size"]
+            step = tile_size_full - tile_overlap
+            cy0g = ty * step
+            cy1g = min((ty + 1) * step, actual_height + y_start)
+            cx0g = tx * step
+            cx1g = min((tx + 1) * step, actual_width + x_start)
+            cy0l = max(0, cy0g - y_start); cy1l = min(actual_height, cy1g - y_start)
+            cx0l = max(0, cx0g - x_start); cx1l = min(actual_width, cx1g - x_start)
+
+            is_center = ti.get("is_center", False)
+            gpu_outputs[i] = {
+                "ti": ti,
+                "core_labels_gpu": labeled_mask[cy0l:cy1l, cx0l:cx1l],
+                "core_vesselness_gpu": (
+                    vesselness_map[cy0l:cy1l, cx0l:cx1l] if save_vesselness else None
+                ),
+                "debug_labels_gpu": labeled_mask if is_center else None,
+                "debug_vesselness_gpu": vesselness_map if is_center else None,
+                "core_coords": (cy0g, cy1g, cx0g, cx1g),
+            }
+
+    # Wait for every stream — this is the only global barrier per batch
+    for s in streams:
+        s.synchronize()
+
+    # D2H on main thread (streams are done)
+    cpu_results = []
+    for out in gpu_outputs:
+        ti = out["ti"]
+        ti["_core_y_start_global"] = out["core_coords"][0]
+        ti["_core_y_end_global"] = out["core_coords"][1]
+        ti["_core_x_start_global"] = out["core_coords"][2]
+        ti["_core_x_end_global"] = out["core_coords"][3]
+        core_labels = cp.asnumpy(out["core_labels_gpu"])
+        core_vesselness = (
+            cp.asnumpy(out["core_vesselness_gpu"]) if out["core_vesselness_gpu"] is not None else None
+        )
+        debug_labels = (
+            cp.asnumpy(out["debug_labels_gpu"]).astype(np.int32)
+            if out["debug_labels_gpu"] is not None else None
+        )
+        debug_vesselness = (
+            cp.asnumpy(out["debug_vesselness_gpu"]).astype(np.float32)
+            if out["debug_vesselness_gpu"] is not None else None
+        )
+        cpu_results.append((ti, core_labels, core_vesselness, debug_labels, debug_vesselness))
+
+    # Free GPU memory held by batch
+    for out in gpu_outputs:
+        out.clear()
+    gpu_outputs.clear()
+    cp.get_default_memory_pool().free_all_blocks()
+    return cpu_results
+
+
+def _write_tile_outputs(
+    output_zarr_path: str,
+    pos_path: str,
+    tile_info: dict,
+    core_labels: np.ndarray,
+    core_vesselness: np.ndarray | None,
+    output_label_name: str,
+    save_vesselness: bool,
+    use_preview_mode: bool,
+    labels_arr=None,
+    vesselness_arr=None,
+) -> None:
+    """Write one tile's core region to zarr. Pure CPU work; runs in writer thread.
+
+    If ``labels_arr`` is supplied, writes go directly to the pre-opened zarr
+    array (avoids per-write ``open_ome_zarr`` that holds the GIL through
+    metadata parsing and serializes writer threads). Writes land in disjoint
+    shards so no chunk-level locking is needed.
+    """
+    cy0 = tile_info["_core_y_start_global"]
+    cy1 = tile_info["_core_y_end_global"]
+    cx0 = tile_info["_core_x_start_global"]
+    cx1 = tile_info["_core_x_end_global"]
+
+    if labels_arr is not None:
+        labels_arr[0, 0, 0, cy0:cy1, cx0:cx1] = core_labels
+        if save_vesselness and core_vesselness is not None and vesselness_arr is not None:
+            vesselness_arr[0, 0, 0, cy0:cy1, cx0:cx1] = core_vesselness
+        return
+
+    # Backward-compatible fallback — opens zarr per call.
+    if use_preview_mode:
+        import zarr
+        store = zarr.open(output_zarr_path, mode="r+")
+        if output_label_name:
+            temp_name = f"{output_label_name}_unstitched"
+            labels_arr = store[pos_path]["labels"][temp_name]["0"]
+            labels_arr[0, 0, 0, cy0:cy1, cx0:cx1] = core_labels
+        if save_vesselness and output_label_name and core_vesselness is not None:
+            vesselness_label_name = output_label_name.replace("_seg", "_vesselness")
+            temp_vesselness_name = f"{vesselness_label_name}_unstitched"
+            vesselness_arr = store[pos_path]["labels"][temp_vesselness_name]["0"]
+            vesselness_arr[0, 0, 0, cy0:cy1, cx0:cx1] = core_vesselness
+    else:
+        with open_ome_zarr(output_zarr_path, mode="r+") as ds:
+            if output_label_name:
+                temp_name = f"{output_label_name}_unstitched"
+                labels_arr = ds[pos_path].zgroup["labels"][temp_name]["0"]
+                labels_arr[0, 0, 0, cy0:cy1, cx0:cx1] = core_labels
+            if save_vesselness and output_label_name and core_vesselness is not None:
+                vesselness_label_name = output_label_name.replace("_seg", "_vesselness")
+                temp_vesselness_name = f"{vesselness_label_name}_unstitched"
+                vesselness_arr = ds[pos_path].zgroup["labels"][temp_vesselness_name]["0"]
+                vesselness_arr[0, 0, 0, cy0:cy1, cx0:cx1] = core_vesselness
+
+
+def _run_pass1_gpu_pipelined(
+    tile_infos: list,
+    source_zarr_path: str,
+    output_zarr_path: str,
+    pos_path: str,
+    channel_index: int,
+    frangi_params: dict,
+    pixel_resolution: dict,
+    use_clahe: bool,
+    clahe_params: dict | None,
+    post_clahe_smoothing_sigma: float,
+    frangi_postprocess: bool,
+    input_mask_name: str | None,
+    nucleoli_method: str | None,
+    vesicular_method: str | None,
+    output_label_name: str | None,
+    save_vesselness: bool,
+    tile_overlap: int,
+    use_preview_mode: bool,
+) -> tuple[list, float]:
+    """Pipelined Pass 1 for GPU: reader threads prefetch tiles, main thread
+    runs GPU compute serially, writer threads push outputs asynchronously.
+
+    Env overrides (defaults reasonable for H100/H200 + 32 CPUs):
+        ORG_SEG_READ_WORKERS=4         # parallel tile reads (NFS)
+        ORG_SEG_WRITE_WORKERS=2        # parallel tile writes (NFS)
+        ORG_SEG_PREFETCH_DEPTH=8       # in-flight reads ahead of GPU
+
+    Returns (all_results, pass1_wall_sec).
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import deque
+
+    # Fall back to serial CPU path if the LoG-blob path is active — no cucim blob_log.
+    if nucleoli_method == "blob" or vesicular_method == "blob":
+        raise NotImplementedError(
+            "pipelined GPU driver does not support LoG blob; use the CPU path"
+        )
+
+    n_read = int(os.environ.get("ORG_SEG_READ_WORKERS", "4"))
+    n_write = int(os.environ.get("ORG_SEG_WRITE_WORKERS", "2"))
+    prefetch_depth = int(os.environ.get("ORG_SEG_PREFETCH_DEPTH", "8"))
+    batch_size = max(1, int(os.environ.get("ORG_SEG_GPU_BATCH", "1")))
+    # Prefetch must at least cover the batch; bump automatically if needed.
+    if prefetch_depth < batch_size:
+        prefetch_depth = batch_size
+
+    print(f"  Pass 1 (GPU pipelined): reads={n_read}, writes={n_write}, "
+          f"prefetch_depth={prefetch_depth}, gpu_batch={batch_size}")
+
+    _reset_gpu_phase_timers()
+
+    # Open source and output zarr handles ONCE per worker using raw zarr
+    # (skipping iohub's OME-NGFF metadata parsing — we only need the arrays at
+    # known paths, not plate/well navigation). Reader/writer threads then do
+    # slice-only access, which is thread-safe and releases the GIL during chunk
+    # decompression/compression.
+    import zarr as _zarr
+    src_store = _zarr.open(source_zarr_path, mode="r")
+    source_image_array = src_store[f"{pos_path}/0"]
+    input_mask_array = None
+    if input_mask_name:
+        try:
+            input_mask_array = src_store[f"{pos_path}/labels/{input_mask_name}/0"]
+        except (KeyError, FileNotFoundError):
+            input_mask_array = None
+
+    labels_arr_handle = None
+    vesselness_arr_handle = None
+    dst_store = _zarr.open(output_zarr_path, mode="r+")
+    if output_label_name:
+        temp_name = f"{output_label_name}_unstitched"
+        labels_arr_handle = dst_store[f"{pos_path}/labels/{temp_name}/0"]
+    if save_vesselness and output_label_name:
+        vname = output_label_name.replace("_seg", "_vesselness")
+        temp_v = f"{vname}_unstitched"
+        vesselness_arr_handle = dst_store[f"{pos_path}/labels/{temp_v}/0"]
+
+    read_pool = ThreadPoolExecutor(max_workers=n_read, thread_name_prefix="tile_read")
+    write_pool = ThreadPoolExecutor(max_workers=n_write, thread_name_prefix="tile_write")
+
+    prefetch_q: deque = deque()
+    write_futures: deque = deque()
+
+    pass1_wall_start = time.monotonic()
+    read_wait_total = 0.0
+    write_queue_wait_total = 0.0
+
+    # Prime prefetch queue
+    for ti in tile_infos[:prefetch_depth]:
+        prefetch_q.append((ti, read_pool.submit(
+            _read_tile_for_gpu, source_zarr_path, pos_path, channel_index, ti, input_mask_name,
+            source_image_array, input_mask_array,
+        )))
+
+    all_results = []
+    pbar = tqdm(total=len(tile_infos), desc="  Pass 1: GPU pipelined")
+    next_read_idx = prefetch_depth
+    n_total = len(tile_infos)
+    i = 0
+
+    while i < n_total:
+        # How many tiles this iteration will consume
+        batch_n = min(batch_size, n_total - i)
+
+        # 1) Pull `batch_n` pre-read tiles (block on reader threads)
+        bundles = []
+        for _ in range(batch_n):
+            curr_info, curr_future = prefetch_q.popleft()
+            t0 = time.monotonic()
+            tile_data_np, input_mask_np = curr_future.result()
+            read_wait_total += time.monotonic() - t0
+            bundles.append((curr_info, tile_data_np, input_mask_np))
+            # Top up prefetch for each consumed slot
+            if next_read_idx < n_total:
+                ni = tile_infos[next_read_idx]
+                prefetch_q.append((ni, read_pool.submit(
+                    _read_tile_for_gpu, source_zarr_path, pos_path, channel_index, ni, input_mask_name,
+                    source_image_array, input_mask_array,
+                )))
+                next_read_idx += 1
+
+        # 2) GPU compute — route everything through the batch function. At
+        # batch_size=1 it's "single tile with no mid-pipeline host syncs";
+        # larger N adds intra-process concurrency via streams. The alternative
+        # (_compute_tile_on_gpu with per-phase timers) forces a GPU sync after
+        # every phase, which blocks kernel pipelining and leaves the SM idle
+        # in the gaps. We pay the "no per-phase timing" cost for better throughput.
+        try:
+            use_single_tile_with_timers = (
+                os.environ.get("ORG_SEG_PHASE_TIMERS", "0") == "1" and batch_size == 1
+            )
+            if use_single_tile_with_timers:
+                ti, td_np, mk_np = bundles[0]
+                core_labels, core_vesselness, debug_labels, debug_vesselness = _compute_tile_on_gpu(
+                    tile_data_np=td_np,
+                    input_mask_np=mk_np,
+                    tile_info=ti,
+                    frangi_params=frangi_params,
+                    pixel_resolution=pixel_resolution,
+                    use_clahe=use_clahe,
+                    clahe_params=clahe_params,
+                    post_clahe_smoothing_sigma=post_clahe_smoothing_sigma,
+                    frangi_postprocess=frangi_postprocess,
+                    save_vesselness=save_vesselness,
+                    tile_overlap=tile_overlap,
+                )
+                batch_results = [(ti, core_labels, core_vesselness, debug_labels, debug_vesselness)]
+            else:
+                batch_results = _compute_tile_batch_on_gpu_streams(
+                    bundles=bundles,
+                    frangi_params=frangi_params,
+                    pixel_resolution=pixel_resolution,
+                    use_clahe=use_clahe,
+                    clahe_params=clahe_params,
+                    post_clahe_smoothing_sigma=post_clahe_smoothing_sigma,
+                    frangi_postprocess=frangi_postprocess,
+                    save_vesselness=save_vesselness,
+                    tile_overlap=tile_overlap,
+                )
+
+            # 3) Submit async writes for each tile in the batch
+            for ti, core_labels, core_vesselness, debug_labels, debug_vesselness in batch_results:
+                if len(write_futures) >= prefetch_depth:
+                    t0 = time.monotonic()
+                    while len(write_futures) >= prefetch_depth:
+                        write_futures.popleft().result()
+                    write_queue_wait_total += time.monotonic() - t0
+
+                wfut = write_pool.submit(
+                    _write_tile_outputs,
+                    output_zarr_path, pos_path, ti, core_labels, core_vesselness,
+                    output_label_name, save_vesselness, use_preview_mode,
+                    labels_arr_handle, vesselness_arr_handle,
+                )
+                write_futures.append(wfut)
+
+                all_results.append({
+                    "tile_info": ti,
+                    "success": True,
+                    "vesselness": debug_vesselness if ti.get("is_center") else None,
+                    "labels": debug_labels if ti.get("is_center") else None,
+                })
+        except Exception as e:
+            print(f"Error processing GPU batch starting at tile {bundles[0][0].get('tile_idx', '?')}: {e}")
+            import traceback
+            traceback.print_exc()
+            for ti, _td, _mk in bundles:
+                all_results.append({"tile_info": ti, "success": False})
+
+        pbar.update(batch_n)
+        i += batch_n
+    pbar.close()
+
+    # Drain remaining writes
+    drain_start = time.monotonic()
+    for f in write_futures:
+        f.result()
+    drain_wall = time.monotonic() - drain_start
+
+    read_pool.shutdown(wait=True)
+    write_pool.shutdown(wait=True)
+    # Raw zarr.open doesn't require explicit cleanup — stores go away when
+    # their references drop.
+
+    pass1_wall = time.monotonic() - pass1_wall_start
+    print(f"  Pass 1 pipeline stats:")
+    print(f"    read_wait      {read_wait_total:7.1f}s  ({100 * read_wait_total / pass1_wall:5.1f}% of wall) — time blocked on tile reads")
+    print(f"    write_q_wait   {write_queue_wait_total:7.1f}s  ({100 * write_queue_wait_total / pass1_wall:5.1f}% of wall) — time blocked draining write queue mid-run")
+    print(f"    write_drain    {drain_wall:7.1f}s  ({100 * drain_wall / pass1_wall:5.1f}% of wall) — end-of-pass write drain")
+    return all_results, pass1_wall
+
+
+def _worker_pipelined_pass1(
+    worker_id: int,
+    tile_infos_partition: list,
+    source_zarr_path: str,
+    output_zarr_path: str,
+    pos_path: str,
+    channel_index: int,
+    frangi_params: dict,
+    pixel_resolution: dict,
+    use_clahe: bool,
+    clahe_params: dict | None,
+    post_clahe_smoothing_sigma: float,
+    frangi_postprocess: bool,
+    input_mask_name: str | None,
+    nucleoli_method: str | None,
+    vesicular_method: str | None,
+    output_label_name: str | None,
+    save_vesselness: bool,
+    tile_overlap: int,
+    use_preview_mode: bool,
+):
+    """Worker process: run the pipelined Pass 1 driver on a partition of tiles.
+
+    Each worker owns its own CUDA context (fresh from process spawn), its own
+    reader/writer thread pools, and writes directly to pre-existing zarr chunks
+    (the output array is created by the parent before any worker starts, so no
+    metadata races). Workers write to disjoint shards because the tile→chunk
+    mapping is 1:1, so no write contention either.
+    """
+    import os
+    import sys
+    import traceback
+
+    try:
+        # Re-import inside the worker — spawn gives us a fresh interpreter.
+        # This also initializes a fresh CUDA context owned by this process.
+        from organelle_profiler.organelle_seg.tiled_processing import (
+            _run_pass1_gpu_pipelined,
+        )
+
+        print(f"  [worker {worker_id}] starting with {len(tile_infos_partition)} tiles, pid={os.getpid()}")
+        _run_pass1_gpu_pipelined(
+            tile_infos=tile_infos_partition,
+            source_zarr_path=source_zarr_path,
+            output_zarr_path=output_zarr_path,
+            pos_path=pos_path,
+            channel_index=channel_index,
+            frangi_params=frangi_params,
+            pixel_resolution=pixel_resolution,
+            use_clahe=use_clahe,
+            clahe_params=clahe_params,
+            post_clahe_smoothing_sigma=post_clahe_smoothing_sigma,
+            frangi_postprocess=frangi_postprocess,
+            input_mask_name=input_mask_name,
+            nucleoli_method=nucleoli_method,
+            vesicular_method=vesicular_method,
+            output_label_name=output_label_name,
+            save_vesselness=save_vesselness,
+            tile_overlap=tile_overlap,
+            use_preview_mode=use_preview_mode,
+        )
+        print(f"  [worker {worker_id}] done")
+    except Exception:
+        print(f"  [worker {worker_id}] FAILED:")
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def _run_pass1_gpu_multi_pipeline(
+    tile_infos: list,
+    n_workers: int,
+    source_zarr_path: str,
+    output_zarr_path: str,
+    pos_path: str,
+    channel_index: int,
+    frangi_params: dict,
+    pixel_resolution: dict,
+    use_clahe: bool,
+    clahe_params: dict | None,
+    post_clahe_smoothing_sigma: float,
+    frangi_postprocess: bool,
+    input_mask_name: str | None,
+    nucleoli_method: str | None,
+    vesicular_method: str | None,
+    output_label_name: str | None,
+    save_vesselness: bool,
+    tile_overlap: int,
+    use_preview_mode: bool,
+) -> tuple[list, float]:
+    """Spawn N GPU worker processes, each running the pipelined driver on its
+    partition of tiles. The parent pre-creates the output zarr array (done by
+    the caller) and waits for all workers to complete.
+
+    Uses the ``spawn`` start method — never fork — because fork plus CUDA is
+    fragile (child inherits the parent's CUDA state in a broken way).
+
+    Tile partitioning is interleaved (worker i gets tiles i, i+N, i+2N, ...) so
+    any spatial hot spots in the image get distributed evenly across workers
+    rather than loaded onto a single worker.
+    """
+    import multiprocessing as mp
+    import time as _time
+
+    ctx = mp.get_context("spawn")
+    partitions = [tile_infos[i::n_workers] for i in range(n_workers)]
+
+    print(f"  Pass 1: {len(tile_infos)} tiles across {n_workers} spawned worker processes")
+    for i, p in enumerate(partitions):
+        print(f"    worker {i}: {len(p)} tiles")
+
+    pass1_wall_start = _time.monotonic()
+    procs = []
+    for wid, part in enumerate(partitions):
+        p = ctx.Process(
+            target=_worker_pipelined_pass1,
+            args=(
+                wid, part, source_zarr_path, output_zarr_path, pos_path,
+                channel_index, frangi_params, pixel_resolution, use_clahe,
+                clahe_params, post_clahe_smoothing_sigma, frangi_postprocess,
+                input_mask_name, nucleoli_method, vesicular_method,
+                output_label_name, save_vesselness, tile_overlap,
+                use_preview_mode,
+            ),
+        )
+        p.start()
+        procs.append(p)
+
+    for p in procs:
+        p.join()
+
+    pass1_wall = _time.monotonic() - pass1_wall_start
+
+    failed = [p for p in procs if p.exitcode != 0]
+    if failed:
+        print(f"  [WARN] {len(failed)}/{len(procs)} GPU worker processes failed with non-zero exit codes: "
+              f"{[(p.pid, p.exitcode) for p in failed]}")
+
+    # We don't collect per-tile results in the multi-worker path (would require
+    # IPC of potentially large arrays). Results are on disk at the zarr output.
+    return [], pass1_wall
+
+
 def _stitch_tiled_labels_pass2(
     source_zarr_path: str,
     pos_path: str,
@@ -797,6 +1941,7 @@ def segment_position_frangi_tiled(
     vesicular_method: str = None,
     preview_mode: bool = False,
     shards_ratio: tuple = (1, 1, 1, 32, 32),
+    use_gpu: bool = False,
 ):
     """
     Two-pass tiled Frangi segmentation with Dask parallelization for large images.
@@ -871,6 +2016,27 @@ def segment_position_frangi_tiled(
                 height, width = full_shape[3], full_shape[4]
                 y_start_crop, x_start_crop = 0, 0
 
+        # Allow profile-level override of tile_size/overlap so we can sweep
+        # the tile geometry without threading an argument through three layers.
+        _tile_size_env = os.environ.get("ORG_SEG_TILE_SIZE")
+        if _tile_size_env:
+            try:
+                new_tile = int(_tile_size_env)
+                if new_tile > 0:
+                    print(f"  [ORG_SEG_TILE_SIZE={new_tile}] overriding tile_size from {tile_size}")
+                    tile_size = new_tile
+            except ValueError:
+                pass
+        _tile_overlap_env = os.environ.get("ORG_SEG_TILE_OVERLAP")
+        if _tile_overlap_env:
+            try:
+                new_overlap = int(_tile_overlap_env)
+                if new_overlap >= 0:
+                    print(f"  [ORG_SEG_TILE_OVERLAP={new_overlap}] overriding tile_overlap from {tile_overlap}")
+                    tile_overlap = new_overlap
+            except ValueError:
+                pass
+
         print(f"  Full position size: {height} x {width}")
         print(f"  Processing in {tile_size}x{tile_size} tiles with {tile_overlap}px overlap")
 
@@ -932,12 +2098,28 @@ def segment_position_frangi_tiled(
         # - Eigenvalues/vectors: ~256 MB
         # - scipy intermediate arrays: ~500 MB
         # - Total peak per worker: ~2-3 GB
-        num_workers = get_optimal_workers(
-            use_gpu=False,  # CPU only for Frangi tiled
-            model_ram_gb=1.5,  # Frangi/scipy overhead per worker
-            data_ram_gb=1.5,  # Tile data + Hessian arrays
-            verbose=True,
-        )
+        if use_gpu:
+            if not _GPU_AVAILABLE:
+                print("  [WARN] use_gpu=True but cupy/cucim unavailable; falling back to CPU")
+                effective_use_gpu = False
+                num_workers = get_optimal_workers(
+                    use_gpu=False, model_ram_gb=1.5, data_ram_gb=1.5, verbose=False,
+                )
+            else:
+                effective_use_gpu = True
+                # Multiple GPU workers = separate processes with separate CUDA
+                # contexts; the GPU driver truly interleaves their kernels
+                # (CuPy streams within one process are serialized by the memory
+                # pool lock, which is why this path exists instead of streams).
+                num_workers = max(1, int(os.environ.get("ORG_SEG_GPU_WORKERS", "1")))
+        else:
+            effective_use_gpu = False
+            num_workers = get_optimal_workers(
+                use_gpu=False,  # CPU only for Frangi tiled
+                model_ram_gb=1.5,  # Frangi/scipy overhead per worker
+                data_ram_gb=1.5,  # Tile data + Hessian arrays
+                verbose=True,
+            )
 
         # Cap workers at total tiles and ensure reasonable minimum
         num_workers = min(num_workers, total_tiles)
@@ -1050,14 +2232,74 @@ def segment_position_frangi_tiled(
                     )
                     print(f"  Also storing vesselness map as: {vesselness_label_name}")
 
-        # Process tiles - use joblib for parallel processing, or direct loop for single tile/worker
-        # Each worker processes a tile and writes directly to zarr
-        if num_workers == 1 or total_tiles == 1:
+        # Process tiles - GPU single-worker uses a read/compute/write pipeline;
+        # GPU multi-worker uses joblib with per-tile workers (each its own CUDA
+        # context); CPU path stays on the existing joblib/sequential flow.
+        pass1_wall_start = time.monotonic()
+        pass1_wall_measured = None
+        if effective_use_gpu and num_workers == 1:
+            _reset_gpu_phase_timers()
+            all_results, pass1_wall_measured = _run_pass1_gpu_pipelined(
+                tile_infos=tile_infos,
+                source_zarr_path=source_zarr_path,
+                output_zarr_path=output_zarr_path,
+                pos_path=pos_path,
+                channel_index=channel_index,
+                frangi_params=frangi_params,
+                pixel_resolution=pixel_resolution,
+                use_clahe=use_clahe,
+                clahe_params=clahe_params,
+                post_clahe_smoothing_sigma=post_clahe_smoothing_sigma,
+                frangi_postprocess=frangi_postprocess,
+                input_mask_name=input_mask_name,
+                nucleoli_method=nucleoli_method,
+                vesicular_method=vesicular_method,
+                output_label_name=output_label_name,
+                save_vesselness=save_vesselness,
+                tile_overlap=tile_overlap,
+                use_preview_mode=preview_mode,
+            )
+            tile_worker_fn = None  # unused in GPU pipelined mode
+        elif effective_use_gpu and num_workers > 1:
+            # N spawned GPU worker processes, each owning its own CUDA context
+            # and its own pipelined driver over a partition of tiles. The
+            # output zarr metadata is created once by the parent before the
+            # workers start (above), so workers only write data chunks — no
+            # metadata races. Each worker's writes land in disjoint shards
+            # because the tile→chunk mapping is 1:1.
+            all_results, pass1_wall_measured = _run_pass1_gpu_multi_pipeline(
+                tile_infos=tile_infos,
+                n_workers=num_workers,
+                source_zarr_path=source_zarr_path,
+                output_zarr_path=output_zarr_path,
+                pos_path=pos_path,
+                channel_index=channel_index,
+                frangi_params=frangi_params,
+                pixel_resolution=pixel_resolution,
+                use_clahe=use_clahe,
+                clahe_params=clahe_params,
+                post_clahe_smoothing_sigma=post_clahe_smoothing_sigma,
+                frangi_postprocess=frangi_postprocess,
+                input_mask_name=input_mask_name,
+                nucleoli_method=nucleoli_method,
+                vesicular_method=vesicular_method,
+                output_label_name=output_label_name,
+                save_vesselness=save_vesselness,
+                tile_overlap=tile_overlap,
+                use_preview_mode=preview_mode,
+            )
+            tile_worker_fn = None
+        else:
+            all_results = None  # populated by the CPU branches below
+            tile_worker_fn = _process_single_frangi_tile
+        if effective_use_gpu:
+            pass  # populated above via pipelined driver or joblib
+        elif num_workers == 1 or total_tiles == 1:
             # Single worker or single tile: skip joblib overhead, process directly
-            print(f"  Pass 1: Processing {total_tiles} tile(s) sequentially (num_workers=1)...")
+            print(f"  Pass 1: Processing {total_tiles} tile(s) sequentially (num_workers=1, gpu={effective_use_gpu})...")
             all_results = []
             for tile_info in tqdm(tile_infos, desc="  Pass 1: Segmenting tiles"):
-                result = _process_single_frangi_tile(
+                result = tile_worker_fn(
                     tile_info=tile_info,
                     source_zarr_path=source_zarr_path,
                     pos_path=pos_path,
@@ -1086,7 +2328,7 @@ def segment_position_frangi_tiled(
             # Process all tiles in parallel - each worker writes directly to zarr with locking
             # Pass tile grid info so workers can compute core (non-overlapping) regions
             all_results = Parallel(n_jobs=num_workers)(
-                delayed(_process_single_frangi_tile)(
+                delayed(tile_worker_fn)(
                     tile_info=tile_info,
                     source_zarr_path=source_zarr_path,
                     pos_path=pos_path,
@@ -1110,7 +2352,22 @@ def segment_position_frangi_tiled(
                 for tile_info in tqdm(tile_infos, desc="  Pass 1: Segmenting tiles")
             )
 
-        print(f"  Pass 1 complete: {total_tiles} tiles written to zarr")
+        if effective_use_gpu and pass1_wall_measured is not None:
+            pass1_wall = pass1_wall_measured
+        else:
+            pass1_wall = time.monotonic() - pass1_wall_start
+        print(f"  Pass 1 complete: {total_tiles} tiles written to zarr in {pass1_wall:.1f}s")
+        if effective_use_gpu:
+            _print_gpu_phase_timers(pass1_wall)
+
+        # Profile hook: let iteration skip Pass 2/resharding/pyramid entirely.
+        # The unstitched labels at "<label>_unstitched" are left on disk; the
+        # next real run will overwrite them.
+        if os.environ.get("ORG_SEG_STOP_AFTER_PASS1") == "1":
+            total_elapsed = time.time() - start_time
+            print(f"  [ORG_SEG_STOP_AFTER_PASS1=1] skipping Pass 2, resharding, and pyramid build")
+            print(f"[{pos_path}] Pass 1 only complete (profile mode), took {total_elapsed:.1f}s")
+            return (pos_path, None, None, None, source_scale, crop_bbox)
 
         # Extract center tile result for debug output
         center_tile_result = None
@@ -1518,4 +2775,5 @@ def segment_position_frangi(
         vesicular_method=vesicular_method,
         preview_mode=preview_mode,
         shards_ratio=shards_ratio,
+        use_gpu=use_gpu,
     )

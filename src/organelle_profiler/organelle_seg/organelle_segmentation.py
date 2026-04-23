@@ -278,7 +278,7 @@ def run_organelle_segmentation(
                     channel_to_segment=channel_name,
                     organelle_name=organelle_key,
                     frangi_params=local_frangi_params,
-                    use_gpu=False,
+                    use_gpu=True,
                     frangi_postprocess=frangi_postprocess,
                     use_clahe=use_clahe,
                     post_clahe_smoothing_sigma=post_clahe_smoothing_sigma,
@@ -613,7 +613,7 @@ def segment_single_position_channel(
             channel_to_segment=source_channel,
             organelle_name=organelle_key,
             frangi_params=local_frangi_params,
-            use_gpu=False,
+            use_gpu=True,
             frangi_postprocess=frangi_postprocess,
             use_clahe=True if is_nucleoli else use_clahe,  # Always use CLAHE for nucleoli
             post_clahe_smoothing_sigma=local_smoothing,

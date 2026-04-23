@@ -236,6 +236,29 @@ def process_segmentation_result(
                 objects = np.asarray(labels_arr[...])
                 print(f"  Loaded tiled results from zarr for debug output: shape {objects.shape}")
 
+    if objects is None and not debug_only:
+        # Tiled non-debug path writes directly to zarr and returns None rather than
+        # shipping a 40+ GB in-memory array. Verify the label exists on disk; if so,
+        # that's a successful run. We skip the expensive array read — num_objects=-1
+        # signals "not counted" without pretending to be zero.
+        import time
+        try:
+            store = zarr.open(str(source_path), mode="r")
+            if objects_name in store[position]["labels"]:
+                elapsed_time = time.time() - start_time if start_time else 0.0
+                print(f"  Tiled write verified on disk: labels/{objects_name}")
+                return {
+                    "success": True,
+                    "position": position,
+                    "channel": channel_key,
+                    "output_label": objects_name,
+                    "num_objects": -1,  # not counted — reading 40GB to count would defeat the point
+                    "elapsed_time": elapsed_time,
+                    "tiled": True,
+                }
+        except Exception as e:
+            print(f"  [warn] failed to verify tiled write on disk: {e}")
+
     if objects is None:
         return {
             "success": False,
