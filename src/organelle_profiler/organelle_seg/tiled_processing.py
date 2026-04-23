@@ -2201,6 +2201,82 @@ def _apply_global_lut_to_tile(
     labels_arr[0, 0, 0, y_start:y_end, x_start:x_end] = out_cpu
 
 
+def _read_tile_and_push_gpu(
+    labels_arr,
+    ty: int,
+    tx: int,
+    step: int,
+    height: int,
+    width: int,
+) -> tuple:
+    """Phase A variant that ALSO pushes the tile body to GPU memory, so
+    Phase B.5 can skip the second NFS read. Called from the reader thread
+    pool when ORG_SEG_PASS2_TILE_CACHE=1 is set.
+
+    Returns (ty, tx, local_max, left_col, top_row, right_col, bottom_row,
+             tile_gpu)
+    where tile_gpu is a cupy.int32 ndarray owning the tile's pixels.
+    """
+    cp = _cp
+    y_start = ty * step
+    x_start = tx * step
+    y_end = min((ty + 1) * step, height)
+    x_end = min((tx + 1) * step, width)
+    tile_cpu = np.asarray(labels_arr[0, 0, 0, y_start:y_end, x_start:x_end])
+    if tile_cpu.dtype != np.int32:
+        tile_cpu = tile_cpu.astype(np.int32)
+    local_max = int(tile_cpu.max()) if tile_cpu.size else 0
+    left_col = tile_cpu[:, 0].copy()
+    right_col = tile_cpu[:, -1].copy()
+    top_row = tile_cpu[0, :].copy()
+    bottom_row = tile_cpu[-1, :].copy()
+    # H2D push — tile stays on GPU through Phase B.5.
+    tile_gpu = cp.asarray(tile_cpu)
+    return ty, tx, local_max, left_col, top_row, right_col, bottom_row, tile_gpu
+
+
+def _apply_lut_from_gpu_cache(
+    labels_arr,
+    ty: int,
+    tx: int,
+    step: int,
+    height: int,
+    width: int,
+    global_offset_tile: int,
+    local_max: int,
+    tile_gpu,
+    lut_gpu,
+) -> None:
+    """Apply the global LUT to a tile that's ALREADY on the GPU (populated in
+    Phase A). No NFS read here — only D2H + NFS write. Skips all-background
+    tiles via the precomputed local_max.
+    """
+    if local_max == 0:
+        # All-background tile. Free the GPU buffer and skip the write.
+        del tile_gpu
+        return
+
+    cp = _cp
+    # Stay in int32 throughout — max_label ≈ 70M which fits in int32 (max ~2.1B),
+    # so `tile + global_offset` cannot overflow. Skipping the int32→int64 cast
+    # avoids a JIT-compiled cast kernel (which would need CUDA_PATH set for
+    # nvcc/nvrtc on a fresh process) and halves the intermediate memory.
+    nonzero = tile_gpu > 0
+    global_idx = cp.where(
+        nonzero,
+        tile_gpu + np.int32(global_offset_tile),
+        np.int32(0),
+    )
+    remapped = lut_gpu[global_idx]
+    out_cpu = cp.asnumpy(remapped)
+
+    y_start = ty * step
+    x_start = tx * step
+    y_end = min((ty + 1) * step, height)
+    x_end = min((tx + 1) * step, width)
+    labels_arr[0, 0, 0, y_start:y_end, x_start:x_end] = out_cpu
+
+
 def _run_pass2_parallel(
     source_zarr_path: str,
     pos_path: str,
@@ -2252,8 +2328,16 @@ def _run_pass2_parallel(
     n_read = int(os.environ.get("ORG_SEG_PASS2_READ_WORKERS", "16"))
     n_apply = int(os.environ.get("ORG_SEG_PASS2_APPLY_WORKERS", "16"))
     use_gpu_lut = _GPU_AVAILABLE and os.environ.get("ORG_SEG_PASS2_GPU_LUT", "1") == "1"
+    # Tile-cache-on-GPU: keep tile bodies on GPU after Phase A so Phase B.5
+    # skips the second NFS read. Costs ~44 GB VRAM for a 28×28 4k-tile run;
+    # requires use_gpu_lut. Opt-in via ORG_SEG_PASS2_TILE_CACHE=1.
+    use_tile_cache = (
+        use_gpu_lut
+        and os.environ.get("ORG_SEG_PASS2_TILE_CACHE", "0") == "1"
+    )
 
-    print(f"  Pass 2 (parallel): {n_tiles_total} tiles, reads={n_read}, apply={n_apply}, gpu_lut={use_gpu_lut}")
+    print(f"  Pass 2 (parallel): {n_tiles_total} tiles, reads={n_read}, apply={n_apply}, "
+          f"gpu_lut={use_gpu_lut}, tile_cache={use_tile_cache}")
     print(f"    tile_size={tile_size}, tile_overlap={tile_overlap}, step={step}")
 
     pass2_start = time.monotonic()
@@ -2277,23 +2361,44 @@ def _run_pass2_parallel(
         top_row: dict[int, np.ndarray] = {}
         right_col: dict[int, np.ndarray] = {}
         bottom_row: dict[int, np.ndarray] = {}
+        # Only populated when use_tile_cache=True; holds cupy.int32 tile bodies.
+        tiles_on_gpu: dict[int, object] = {}
 
         tile_list = [(ty, tx) for ty in range(n_tiles_y) for tx in range(n_tiles_x)]
+        reader_fn = _read_tile_and_push_gpu if use_tile_cache else _read_tile_and_boundaries
         with ThreadPoolExecutor(max_workers=n_read, thread_name_prefix="p2_read") as pool:
             futures = [
-                pool.submit(_read_tile_and_boundaries, labels_arr, ty, tx, step, height, width)
+                pool.submit(reader_fn, labels_arr, ty, tx, step, height, width)
                 for (ty, tx) in tile_list
             ]
             for fut in tqdm(futures, desc="    Phase A read", total=len(futures)):
-                ty, tx, lm, lcol, trow, rcol, brow = fut.result()
+                result = fut.result()
+                if use_tile_cache:
+                    ty, tx, lm, lcol, trow, rcol, brow, tile_gpu = result
+                else:
+                    ty, tx, lm, lcol, trow, rcol, brow = result
+                    tile_gpu = None
                 tid = tile_id(ty, tx)
                 local_max[tid] = lm
                 left_col[tid] = lcol
                 top_row[tid] = trow
                 right_col[tid] = rcol
                 bottom_row[tid] = brow
+                if tile_gpu is not None:
+                    tiles_on_gpu[tid] = tile_gpu
+        # If caching, report VRAM use for sanity.
+        cache_msg = ""
+        if use_tile_cache:
+            # sum(nbytes) across cupy arrays — each is int32 of tile size
+            cp = _cp
+            try:
+                mempool = cp.get_default_memory_pool()
+                used_gb = mempool.used_bytes() / 2**30
+                cache_msg = f"; gpu_cache ~{used_gb:.1f} GB"
+            except Exception:
+                cache_msg = "; gpu_cache populated"
         print(f"    Phase A done in {time.monotonic() - t_phase_a:.1f}s; "
-              f"sum(local_max) = {int(local_max.sum())}")
+              f"sum(local_max) = {int(local_max.sum())}{cache_msg}")
 
         # -----------------------------------------------------------------
         # Phase A.5 — cumulative offsets (tiny, CPU).
@@ -2405,17 +2510,35 @@ def _run_pass2_parallel(
 
         print(f"    Phase B.5: applying LUT to {n_tiles_total} tiles in parallel...")
         with ThreadPoolExecutor(max_workers=n_apply, thread_name_prefix="p2_apply") as pool:
-            futures = [
-                pool.submit(
-                    _apply_global_lut_to_tile,
-                    labels_arr, ty, tx, step, height, width,
-                    int(global_offset[tile_id(ty, tx)]),
-                    lut_cpu, lut_gpu,
-                )
-                for (ty, tx) in tile_list
-            ]
+            if use_tile_cache:
+                # Tiles are already in VRAM — skip NFS read, just remap + write.
+                futures = []
+                for (ty, tx) in tile_list:
+                    tid = tile_id(ty, tx)
+                    futures.append(pool.submit(
+                        _apply_lut_from_gpu_cache,
+                        labels_arr, ty, tx, step, height, width,
+                        int(global_offset[tid]),
+                        int(local_max[tid]),
+                        tiles_on_gpu.pop(tid),  # transfer ownership; free after worker done
+                        lut_gpu,
+                    ))
+            else:
+                futures = [
+                    pool.submit(
+                        _apply_global_lut_to_tile,
+                        labels_arr, ty, tx, step, height, width,
+                        int(global_offset[tile_id(ty, tx)]),
+                        lut_cpu, lut_gpu,
+                    )
+                    for (ty, tx) in tile_list
+                ]
             for fut in tqdm(futures, desc="    Phase B.5 apply", total=len(futures)):
                 fut.result()
+        if use_tile_cache:
+            # Drop any lingering refs so cupy can reclaim VRAM immediately.
+            tiles_on_gpu.clear()
+            _cp.get_default_memory_pool().free_all_blocks()
         print(f"    Phase B.5 done in {time.monotonic() - t_phase_b5:.1f}s")
 
     # -------------------------------------------------------------------
