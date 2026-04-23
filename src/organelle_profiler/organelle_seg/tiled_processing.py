@@ -1308,6 +1308,8 @@ def _write_tile_outputs(
     use_preview_mode: bool,
     labels_arr=None,
     vesselness_arr=None,
+    shm_labels_buffer: np.ndarray | None = None,
+    shm_step: int = 0,
 ) -> None:
     """Write one tile's core region to zarr. Pure CPU work; runs in writer thread.
 
@@ -1315,11 +1317,29 @@ def _write_tile_outputs(
     array (avoids per-write ``open_ome_zarr`` that holds the GIL through
     metadata parsing and serializes writer threads). Writes land in disjoint
     shards so no chunk-level locking is needed.
+
+    If ``shm_labels_buffer`` is supplied (shape ``(n_ty, n_tx, step, step)``),
+    labels are written to shared memory instead of zarr — the in-memory
+    unstitched path that feeds Pass 2 directly. ``vesselness_arr`` is still
+    used for vesselness writes (that output is kept on disk).
     """
     cy0 = tile_info["_core_y_start_global"]
     cy1 = tile_info["_core_y_end_global"]
     cx0 = tile_info["_core_x_start_global"]
     cx1 = tile_info["_core_x_end_global"]
+
+    if shm_labels_buffer is not None:
+        ty = tile_info["ty"]
+        tx = tile_info["tx"]
+        h = cy1 - cy0
+        w = cx1 - cx0
+        # Core region occupies the top-left (h, w) of this tile's slot;
+        # interior tiles fill the full step×step, edge tiles leave the
+        # trailing pixels as the pre-zeroed fill.
+        shm_labels_buffer[ty, tx, :h, :w] = core_labels
+        if save_vesselness and core_vesselness is not None and vesselness_arr is not None:
+            vesselness_arr[0, 0, 0, cy0:cy1, cx0:cx1] = core_vesselness
+        return
 
     if labels_arr is not None:
         labels_arr[0, 0, 0, cy0:cy1, cx0:cx1] = core_labels
@@ -1372,6 +1392,9 @@ def _run_pass1_gpu_pipelined(
     save_vesselness: bool,
     tile_overlap: int,
     use_preview_mode: bool,
+    shm_name: str | None = None,
+    shm_shape: tuple | None = None,
+    shm_step: int = 0,
 ) -> tuple[list, float]:
     """Pipelined Pass 1 for GPU: reader threads prefetch tiles, main thread
     runs GPU compute serially, writer threads push outputs asynchronously.
@@ -1426,7 +1449,16 @@ def _run_pass1_gpu_pipelined(
     labels_arr_handle = None
     vesselness_arr_handle = None
     dst_store = _zarr.open(output_zarr_path, mode="r+")
-    if output_label_name:
+    # In-memory labels path: attach to the shared-memory tile buffer the parent
+    # pre-allocated. When active, label writes go to shm instead of zarr —
+    # the unstitched zarr array is not created at all in this mode.
+    shm_labels_buffer = None
+    shm_handle = None  # keep reference so /dev/shm block stays mapped
+    if shm_name is not None and shm_shape is not None:
+        from multiprocessing import shared_memory as _shm
+        shm_handle = _shm.SharedMemory(name=shm_name)
+        shm_labels_buffer = np.ndarray(shm_shape, dtype=np.int32, buffer=shm_handle.buf)
+    elif output_label_name:
         temp_name = f"{output_label_name}_unstitched"
         labels_arr_handle = dst_store[f"{pos_path}/labels/{temp_name}/0"]
     if save_vesselness and output_label_name:
@@ -1541,6 +1573,7 @@ def _run_pass1_gpu_pipelined(
                     output_zarr_path, pos_path, ti, core_labels, core_vesselness,
                     output_label_name, save_vesselness, use_preview_mode,
                     labels_arr_handle, vesselness_arr_handle,
+                    shm_labels_buffer, shm_step,
                 )
                 write_futures.append(wfut)
 
@@ -1583,6 +1616,11 @@ def _run_pass1_gpu_pipelined(
     write_pool.shutdown(wait=True)
     # Raw zarr.open doesn't require explicit cleanup — stores go away when
     # their references drop.
+    if shm_handle is not None:
+        # Drop our numpy view, then close the mmap. Parent unlinks the shm
+        # block after Pass 2 finishes reading from it.
+        shm_labels_buffer = None
+        shm_handle.close()
 
     pass1_wall = time.monotonic() - pass1_wall_start
     print(f"  Pass 1 pipeline stats:")
@@ -1615,6 +1653,9 @@ def _worker_pipelined_pass1(
     save_vesselness: bool,
     tile_overlap: int,
     use_preview_mode: bool,
+    shm_name: str | None = None,
+    shm_shape: tuple | None = None,
+    shm_step: int = 0,
 ):
     """Worker process: run the pipelined Pass 1 driver on a partition of tiles.
 
@@ -1663,7 +1704,8 @@ def _worker_pipelined_pass1(
             import time as _t
             _t.sleep(delay_s)
 
-        print(f"  [worker {worker_id}] starting with {len(tile_infos_partition)} tiles, pid={os.getpid()}")
+        print(f"  [worker {worker_id}] starting with {len(tile_infos_partition)} tiles, pid={os.getpid()}"
+              + (f", shm={shm_name}" if shm_name else ""))
         _run_pass1_gpu_pipelined(
             tile_infos=tile_infos_partition,
             source_zarr_path=source_zarr_path,
@@ -1683,6 +1725,9 @@ def _worker_pipelined_pass1(
             save_vesselness=save_vesselness,
             tile_overlap=tile_overlap,
             use_preview_mode=use_preview_mode,
+            shm_name=shm_name,
+            shm_shape=shm_shape,
+            shm_step=shm_step,
         )
         print(f"  [worker {worker_id}] done")
     except Exception:
@@ -1711,6 +1756,9 @@ def _run_pass1_gpu_multi_pipeline(
     save_vesselness: bool,
     tile_overlap: int,
     use_preview_mode: bool,
+    shm_name: str | None = None,
+    shm_shape: tuple | None = None,
+    shm_step: int = 0,
 ) -> tuple[list, float]:
     """Spawn N GPU worker processes, each running the pipelined driver on its
     partition of tiles. The parent pre-creates the output zarr array (done by
@@ -1745,6 +1793,7 @@ def _run_pass1_gpu_multi_pipeline(
                 input_mask_name, nucleoli_method, vesicular_method,
                 output_label_name, save_vesselness, tile_overlap,
                 use_preview_mode,
+                shm_name, shm_shape, shm_step,
             ),
         )
         p.start()
@@ -2235,6 +2284,47 @@ def _read_tile_and_push_gpu(
     return ty, tx, local_max, left_col, top_row, right_col, bottom_row, tile_gpu
 
 
+def _read_tile_from_buffer_and_push_gpu(
+    tile_buffer: np.ndarray,
+    ty: int,
+    tx: int,
+    step: int,
+    height: int,
+    width: int,
+) -> tuple:
+    """Phase A variant for when the unstitched tiles are already in a shared
+    numpy buffer (fed by Pass 1 via mp.shared_memory — or preloaded for a
+    bench). Skips all zarr I/O on the read side.
+
+    `tile_buffer` shape is ``(n_ty, n_tx, step, step)``, int32. Edge tiles
+    (last row/col) are zero-padded to fill the fixed-size slot, so we slice
+    down to the actual valid region before boundary extraction.
+
+    Returns the same 8-tuple as ``_read_tile_and_push_gpu``.
+    """
+    cp = _cp
+    y_start = ty * step
+    x_start = tx * step
+    y_end = min((ty + 1) * step, height)
+    x_end = min((tx + 1) * step, width)
+    h = y_end - y_start
+    w = x_end - x_start
+    # View into the pre-populated buffer. No zarr read, no decompression.
+    tile_cpu = tile_buffer[ty, tx, :h, :w]
+    # Ensure contiguous for cupy H2D; the slice is already contiguous if the
+    # buffer is row-major and full-size (h == step, w == step). For edge
+    # tiles we copy so the GPU-side array is contiguous.
+    if not tile_cpu.flags.c_contiguous:
+        tile_cpu = np.ascontiguousarray(tile_cpu)
+    local_max = int(tile_cpu.max()) if tile_cpu.size else 0
+    left_col = tile_cpu[:, 0].copy()
+    right_col = tile_cpu[:, -1].copy()
+    top_row = tile_cpu[0, :].copy()
+    bottom_row = tile_cpu[-1, :].copy()
+    tile_gpu = cp.asarray(tile_cpu)
+    return ty, tx, local_max, left_col, top_row, right_col, bottom_row, tile_gpu
+
+
 def _apply_lut_from_gpu_cache(
     labels_arr,
     ty: int,
@@ -2292,6 +2382,7 @@ def _run_pass2_parallel(
     crop_bbox: tuple = None,
     target_chunks: tuple = (1, 1, 1, 512, 512),
     target_shards_ratio: tuple = (1, 1, 1, 32, 32),
+    tile_buffer: np.ndarray = None,
 ) -> int:
     """Parallel Pass 2: two-phase stitching without the per-tile
     read-offset-write cycle that made the original serial.
@@ -2335,17 +2426,33 @@ def _run_pass2_parallel(
         use_gpu_lut
         and os.environ.get("ORG_SEG_PASS2_TILE_CACHE", "0") == "1"
     )
+    # In-memory Phase A source: when a pre-populated numpy buffer of shape
+    # (n_ty, n_tx, step, step) int32 is passed in, skip zarr reads entirely.
+    # Intended for the shared-memory Pass 1 → Pass 2 handoff (and benched
+    # here by preloading the unstitched into RAM).
+    use_buffer = tile_buffer is not None
+    if use_buffer:
+        # Buffer implies tile cache (tile lives in RAM, H2D is cheap).
+        use_tile_cache = use_tile_cache or _GPU_AVAILABLE
 
     print(f"  Pass 2 (parallel): {n_tiles_total} tiles, reads={n_read}, apply={n_apply}, "
-          f"gpu_lut={use_gpu_lut}, tile_cache={use_tile_cache}")
+          f"gpu_lut={use_gpu_lut}, tile_cache={use_tile_cache}, buffer={use_buffer}")
     print(f"    tile_size={tile_size}, tile_overlap={tile_overlap}, step={step}")
 
     pass2_start = time.monotonic()
 
+    # When tile_buffer is passed in, the unstitched zarr was never created —
+    # Pass 1 wrote directly to shm. In that case, Phase B.5 writes to the
+    # FINAL labels array (which the orchestrator pre-created with the
+    # parallel-safe chunk/shard layout) instead of remapping-in-place +
+    # renaming. Skip the rename step at the end.
     with open_ome_zarr(source_zarr_path, mode="r+") as ds:
         source_pos = ds[pos_path]
         labels_group = source_pos.zgroup["labels"]
-        labels_arr = labels_group[temp_name]["0"]
+        if use_buffer:
+            labels_arr = labels_group[organelle_name]["0"]
+        else:
+            labels_arr = labels_group[temp_name]["0"]
 
         # -----------------------------------------------------------------
         # Phase A — parallel read + boundary extraction. No writes.
@@ -2365,10 +2472,18 @@ def _run_pass2_parallel(
         tiles_on_gpu: dict[int, object] = {}
 
         tile_list = [(ty, tx) for ty in range(n_tiles_y) for tx in range(n_tiles_x)]
-        reader_fn = _read_tile_and_push_gpu if use_tile_cache else _read_tile_and_boundaries
+        if use_buffer:
+            reader_fn = _read_tile_from_buffer_and_push_gpu
+            reader_src = tile_buffer
+        elif use_tile_cache:
+            reader_fn = _read_tile_and_push_gpu
+            reader_src = labels_arr
+        else:
+            reader_fn = _read_tile_and_boundaries
+            reader_src = labels_arr
         with ThreadPoolExecutor(max_workers=n_read, thread_name_prefix="p2_read") as pool:
             futures = [
-                pool.submit(reader_fn, labels_arr, ty, tx, step, height, width)
+                pool.submit(reader_fn, reader_src, ty, tx, step, height, width)
                 for (ty, tx) in tile_list
             ]
             for fut in tqdm(futures, desc="    Phase A read", total=len(futures)):
@@ -2542,17 +2657,20 @@ def _run_pass2_parallel(
         print(f"    Phase B.5 done in {time.monotonic() - t_phase_b5:.1f}s")
 
     # -------------------------------------------------------------------
-    # Rename temp → final (matches the original's filesystem rename)
+    # Rename temp → final (matches the original's filesystem rename).
+    # Skipped when use_buffer=True — in that path Phase B.5 already wrote
+    # directly to the final array, and there's no unstitched zarr to rename.
     # -------------------------------------------------------------------
-    print(f"  Renaming {temp_name} -> {organelle_name}")
-    zarr_store_path = Path(source_zarr_path)
-    labels_path = zarr_store_path / pos_path / "labels"
-    temp_path = labels_path / temp_name
-    final_path = labels_path / organelle_name
-    if final_path.exists():
-        import shutil
-        shutil.rmtree(final_path)
-    temp_path.rename(final_path)
+    if not use_buffer:
+        print(f"  Renaming {temp_name} -> {organelle_name}")
+        zarr_store_path = Path(source_zarr_path)
+        labels_path = zarr_store_path / pos_path / "labels"
+        temp_path = labels_path / temp_name
+        final_path = labels_path / organelle_name
+        if final_path.exists():
+            import shutil
+            shutil.rmtree(final_path)
+        temp_path.rename(final_path)
 
     running_offset = max_label_seen
     print(f"  Pass 2 (parallel) complete in {time.monotonic() - pass2_start:.1f}s; "
@@ -2809,6 +2927,27 @@ def segment_position_frangi_tiled(
         print(f"  Pass 1: Processing {total_tiles} tiles in parallel, writing to zarr...")
         print(f"  Output label: {output_label_name}")
 
+        # In-memory unstitched handoff: ORG_SEG_INMEM_UNSTITCHED=1 bypasses the
+        # unstitched zarr entirely. Pass 1 workers write tile bodies into a
+        # shared-memory block; Pass 2 reads directly from it. Only valid for
+        # the GPU multi-pipeline path (spawn workers can attach to shm by name)
+        # and not with preview_mode or save_vesselness yet.
+        # Vesselness is unaffected by inmem: `_write_tile_outputs` still
+        # routes `core_vesselness` to the vesselness zarr regardless. Only
+        # the *labels* stream moves to shm. Pass 3 mask-erosion isn't wired
+        # into the parallel Pass 2 yet, so keep that precondition.
+        use_inmem_unstitched = (
+            os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1"
+            and effective_use_gpu
+            and num_workers > 1
+            and not preview_mode
+            and not input_mask_name  # Pass 3 mask erosion not wired for shm path
+        )
+        if os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1" and not use_inmem_unstitched:
+            print("  [NOTE] ORG_SEG_INMEM_UNSTITCHED=1 requested but preconditions "
+                  "not met (requires GPU multi-worker, no preview, no input_mask_name). "
+                  "Falling back to zarr unstitched path.")
+
         # Create the output zarr arrays with chunking matching tile size
         # Optionally also create vesselness (float32) array if save_vesselness=True
         vesselness_label_name = output_label_name.replace("_seg", "_vesselness") if save_vesselness else None
@@ -2869,23 +3008,42 @@ def segment_position_frangi_tiled(
                 # to avoid race conditions when multiple jobs run in parallel
                 labels_group = source_pos.zgroup["labels"]
 
-                # Delete if exists (fresh start)
+                # Delete any prior labels from a failed/interrupted run.
                 if temp_name in labels_group:
                     del labels_group[temp_name]
                 if save_vesselness and temp_vesselness_name in labels_group:
                     del labels_group[temp_vesselness_name]
+                if use_inmem_unstitched and output_label_name in labels_group:
+                    del labels_group[output_label_name]
 
-                # Create labels array with STEP-aligned chunks to avoid race conditions
-                # AND sharding for efficient storage (matching convert_v3.py behavior)
-                temp_subgroup = labels_group.create_group(temp_name)
-                temp_subgroup.create_array(
-                    "0",
-                    shape=(1, 1, 1, height, width),
-                    dtype=np.int32,
-                    chunks=label_chunks,
-                    shards=label_shards,
-                    fill_value=0,
-                )
+                if use_inmem_unstitched:
+                    # Skip unstitched; create the FINAL labels array up front
+                    # with the parallel-safe layout. Pass 2 writes remapped
+                    # labels straight into this array and the subsequent
+                    # reshard repacks it to efficient storage.
+                    final_subgroup = labels_group.create_group(output_label_name)
+                    final_subgroup.create_array(
+                        "0",
+                        shape=(1, 1, 1, height, width),
+                        dtype=np.int32,
+                        chunks=label_chunks,
+                        shards=label_shards,
+                        fill_value=0,
+                    )
+                    print(f"  [inmem] created FINAL zarr labels/{output_label_name} "
+                          f"(unstitched skipped)")
+                else:
+                    # Create labels array with STEP-aligned chunks to avoid race conditions
+                    # AND sharding for efficient storage (matching convert_v3.py behavior)
+                    temp_subgroup = labels_group.create_group(temp_name)
+                    temp_subgroup.create_array(
+                        "0",
+                        shape=(1, 1, 1, height, width),
+                        dtype=np.int32,
+                        chunks=label_chunks,
+                        shards=label_shards,
+                        fill_value=0,
+                    )
 
                 # Optionally create vesselness array (also with sharding)
                 if save_vesselness:
@@ -2899,6 +3057,29 @@ def segment_position_frangi_tiled(
                         fill_value=0.0,
                     )
                     print(f"  Also storing vesselness map as: {vesselness_label_name}")
+
+        # In-memory unstitched handoff: allocate the shm tile buffer that
+        # replaces the unstitched zarr. Lives until after Pass 2 consumes it.
+        shm_block = None
+        shm_name_for_pass1 = None
+        shm_shape_for_pass1 = None
+        tile_buffer_for_pass2 = None
+        if use_inmem_unstitched:
+            from multiprocessing import shared_memory as _shm_mod
+            shm_shape_for_pass1 = (n_tiles_y, n_tiles_x, step, step)
+            nbytes = int(np.int32().itemsize * np.prod(shm_shape_for_pass1))
+            shm_block = _shm_mod.SharedMemory(create=True, size=nbytes)
+            # POSIX shared memory is zero-initialized on creation (ftruncate
+            # extends with zero pages), so edge-tile padding and any
+            # never-written positions are already 0=background. Skipping an
+            # explicit np.zero-fill saves ~8s of first-touch wall time on
+            # the ~43 GB buffer.
+            tile_buffer_for_pass2 = np.ndarray(
+                shm_shape_for_pass1, dtype=np.int32, buffer=shm_block.buf
+            )
+            shm_name_for_pass1 = shm_block.name
+            print(f"  [inmem] allocated shm tile buffer: name={shm_name_for_pass1}, "
+                  f"shape={shm_shape_for_pass1}, {nbytes / 2**30:.1f} GB")
 
         # Process tiles - GPU single-worker uses a read/compute/write pipeline;
         # GPU multi-worker uses joblib with per-tile workers (each its own CUDA
@@ -2955,6 +3136,9 @@ def segment_position_frangi_tiled(
                 save_vesselness=save_vesselness,
                 tile_overlap=tile_overlap,
                 use_preview_mode=preview_mode,
+                shm_name=shm_name_for_pass1,
+                shm_shape=shm_shape_for_pass1,
+                shm_step=step,
             )
             tile_worker_fn = None
         else:
@@ -3036,6 +3220,16 @@ def segment_position_frangi_tiled(
             total_elapsed = time.time() - start_time
             print(f"  [ORG_SEG_STOP_AFTER_PASS1=1] skipping Pass 2, resharding, and pyramid build")
             print(f"[{pos_path}] Pass 1 only complete (profile mode), took {total_elapsed:.1f}s")
+            # Release shm if we allocated one for the inmem path. The tile
+            # data isn't persisted anywhere else in this mode, so a
+            # STOP_AFTER_PASS1 run with inmem throws it away — fine for
+            # profiling Pass 1 in isolation.
+            if shm_block is not None:
+                try:
+                    shm_block.close()
+                    shm_block.unlink()
+                except Exception:
+                    pass
             return (pos_path, None, None, None, source_scale, crop_bbox)
 
         # Extract center tile result for debug output
@@ -3241,10 +3435,15 @@ def segment_position_frangi_tiled(
         # components + parallel LUT apply). Falls back to the original
         # sequential CPU implementation by default or when GPU is unavailable.
         _pass2_gpu = os.environ.get("ORG_SEG_PASS2_GPU", "0") == "1" and _GPU_AVAILABLE
+        # The in-memory unstitched path requires the parallel/GPU Pass 2 —
+        # the buffer kwarg only exists there.
+        if use_inmem_unstitched:
+            _pass2_gpu = True
         _pass2_fn = _run_pass2_parallel if _pass2_gpu else _stitch_tiled_labels_pass2
         if _pass2_gpu:
-            print(f"  Using parallel Pass 2 (ORG_SEG_PASS2_GPU=1)")
-        _pass2_fn(
+            print(f"  Using parallel Pass 2 (ORG_SEG_PASS2_GPU=1)"
+                  + (" [inmem buffer]" if use_inmem_unstitched else ""))
+        _pass2_kwargs = dict(
             source_zarr_path=source_zarr_path,
             pos_path=pos_path,
             organelle_name=output_label_name,  # Use the standardized output name
@@ -3260,6 +3459,19 @@ def segment_position_frangi_tiled(
             target_chunks=(1, 1, 1, 512, 512),
             target_shards_ratio=shards_ratio,  # Use shards_ratio passed to this function
         )
+        if use_inmem_unstitched and _pass2_fn is _run_pass2_parallel:
+            _pass2_kwargs["tile_buffer"] = tile_buffer_for_pass2
+        _pass2_fn(**_pass2_kwargs)
+
+        # Release the shm tile buffer now that Pass 2 has consumed it.
+        if shm_block is not None:
+            tile_buffer_for_pass2 = None
+            try:
+                shm_block.close()
+                shm_block.unlink()
+                print(f"  [inmem] released shm tile buffer")
+            except Exception as _shm_e:
+                print(f"  [inmem] shm cleanup warning: {_shm_e}")
 
         # Build and update metadata for the segmentation labels
         # Use organelle_name as channel_label (it often contains "organelle, marker" info)
