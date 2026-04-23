@@ -2506,7 +2506,24 @@ def _run_pass2_parallel(
     use_buffer = tile_buffer is not None
     if use_buffer:
         # Buffer implies tile cache (tile lives in RAM, H2D is cheap).
+        # The orchestrator already guaranteed VRAM is sufficient when it
+        # decided to pass a tile_buffer, so no need to re-check here.
         use_tile_cache = use_tile_cache or _GPU_AVAILABLE
+    elif use_tile_cache:
+        # No buffer (classic zarr path) but user asked for tile cache.
+        # Guard against OOM on smaller GPUs — the orchestrator's VRAM
+        # check only fires for the shm path.
+        cp = _cp
+        tile_cache_bytes = n_tiles_total * (tile_size - tile_overlap) ** 2 * 4
+        required_bytes = tile_cache_bytes + 15 * (1024 ** 3)
+        try:
+            _, total_bytes = cp.cuda.Device().mem_info
+            if total_bytes < required_bytes:
+                print(f"    [Pass 2] tile cache needs ~{required_bytes / 2**30:.1f} GB "
+                      f"VRAM but GPU has {total_bytes / 2**30:.1f} GB; disabling.")
+                use_tile_cache = False
+        except Exception as _e:
+            print(f"    [Pass 2] VRAM probe failed ({_e}); leaving tile_cache on")
 
     print(f"  Pass 2 (parallel): {n_tiles_total} tiles, reads={n_read}, apply={n_apply}, "
           f"gpu_lut={use_gpu_lut}, tile_cache={use_tile_cache}, buffer={use_buffer}")
@@ -3028,6 +3045,17 @@ def segment_position_frangi_tiled(
         # - Eigenvalues/vectors: ~256 MB
         # - scipy intermediate arrays: ~500 MB
         # - Total peak per worker: ~2-3 GB
+        # LoG blob detection is not supported by the GPU-pipelined Pass 1
+        # driver (which is Frangi-only). Route blob methods to the CPU
+        # joblib path where `_process_single_frangi_tile` calls
+        # `_segment_blob_log` per tile. When ORG_SEG_BLOB_GPU=1, that
+        # per-tile function internally does the LoG on GPU via cupy.
+        _is_blob_method = (nucleoli_method == "blob") or (vesicular_method == "blob")
+        if _is_blob_method and use_gpu:
+            print("  [NOTE] blob detection method — routing to CPU joblib path "
+                  "(per-tile blob_log runs on GPU if ORG_SEG_BLOB_GPU=1)")
+            use_gpu = False
+
         if use_gpu:
             if not _GPU_AVAILABLE:
                 print("  [WARN] use_gpu=True but cupy/cucim unavailable; falling back to CPU")
@@ -3080,17 +3108,55 @@ def segment_position_frangi_tiled(
         # routes `core_vesselness` to the vesselness zarr regardless. Only
         # the *labels* stream moves to shm. Pass 3 mask-erosion isn't wired
         # into the parallel Pass 2 yet, so keep that precondition.
+        #
+        # VRAM requirement: shm path → Pass 2 tile cache holds all tile
+        # bodies on GPU (~n_ty × n_tx × step² × 4 bytes = ~40 GB for a
+        # 100k² image). Plus LUT + remap working set + Pass 1 residuals,
+        # total peak is ~55 GB. Safe on H100 (80 GB) / H200 (140 GB) /
+        # A100-80GB. OOMs on 40-48 GB GPUs (A40, L40S, A100-40GB, A6000).
+        # Auto-detect and fall back to the zarr unstitched path when the
+        # visible GPU has less than the required VRAM — keeps the feature
+        # flag-on by default without breaking smaller-GPU deployments.
+        _step_local = tile_size - tile_overlap
+        tile_cache_bytes = n_tiles_y * n_tiles_x * (_step_local ** 2) * 4
+        required_bytes = tile_cache_bytes + 15 * (1024 ** 3)  # +15 GB headroom
+        _vram_ok = True
+        _total_vram_gb = None
+        if effective_use_gpu and os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1":
+            try:
+                import cupy as _cp_probe
+                _, total_bytes = _cp_probe.cuda.Device().mem_info
+                _total_vram_gb = total_bytes / (1024 ** 3)
+                if total_bytes < required_bytes:
+                    _vram_ok = False
+            except Exception as _e:
+                print(f"  [inmem] could not query GPU VRAM ({_e}); disabling shm path")
+                _vram_ok = False
+
         use_inmem_unstitched = (
             os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1"
             and effective_use_gpu
             and num_workers > 1
             and not preview_mode
             and not input_mask_name  # Pass 3 mask erosion not wired for shm path
+            and _vram_ok
         )
         if os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1" and not use_inmem_unstitched:
-            print("  [NOTE] ORG_SEG_INMEM_UNSTITCHED=1 requested but preconditions "
-                  "not met (requires GPU multi-worker, no preview, no input_mask_name). "
-                  "Falling back to zarr unstitched path.")
+            reason_bits = []
+            if not effective_use_gpu or num_workers <= 1:
+                reason_bits.append("requires GPU multi-worker")
+            if preview_mode:
+                reason_bits.append("preview_mode active")
+            if input_mask_name:
+                reason_bits.append("input_mask_name set (Pass 3 not wired)")
+            if not _vram_ok and _total_vram_gb is not None:
+                reason_bits.append(
+                    f"VRAM {_total_vram_gb:.1f} GB < required "
+                    f"{required_bytes / 2**30:.1f} GB"
+                )
+            print(f"  [NOTE] ORG_SEG_INMEM_UNSTITCHED=1 requested but preconditions "
+                  f"not met ({', '.join(reason_bits) or 'unknown'}). "
+                  f"Falling back to zarr unstitched path.")
 
         # Create the output zarr arrays with chunking matching tile size
         # Optionally also create vesselness (float32) array if save_vesselness=True

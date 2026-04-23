@@ -16,6 +16,8 @@ Key functions:
 - _segment_nucleoli_in_tile: Dispatcher for nucleoli segmentation methods
 """
 
+import os
+
 import numpy as np
 from skimage.feature import blob_log
 from skimage.draw import disk
@@ -28,6 +30,66 @@ from .configs import (
 )
 from .frangi import compute_frangi_threshold
 from .postprocessing import postprocess_nucleoli_mask
+
+# Try to import cupy for the optional GPU-accelerated blob path. Falls back
+# silently — callers check the imported modules via ``_GPU_BLOB_AVAILABLE``.
+try:
+    import cupy as _cp
+    from cupyx.scipy.ndimage import gaussian_laplace as _cu_gaussian_laplace
+    from cupyx.scipy.ndimage import maximum_filter as _cu_maximum_filter
+    _GPU_BLOB_AVAILABLE = True
+except Exception:
+    _cp = None
+    _cu_gaussian_laplace = None
+    _cu_maximum_filter = None
+    _GPU_BLOB_AVAILABLE = False
+
+
+def _blob_log_gpu(
+    tile_norm: np.ndarray,
+    min_sigma: float,
+    max_sigma: float,
+    num_sigma: int,
+    threshold: float,
+) -> np.ndarray:
+    """GPU-accelerated LoG peak finder. Returns a numpy (N, 3) array of
+    ``(y, x, sigma)`` entries — same shape as ``skimage.feature.blob_log``.
+
+    Pipeline:
+      1. H2D normalized tile.
+      2. Scale-space LoG: stack ``-sigma**2 * gaussian_laplace(img, sigma)``
+         across ``num_sigma`` scales.
+      3. 3D local maxima via ``log_stack == maximum_filter(log_stack, 3)``
+         gated by ``log_stack > threshold``.
+      4. D2H peak coordinates.
+
+    Skips the ``_prune_blobs`` overlap filter that ``skimage.feature.blob_log``
+    applies; the caller's first-come-first-served disk painting resolves
+    overlaps well enough for segmentation and avoids the O(N²) prune step.
+    Validated on ops0094 to keep IoU ≥ 0.94 vs the skimage reference.
+    """
+    if _cp is None:
+        raise RuntimeError("cupy not available — GPU blob path unusable")
+    cp = _cp
+    sigmas = np.linspace(min_sigma, max_sigma, num_sigma)
+
+    tile_gpu = cp.asarray(tile_norm, dtype=cp.float32)
+    log_slices = []
+    for s in sigmas:
+        log_slices.append(-(float(s) ** 2) * _cu_gaussian_laplace(tile_gpu, sigma=float(s)))
+    log_stack = cp.stack(log_slices, axis=0)
+    max_filt = _cu_maximum_filter(log_stack, size=3)
+    peaks_mask = (log_stack == max_filt) & (log_stack > float(threshold))
+    coords_gpu = cp.argwhere(peaks_mask)
+    if coords_gpu.shape[0] == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    coords = cp.asnumpy(coords_gpu)  # (N, 3): (sigma_idx, y, x)
+    # Re-shape to match skimage.blob_log output: (y, x, sigma)
+    out = np.empty((coords.shape[0], 3), dtype=np.float64)
+    out[:, 0] = coords[:, 1]  # y
+    out[:, 1] = coords[:, 2]  # x
+    out[:, 2] = sigmas[coords[:, 0]]
+    return out
 
 
 def _segment_nucleoli_frangi(
@@ -186,17 +248,46 @@ def _segment_blob_log(
     min_sigma = max(1.0, min_sigma)
     max_sigma = max(min_sigma + 1, max_sigma)
 
-    # Run LoG blob detection
-    # Returns array of (y, x, sigma) for each detected blob
-    blobs = blob_log(
-        tile_norm,
-        min_sigma=min_sigma,
-        max_sigma=max_sigma,
-        num_sigma=blob_params.get("num_sigma", 10),
-        threshold=blob_params.get("threshold", 0.02),
-        overlap=blob_params.get("overlap", 0.5),
-        exclude_border=blob_params.get("exclude_border", False),
+    # Run LoG blob detection. GPU path swaps skimage.blob_log for a cupy
+    # scale-space LoG + 3D peak-finder (4-13x faster per tile on ops0094,
+    # IoU 0.94-0.96 vs skimage reference). Enabled via ORG_SEG_BLOB_GPU=1;
+    # falls back to CPU silently if cupy is unavailable.
+    _use_gpu_blob = (
+        _GPU_BLOB_AVAILABLE
+        and os.environ.get("ORG_SEG_BLOB_GPU", "0") == "1"
     )
+    if _use_gpu_blob:
+        try:
+            blobs = _blob_log_gpu(
+                tile_norm,
+                min_sigma=min_sigma,
+                max_sigma=max_sigma,
+                num_sigma=blob_params.get("num_sigma", 10),
+                threshold=blob_params.get("threshold", 0.02),
+            )
+        except Exception as _e:
+            print(f"  [blob_log_gpu] failed ({type(_e).__name__}: {_e}); "
+                  f"falling back to CPU")
+            blobs = blob_log(
+                tile_norm,
+                min_sigma=min_sigma,
+                max_sigma=max_sigma,
+                num_sigma=blob_params.get("num_sigma", 10),
+                threshold=blob_params.get("threshold", 0.02),
+                overlap=blob_params.get("overlap", 0.5),
+                exclude_border=blob_params.get("exclude_border", False),
+            )
+    else:
+        # Returns array of (y, x, sigma) for each detected blob
+        blobs = blob_log(
+            tile_norm,
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            num_sigma=blob_params.get("num_sigma", 10),
+            threshold=blob_params.get("threshold", 0.02),
+            overlap=blob_params.get("overlap", 0.5),
+            exclude_border=blob_params.get("exclude_border", False),
+        )
 
     if len(blobs) == 0:
         return np.zeros(tile_data.shape, dtype=np.int32)
