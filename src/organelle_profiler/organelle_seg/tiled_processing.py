@@ -69,6 +69,65 @@ def _bump_gpu_phase_timer(name: str, seconds: float) -> None:
     _GPU_PHASE_TIMERS[name] = _GPU_PHASE_TIMERS.get(name, 0.0) + seconds
 
 
+# -----------------------------------------------------------------------------
+# Detailed per-phase timing — opt-in via ORG_SEG_DETAILED_TIMING=1. Host-side
+# timers measure Python/dispatch wall time in the main loop; CUDA events
+# measure GPU-side time without blocking the host.
+# -----------------------------------------------------------------------------
+_DETAILED_HOST_TIMERS: dict[str, float] = {}
+_DETAILED_GPU_MS: dict[str, float] = {}
+_DETAILED_TILES_SEEN: int = 0
+
+
+def _detailed_timing_enabled() -> bool:
+    return os.environ.get("ORG_SEG_DETAILED_TIMING", "0") == "1"
+
+
+def _reset_detailed_timers() -> None:
+    _DETAILED_HOST_TIMERS.clear()
+    _DETAILED_GPU_MS.clear()
+    global _DETAILED_TILES_SEEN
+    _DETAILED_TILES_SEEN = 0
+
+
+def _bump_detailed_host(name: str, seconds: float) -> None:
+    _DETAILED_HOST_TIMERS[name] = _DETAILED_HOST_TIMERS.get(name, 0.0) + seconds
+
+
+def _bump_detailed_gpu_ms(name: str, ms: float) -> None:
+    _DETAILED_GPU_MS[name] = _DETAILED_GPU_MS.get(name, 0.0) + ms
+
+
+def _record_detailed_tile() -> None:
+    global _DETAILED_TILES_SEEN
+    _DETAILED_TILES_SEEN += 1
+
+
+def _print_detailed_timers(pass1_wall_sec: float) -> None:
+    if not _DETAILED_HOST_TIMERS and not _DETAILED_GPU_MS:
+        return
+    n = max(1, _DETAILED_TILES_SEEN)
+    pw_ms = pass1_wall_sec * 1000
+    wall_per_tile_ms = pw_ms / n
+    print(f"  [DETAILED TIMING] per-tile average over {n} tiles (wall {wall_per_tile_ms:.2f} ms/tile):")
+    print(f"    Host-side (main thread in _run_pass1_gpu_pipelined):")
+    for k, total in sorted(_DETAILED_HOST_TIMERS.items(), key=lambda kv: -kv[1]):
+        per = (total * 1000) / n
+        share = 100 * per / wall_per_tile_ms if wall_per_tile_ms > 0 else 0.0
+        print(f"      {k:<24} {per:7.2f} ms/tile  ({total:6.1f}s total, {share:5.1f}% of wall)")
+    print(f"    GPU-side (CUDA events inside _compute_tile_batch_on_gpu_streams):")
+    for k, total_ms in sorted(_DETAILED_GPU_MS.items(), key=lambda kv: -kv[1]):
+        per = total_ms / n
+        share = 100 * per / wall_per_tile_ms if wall_per_tile_ms > 0 else 0.0
+        print(f"      {k:<24} {per:7.2f} ms/tile  ({total_ms/1000:6.1f}s total, {share:5.1f}% of wall)")
+    # Summary: GPU-side sum vs wall — if GPU<<wall, main thread is blocking on
+    # something other than GPU (Python, IPC, pool contention).
+    gpu_sum_per_tile = sum(_DETAILED_GPU_MS.values()) / n
+    host_sum_per_tile = sum(_DETAILED_HOST_TIMERS.values()) * 1000 / n
+    print(f"    Summary: GPU total {gpu_sum_per_tile:.2f} ms/tile, Host total {host_sum_per_tile:.2f} ms/tile, wall {wall_per_tile_ms:.2f} ms/tile")
+    print(f"      → If host+GPU > wall, they overlap; if host ≈ wall and GPU < host, we're CPU-bound.")
+
+
 def _print_gpu_phase_timers(total_wall_sec: float) -> None:
     if not _GPU_PHASE_TIMERS:
         return
@@ -1062,10 +1121,26 @@ def _compute_tile_batch_on_gpu_streams(
     clp_kernel = (clahe_params or {}).get("kernel_size", None)
 
     gpu_outputs = [None] * N
+    # Detailed timing via CUDA events — zero host-sync overhead (we read times
+    # after all streams have synced at the end of the batch).
+    detailed = _detailed_timing_enabled()
+    event_markers: list[dict] = [{} for _ in range(N)]
 
     # Launch compute on each stream
     for i, (ti, td_np, mk_np) in enumerate(bundles):
         with streams[i]:
+            ems = event_markers[i]
+            if detailed:
+                ems["h2d_start"] = cp.cuda.Event(disable_timing=False)
+                ems["h2d_end"] = cp.cuda.Event(disable_timing=False)
+                ems["clahe_end"] = cp.cuda.Event(disable_timing=False)
+                ems["smooth_end"] = cp.cuda.Event(disable_timing=False)
+                ems["frangi_end"] = cp.cuda.Event(disable_timing=False)
+                ems["threshold_end"] = cp.cuda.Event(disable_timing=False)
+                ems["postprocess_end"] = cp.cuda.Event(disable_timing=False)
+                ems["label_end"] = cp.cuda.Event(disable_timing=False)
+                ems["h2d_start"].record()
+
             # H2D
             tile_data = cp.asarray(td_np, dtype=cp.float32)
             if mk_np is not None:
@@ -1077,6 +1152,8 @@ def _compute_tile_batch_on_gpu_streams(
                     mk_np = new_mask
                 mask_gpu = cp.asarray(mk_np) > 0
                 tile_data = cp.where(mask_gpu, tile_data, cp.float32(0.0))
+            if detailed:
+                ems["h2d_end"].record()
 
             # CLAHE — normalize to [0,1] then equalize. Use cp.where for rng
             # guard so we never sync with host.
@@ -1089,18 +1166,26 @@ def _compute_tile_batch_on_gpu_streams(
                 tile_data = _cu_equalize_adapthist(
                     tile_norm, kernel_size=clp_kernel, clip_limit=clp_clip,
                 ).astype(cp.float32)
+            if detailed:
+                ems["clahe_end"].record()
 
             # Post-CLAHE smoothing
             if post_clahe_smoothing_sigma and post_clahe_smoothing_sigma > 0:
                 tile_data = cp_ndi.gaussian_filter(tile_data, sigma=post_clahe_smoothing_sigma)
+            if detailed:
+                ems["smooth_end"].record()
 
             # Frangi
             vesselness_map = _cu_frangi(
                 tile_data, sigmas=sigmas, black_ridges=black_ridges,
             ).astype(cp.float32)
+            if detailed:
+                ems["frangi_end"].record()
 
             # Threshold (fixed; dynamic would require host sync)
             binary_mask = vesselness_map > fixed_threshold
+            if detailed:
+                ems["threshold_end"].record()
 
             # Postprocess (tubular-focused; safe to no-op on empty masks)
             if do_postprocess and is_tubular:
@@ -1120,6 +1205,8 @@ def _compute_tile_batch_on_gpu_streams(
                         small_ids = cp.where(areas[1:] < pp_min_size)[0] + 1
                         drop = cp.isin(lab_tmp, small_ids)
                         binary_mask = cp.where(drop, cp.bool_(False), lab_tmp > 0)
+            if detailed:
+                ems["postprocess_end"].record()
 
             # Final label pass
             footprint = cp_ndi.generate_binary_structure(binary_mask.ndim, 1)
@@ -1132,6 +1219,8 @@ def _compute_tile_batch_on_gpu_streams(
                     labeled_mask = cp.where(drop, cp.int32(0), labeled_mask.astype(cp.int32))
                     labeled_mask, _ = cp_ndi.label(labeled_mask > 0, structure=footprint)
             labeled_mask = labeled_mask.astype(cp.int32)
+            if detailed:
+                ems["label_end"].record()
 
             # Compute core region coords (host-side, no sync)
             ty, tx = ti["ty"], ti["tx"]
@@ -1162,6 +1251,21 @@ def _compute_tile_batch_on_gpu_streams(
     # Wait for every stream — this is the only global barrier per batch
     for s in streams:
         s.synchronize()
+
+    # After stream sync, read GPU-event deltas (each cp.cuda.Event.get_elapsed_time
+    # returns ms between two events on the same stream).
+    if detailed:
+        for ems in event_markers:
+            if not ems:
+                continue
+            _bump_detailed_gpu_ms("gpu_h2d",         float(cp.cuda.get_elapsed_time(ems["h2d_start"], ems["h2d_end"])))
+            _bump_detailed_gpu_ms("gpu_clahe",       float(cp.cuda.get_elapsed_time(ems["h2d_end"], ems["clahe_end"])))
+            _bump_detailed_gpu_ms("gpu_smooth",      float(cp.cuda.get_elapsed_time(ems["clahe_end"], ems["smooth_end"])))
+            _bump_detailed_gpu_ms("gpu_frangi",      float(cp.cuda.get_elapsed_time(ems["smooth_end"], ems["frangi_end"])))
+            _bump_detailed_gpu_ms("gpu_threshold",   float(cp.cuda.get_elapsed_time(ems["frangi_end"], ems["threshold_end"])))
+            _bump_detailed_gpu_ms("gpu_postprocess", float(cp.cuda.get_elapsed_time(ems["threshold_end"], ems["postprocess_end"])))
+            _bump_detailed_gpu_ms("gpu_label",       float(cp.cuda.get_elapsed_time(ems["postprocess_end"], ems["label_end"])))
+            _record_detailed_tile()
 
     # D2H on main thread (streams are done)
     cpu_results = []
@@ -1301,6 +1405,8 @@ def _run_pass1_gpu_pipelined(
           f"prefetch_depth={prefetch_depth}, gpu_batch={batch_size}")
 
     _reset_gpu_phase_timers()
+    _reset_detailed_timers()
+    detailed = _detailed_timing_enabled()
 
     # Open source and output zarr handles ONCE per worker using raw zarr
     # (skipping iohub's OME-NGFF metadata parsing — we only need the arrays at
@@ -1355,8 +1461,13 @@ def _run_pass1_gpu_pipelined(
         # How many tiles this iteration will consume
         batch_n = min(batch_size, n_total - i)
 
+        # Track per-iteration wall-clock so we can decompose where the main
+        # thread spends time when ORG_SEG_DETAILED_TIMING=1.
+        iter_t0 = time.monotonic() if detailed else None
+
         # 1) Pull `batch_n` pre-read tiles (block on reader threads)
         bundles = []
+        t_pull_start = time.monotonic() if detailed else None
         for _ in range(batch_n):
             curr_info, curr_future = prefetch_q.popleft()
             t0 = time.monotonic()
@@ -1371,6 +1482,8 @@ def _run_pass1_gpu_pipelined(
                     source_image_array, input_mask_array,
                 )))
                 next_read_idx += 1
+        if detailed:
+            _bump_detailed_host("host_read_pull", (time.monotonic() - t_pull_start))
 
         # 2) GPU compute — route everything through the batch function. At
         # batch_size=1 it's "single tile with no mid-pipeline host syncs";
@@ -1379,6 +1492,7 @@ def _run_pass1_gpu_pipelined(
         # every phase, which blocks kernel pipelining and leaves the SM idle
         # in the gaps. We pay the "no per-phase timing" cost for better throughput.
         try:
+            t_compute_start = time.monotonic() if detailed else None
             use_single_tile_with_timers = (
                 os.environ.get("ORG_SEG_PHASE_TIMERS", "0") == "1" and batch_size == 1
             )
@@ -1410,8 +1524,11 @@ def _run_pass1_gpu_pipelined(
                     save_vesselness=save_vesselness,
                     tile_overlap=tile_overlap,
                 )
+            if detailed:
+                _bump_detailed_host("host_compute_call", (time.monotonic() - t_compute_start))
 
             # 3) Submit async writes for each tile in the batch
+            t_write_start = time.monotonic() if detailed else None
             for ti, core_labels, core_vesselness, debug_labels, debug_vesselness in batch_results:
                 if len(write_futures) >= prefetch_depth:
                     t0 = time.monotonic()
@@ -1440,6 +1557,18 @@ def _run_pass1_gpu_pipelined(
             for ti, _td, _mk in bundles:
                 all_results.append({"tile_info": ti, "success": False})
 
+        if detailed:
+            _bump_detailed_host("host_write_submit", (time.monotonic() - t_write_start))
+            iter_dt = time.monotonic() - iter_t0
+            # "loop overhead" = iter wall minus the three tracked host sections.
+            overhead = iter_dt - (
+                _DETAILED_HOST_TIMERS.get("host_read_pull", 0) / (1 if i == 0 else 1)
+            )
+            # Rather than subtract accumulators (messy), track the slack
+            # separately: time between end-of-write-submit and end-of-iter.
+            # We'll record it implicitly by summing iter_dt and reconciling.
+            _bump_detailed_host("host_iter_total", iter_dt)
+
         pbar.update(batch_n)
         i += batch_n
     pbar.close()
@@ -1460,6 +1589,9 @@ def _run_pass1_gpu_pipelined(
     print(f"    read_wait      {read_wait_total:7.1f}s  ({100 * read_wait_total / pass1_wall:5.1f}% of wall) — time blocked on tile reads")
     print(f"    write_q_wait   {write_queue_wait_total:7.1f}s  ({100 * write_queue_wait_total / pass1_wall:5.1f}% of wall) — time blocked draining write queue mid-run")
     print(f"    write_drain    {drain_wall:7.1f}s  ({100 * drain_wall / pass1_wall:5.1f}% of wall) — end-of-pass write drain")
+    if detailed:
+        _print_detailed_timers(pass1_wall)
+    _print_gpu_phase_timers(pass1_wall)
     return all_results, pass1_wall
 
 
@@ -1502,6 +1634,34 @@ def _worker_pipelined_pass1(
         from organelle_profiler.organelle_seg.tiled_processing import (
             _run_pass1_gpu_pipelined,
         )
+
+        # Optional: switch to CUDA's stream-ordered async memory pool
+        # (cudaMallocAsync). Allocations become stream-local, so N concurrent
+        # streams don't serialize on CuPy's default pool lock. Requires
+        # CUDA 11.2+ and CuPy with async-pool support.
+        if os.environ.get("ORG_SEG_ASYNC_POOL", "0") == "1":
+            try:
+                import cupy as cp
+                cp.cuda.set_allocator(cp.cuda.MemoryAsyncPool().malloc)
+                print(f"  [worker {worker_id}] using cudaMallocAsync pool (stream-ordered)")
+            except Exception as e:
+                print(f"  [worker {worker_id}] MemoryAsyncPool setup failed, using default pool: {e}")
+
+        # Optional: stagger worker starts to desync their GPU pipelines. The
+        # hope is that one worker is in an HBM-heavy phase (CLAHE histogram or
+        # interpolation) while another is in compute-heavy phase (CDF), so
+        # bandwidth contention is less severe. In steady state workers
+        # naturally desync from per-tile timing variation, so this mainly
+        # affects early batches.
+        try:
+            stagger_ms = int(os.environ.get("ORG_SEG_WORKER_STAGGER_MS", "0"))
+        except ValueError:
+            stagger_ms = 0
+        if stagger_ms > 0 and worker_id > 0:
+            delay_s = worker_id * stagger_ms / 1000.0
+            print(f"  [worker {worker_id}] staggered start delay: {delay_s:.3f}s")
+            import time as _t
+            _t.sleep(delay_s)
 
         print(f"  [worker {worker_id}] starting with {len(tile_infos_partition)} tiles, pid={os.getpid()}")
         _run_pass1_gpu_pipelined(
@@ -2359,6 +2519,7 @@ def segment_position_frangi_tiled(
         print(f"  Pass 1 complete: {total_tiles} tiles written to zarr in {pass1_wall:.1f}s")
         if effective_use_gpu:
             _print_gpu_phase_timers(pass1_wall)
+            _print_detailed_timers(pass1_wall)
 
         # Profile hook: let iteration skip Pass 2/resharding/pyramid entirely.
         # The unstitched labels at "<label>_unstitched" are left on disk; the
