@@ -492,33 +492,129 @@ _EXPERIMENT_CONFIGS_CACHE = {}
 _CHANNEL_LABELS_CACHE = {}
 
 
-def load_experiment_configs(experiment: str, config_path: str = None) -> dict:
+def _extract_marker_from_label(label):
+    """Derive the marker id from a channel label (mirrors _extract_seg_params.py).
+
+    Rules:
+    - 'Phase' / bare 'no label' / 'empty' -> None (not real reporters).
+    - 'A, B' -> marker is B (post-last-comma token).
+    - Post-comma 'no label' -> fall back to pre-comma (preserves
+      'bleedthrough' / 'autofluorescence' dim-signal references).
+    - single-word label -> use as-is.
+    - Common dye/excitation suffixes stripped.
+    - Whitespace inside the marker token is folded to '_'.
+    """
+    import re as _re
+    if not isinstance(label, str):
+        return None
+    label = label.strip()
+    if not label:
+        return None
+    low = label.lower()
+    if low == "phase":
+        return None
+    if low in ("no label", "empty", "empty, no label"):
+        return None
+    if "," in label:
+        pre, tail = label.rsplit(",", 1)
+        pre = pre.strip()
+        tail = tail.strip()
+        if tail.lower() in ("no label", ""):
+            tail = pre
+    else:
+        tail = label
+    if tail.lower() == "bleedthough":
+        tail = "bleedthrough"
+    for suf in (
+        " Live Cell Dye", " Live Cell dye", " live Cell dye", " live cell dye",
+        " Live-Cell Dye", " live-cell dye", " Live Cell", " live cell", " excitation",
+    ):
+        if tail.lower().endswith(suf.lower()):
+            tail = tail[: -len(suf)].strip()
+    tail = _re.sub(r"\s+", "_", tail)
+    m = _re.match(r"[A-Za-z0-9_\-]+", tail)
+    if not m:
+        return None
+    marker = m.group(0).strip("_-")
+    return marker or None
+
+
+def _load_marker_seg_params(config_path: str = None) -> dict:
+    """Load org_seg_params.yaml and return {marker: raw_block_list} (the list-of-dicts)."""
+    from pathlib import Path
+    import yaml
+
+    if config_path is None:
+        try:
+            from ops_utils.data.experiment import OpsDataset
+            dataset = OpsDataset("dummy")
+            config_path = str(dataset.marker_seg_params)
+        except Exception:
+            return {}
+    if not Path(config_path).exists():
+        return {}
+    with open(config_path, "r") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _resolve_marker_config(marker: str, experiment: str, marker_params: dict):
+    """Return the segmentation_config for this (marker, experiment), or {} if none.
+
+    Handles both `segmentation_config` and per-experiment `segmentation_config_variants`.
+    Falls back to any variant if the specific experiment isn't listed.
+    """
+    block = marker_params.get(marker)
+    if not block:
+        return None
+    seg_cfg = None
+    variants = None
+    for item in block if isinstance(block, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if "segmentation_config" in item:
+            seg_cfg = item["segmentation_config"]
+        if "segmentation_config_variants" in item:
+            variants = item["segmentation_config_variants"] or {}
+    if variants:
+        from ops_utils.data.filesystem import extract_ops_key
+        ops_key = extract_ops_key(experiment) or experiment
+        # Try the experiment's own variant first, then the ops key, else any variant
+        for k in (experiment, ops_key):
+            if k and k in variants:
+                return variants[k]
+        # Fallback: lexicographically-latest experiment's variant
+        if variants:
+            latest = sorted(variants.keys())[-1]
+            return variants[latest]
+    return seg_cfg
+
+
+def load_experiment_configs(experiment: str, config_path: str = None,
+                             marker_params_path: str = None) -> dict:
     """
     Load experiment-specific segmentation config overrides from YAML.
 
-    The YAML file can include:
-    1. Per-channel 'segmentation_config' for standard channels (list format)
-    2. Additional metadata sections at experiment level (dict format, e.g., cell_painting)
+    The primary source is org_seg_params.yaml (keyed by marker, shared across
+    experiments). For each channel in ops_channel_maps.yaml, we extract the marker
+    from its label and look up the config by marker. If the marker is missing from
+    org_seg_params.yaml or the label has no extractable marker, we fall back to a
+    channel-map-embedded `segmentation_config` (legacy path, to be removed once all
+    configs are migrated).
 
     Args:
         experiment: Experiment name (e.g., "ops0033")
         config_path: Path to ops_channel_maps.yaml. If None, uses OpsDataset.channel_maps.
+        marker_params_path: Path to org_seg_params.yaml. If None, uses
+            OpsDataset.marker_seg_params.
 
     Returns:
-        Dict mapping channel_name -> {"frangi": {...}, "clahe": {...}, "blob": {...}}
-        where each sub-dict contains only the override parameters.
-        Includes additional channels from metadata sections if enabled.
-
-    Example YAML structure:
-        ops0033:
-          - channel_name: GFP
-            segmentation_config:
-              structure_type: tubular
-              frangi:
-                pixel_size_um: 0.185
+        Dict mapping channel_name -> segmentation_config dict (may be empty = defaults).
 """
     # Check cache first
-    cache_key = (experiment, config_path)
+    cache_key = (experiment, config_path, marker_params_path)
     if cache_key in _EXPERIMENT_CONFIGS_CACHE:
         return _EXPERIMENT_CONFIGS_CACHE[cache_key]
 
@@ -540,6 +636,9 @@ def load_experiment_configs(experiment: str, config_path: str = None) -> dict:
     with open(config_path, 'r') as f:
         channel_maps = yaml.safe_load(f)
 
+    # Load the marker-keyed params (new source of truth)
+    marker_params = _load_marker_seg_params(marker_params_path)
+
     # Extract ops key (e.g., "ops0113" from "ops0113_20260108" or "ops0113")
     from ops_utils.data.filesystem import extract_ops_key
     ops_key = extract_ops_key(experiment)
@@ -557,6 +656,18 @@ def load_experiment_configs(experiment: str, config_path: str = None) -> dict:
     # Parse config
     channel_configs = {}
 
+    def _resolve(channel_name, label, legacy_embedded_cfg):
+        """Marker lookup first; fall back to legacy per-channel embedded config."""
+        marker = _extract_marker_from_label(label) if label else None
+        if marker:
+            cfg = _resolve_marker_config(marker, experiment, marker_params)
+            if cfg is not None:
+                return cfg
+        # Legacy fallback (pre-migration): embedded segmentation_config in channel map
+        if legacy_embedded_cfg:
+            return legacy_embedded_cfg
+        return {}
+
     if isinstance(exp_config, list):
         # Standard format: list of channel configs
         for channel_entry in exp_config:
@@ -565,23 +676,26 @@ def load_experiment_configs(experiment: str, config_path: str = None) -> dict:
 
             channel_name = channel_entry.get("channel_name")
             if channel_name:
-                # Standard channel entry
-                # Include ALL channels (even without segmentation_config)
-                # Empty dict means use defaults
-                seg_config = channel_entry.get("segmentation_config", {})
-                channel_configs[channel_name] = seg_config
+                label = channel_entry.get("label", "")
+                legacy = channel_entry.get("segmentation_config") or {}
+                channel_configs[channel_name] = _resolve(channel_name, label, legacy)
             elif "cell_painting" in channel_entry:
-                # Cell painting metadata section (nested format)
+                # Cell painting metadata section (nested format).
+                # CP channel names encode the marker in the final underscore token.
                 cell_painting_config = channel_entry.get("cell_painting", {})
                 if cell_painting_config.get("enabled") and "channel_overrides" in cell_painting_config:
-                    # Extract all channel configs from channel_overrides
-                    for ch_name, ch_config in cell_painting_config["channel_overrides"].items():
-                        if isinstance(ch_config, dict):
-                            channel_configs[ch_name] = ch_config
+                    for ch_name, ch_cfg in cell_painting_config["channel_overrides"].items():
+                        if not isinstance(ch_cfg, dict):
+                            continue
+                        cp_marker = ch_name.split("_")[-1] if "_" in ch_name else ch_name
+                        resolved = None
+                        if cp_marker in marker_params:
+                            resolved = _resolve_marker_config(cp_marker, experiment, marker_params)
+                        channel_configs[ch_name] = resolved if resolved is not None else ch_cfg
 
     elif isinstance(exp_config, dict):
         # Dict format (e.g., cell painting with metadata sections)
-        # Look for segmentation_config in each channel entry
+        # Look for segmentation_config in each channel entry (legacy path only)
         for key, value in exp_config.items():
             if isinstance(value, dict) and "segmentation_config" in value:
                 channel_configs[key] = value["segmentation_config"]
