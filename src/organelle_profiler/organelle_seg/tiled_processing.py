@@ -2325,6 +2325,78 @@ def _read_tile_from_buffer_and_push_gpu(
     return ty, tx, local_max, left_col, top_row, right_col, bottom_row, tile_gpu
 
 
+def _phase_b5_mp_worker(
+    worker_id: int,
+    tile_shm_name: str,
+    tile_shm_shape: tuple,
+    lut_shm_name: str,
+    lut_length: int,
+    zarr_store_path: str,
+    labels_component_path: str,
+    step: int,
+    height: int,
+    width: int,
+    partition: list,  # list of (ty, tx, global_offset, local_max)
+) -> None:
+    """Phase B.5 worker process for multiprocessing path.
+
+    Attaches to the shm tile buffer and a shm-backed LUT, opens its own
+    zarr handle, and applies the remap to its partition of tiles. Each
+    worker has its own fresh CUDA context so GPU work on different
+    workers truly parallelizes across streams.
+
+    Writes land in disjoint shards (tile→chunk is 1:1) so there's no
+    write contention between workers.
+    """
+    import sys, traceback
+    try:
+        import numpy as _np
+        import cupy as _cp
+        import zarr as _zarr
+        from multiprocessing import shared_memory as _shm
+
+        tile_shm = _shm.SharedMemory(name=tile_shm_name)
+        lut_shm = _shm.SharedMemory(name=lut_shm_name)
+        try:
+            tile_buffer = _np.ndarray(tile_shm_shape, dtype=_np.int32, buffer=tile_shm.buf)
+            lut_cpu = _np.ndarray((lut_length,), dtype=_np.int32, buffer=lut_shm.buf)
+            lut_gpu = _cp.asarray(lut_cpu)
+
+            arr = _zarr.open(zarr_store_path, mode="r+")[labels_component_path]
+
+            for ty, tx, global_offset, local_max in partition:
+                if local_max == 0:
+                    continue
+                y_start = ty * step
+                x_start = tx * step
+                y_end = min((ty + 1) * step, height)
+                x_end = min((tx + 1) * step, width)
+                h = y_end - y_start
+                w = x_end - x_start
+
+                tile_cpu = tile_buffer[ty, tx, :h, :w]
+                if not tile_cpu.flags.c_contiguous:
+                    tile_cpu = _np.ascontiguousarray(tile_cpu)
+                tile_gpu = _cp.asarray(tile_cpu)
+                nonzero = tile_gpu > 0
+                global_idx = _cp.where(
+                    nonzero,
+                    tile_gpu + _np.int32(global_offset),
+                    _np.int32(0),
+                )
+                remapped = lut_gpu[global_idx]
+                out_cpu = _cp.asnumpy(remapped)
+                arr[0, 0, 0, y_start:y_end, x_start:x_end] = out_cpu
+        finally:
+            del tile_buffer, lut_cpu
+            tile_shm.close()
+            lut_shm.close()
+    except Exception:
+        print(f"  [phase_b5 worker {worker_id}] FAILED:")
+        traceback.print_exc()
+        sys.exit(1)
+
+
 def _apply_lut_from_gpu_cache(
     labels_arr,
     ty: int,
@@ -2383,6 +2455,7 @@ def _run_pass2_parallel(
     target_chunks: tuple = (1, 1, 1, 512, 512),
     target_shards_ratio: tuple = (1, 1, 1, 32, 32),
     tile_buffer: np.ndarray = None,
+    tile_buffer_shm_name: str = None,
 ) -> int:
     """Parallel Pass 2: two-phase stitching without the per-tile
     read-offset-write cycle that made the original serial.
@@ -2623,37 +2696,108 @@ def _run_pass2_parallel(
             cp = _cp
             lut_gpu = cp.asarray(lut_cpu)
 
-        print(f"    Phase B.5: applying LUT to {n_tiles_total} tiles in parallel...")
-        with ThreadPoolExecutor(max_workers=n_apply, thread_name_prefix="p2_apply") as pool:
-            if use_tile_cache:
-                # Tiles are already in VRAM — skip NFS read, just remap + write.
-                futures = []
-                for (ty, tx) in tile_list:
-                    tid = tile_id(ty, tx)
-                    futures.append(pool.submit(
-                        _apply_lut_from_gpu_cache,
-                        labels_arr, ty, tx, step, height, width,
-                        int(global_offset[tid]),
-                        int(local_max[tid]),
-                        tiles_on_gpu.pop(tid),  # transfer ownership; free after worker done
-                        lut_gpu,
-                    ))
-            else:
-                futures = [
-                    pool.submit(
-                        _apply_global_lut_to_tile,
-                        labels_arr, ty, tx, step, height, width,
-                        int(global_offset[tile_id(ty, tx)]),
-                        lut_cpu, lut_gpu,
-                    )
+        # Phase B.5 has three backends:
+        #  * multiprocessing (ORG_SEG_PASS2_MP_APPLY=1 + shm buffer):
+        #    each worker process has its own CUDA context + default
+        #    stream + zarr/NFS handles. Separate streams parallelize the
+        #    GPU remap that threads can't escape (CuPy default stream is
+        #    per-process).
+        #  * threaded tile-cache: tiles in parent GPU memory, one default
+        #    cupy stream serializes remaps, writes parallel.
+        #  * threaded read-from-zarr: original fallback.
+        use_mp_apply = (
+            use_buffer
+            and tile_buffer_shm_name is not None
+            and os.environ.get("ORG_SEG_PASS2_MP_APPLY", "0") == "1"
+        )
+        if use_mp_apply:
+            import multiprocessing as _mp_mod
+            from concurrent.futures import ProcessPoolExecutor
+            from multiprocessing import shared_memory as _shm_mod
+
+            n_mp = int(os.environ.get("ORG_SEG_PASS2_MP_WORKERS", "8"))
+            print(f"    Phase B.5 (multiprocessing): {n_mp} worker processes, "
+                  f"each with its own CUDA context")
+
+            # LUT into shm so workers read it without 280 MB × N pickles.
+            lut_shm = _shm_mod.SharedMemory(create=True, size=lut_cpu.nbytes)
+            try:
+                lut_shm_view = np.ndarray(lut_cpu.shape, dtype=lut_cpu.dtype,
+                                          buffer=lut_shm.buf)
+                lut_shm_view[:] = lut_cpu[:]
+
+                # Free parent's GPU tile cache before spawning — each
+                # worker allocates its own 5.5 GB partition of tiles.
+                if use_tile_cache:
+                    tiles_on_gpu.clear()
+                    _cp.get_default_memory_pool().free_all_blocks()
+
+                all_entries = [
+                    (ty, tx,
+                     int(global_offset[tile_id(ty, tx)]),
+                     int(local_max[tile_id(ty, tx)]))
                     for (ty, tx) in tile_list
                 ]
-            for fut in tqdm(futures, desc="    Phase B.5 apply", total=len(futures)):
-                fut.result()
-        if use_tile_cache:
-            # Drop any lingering refs so cupy can reclaim VRAM immediately.
-            tiles_on_gpu.clear()
-            _cp.get_default_memory_pool().free_all_blocks()
+                partitions = [all_entries[i::n_mp] for i in range(n_mp)]
+                labels_component_path = f"{pos_path}/labels/{organelle_name}/0"
+
+                ctx = _mp_mod.get_context("spawn")
+                with ProcessPoolExecutor(max_workers=n_mp, mp_context=ctx) as pool:
+                    futures = [
+                        pool.submit(
+                            _phase_b5_mp_worker,
+                            wid,
+                            tile_buffer_shm_name,
+                            tile_buffer.shape,
+                            lut_shm.name,
+                            int(lut_cpu.size),
+                            source_zarr_path,
+                            labels_component_path,
+                            step,
+                            height,
+                            width,
+                            part,
+                        )
+                        for wid, part in enumerate(partitions)
+                    ]
+                    for fut in tqdm(futures, desc="    Phase B.5 mp apply",
+                                    total=len(futures)):
+                        fut.result()
+            finally:
+                lut_shm.close()
+                lut_shm.unlink()
+        else:
+            print(f"    Phase B.5: applying LUT to {n_tiles_total} tiles in parallel...")
+            with ThreadPoolExecutor(max_workers=n_apply, thread_name_prefix="p2_apply") as pool:
+                if use_tile_cache:
+                    # Tiles are already in VRAM — skip NFS read, just remap + write.
+                    futures = []
+                    for (ty, tx) in tile_list:
+                        tid = tile_id(ty, tx)
+                        futures.append(pool.submit(
+                            _apply_lut_from_gpu_cache,
+                            labels_arr, ty, tx, step, height, width,
+                            int(global_offset[tid]),
+                            int(local_max[tid]),
+                            tiles_on_gpu.pop(tid),  # transfer ownership; free after worker done
+                            lut_gpu,
+                        ))
+                else:
+                    futures = [
+                        pool.submit(
+                            _apply_global_lut_to_tile,
+                            labels_arr, ty, tx, step, height, width,
+                            int(global_offset[tile_id(ty, tx)]),
+                            lut_cpu, lut_gpu,
+                        )
+                        for (ty, tx) in tile_list
+                    ]
+                for fut in tqdm(futures, desc="    Phase B.5 apply", total=len(futures)):
+                    fut.result()
+            if use_tile_cache:
+                # Drop any lingering refs so cupy can reclaim VRAM immediately.
+                tiles_on_gpu.clear()
+                _cp.get_default_memory_pool().free_all_blocks()
         print(f"    Phase B.5 done in {time.monotonic() - t_phase_b5:.1f}s")
 
     # -------------------------------------------------------------------
@@ -3461,6 +3605,7 @@ def segment_position_frangi_tiled(
         )
         if use_inmem_unstitched and _pass2_fn is _run_pass2_parallel:
             _pass2_kwargs["tile_buffer"] = tile_buffer_for_pass2
+            _pass2_kwargs["tile_buffer_shm_name"] = shm_name_for_pass1
         _pass2_fn(**_pass2_kwargs)
 
         # Release the shm tile buffer now that Pass 2 has consumed it.
