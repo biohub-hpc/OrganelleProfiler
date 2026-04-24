@@ -3671,6 +3671,15 @@ def segment_position_frangi_tiled(
         # the buffer kwarg only exists there.
         if use_inmem_unstitched:
             _pass2_gpu = True
+        # The parallel Pass 2 doesn't implement Pass 3 mask erosion yet
+        # (nucleoli removes labels within N px of the nuclear-mask edge).
+        # Route nucleoli-like invocations to the legacy sequential Pass 2
+        # which has working Pass 3.
+        _needs_pass3 = bool(input_mask_name) and (3 if input_mask_name else 0) > 0
+        if _needs_pass3 and _pass2_gpu:
+            print(f"  [NOTE] input_mask_name={input_mask_name}: falling back to "
+                  f"sequential Pass 2 so Pass 3 mask erosion runs.")
+            _pass2_gpu = False
         _pass2_fn = _run_pass2_parallel if _pass2_gpu else _stitch_tiled_labels_pass2
         if _pass2_gpu:
             print(f"  Using parallel Pass 2 (ORG_SEG_PASS2_GPU=1)"
