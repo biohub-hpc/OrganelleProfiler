@@ -80,6 +80,24 @@ _DETAILED_GPU_MS: dict[str, float] = {}
 _DETAILED_TILES_SEEN: int = 0
 
 
+def _optimized_on() -> bool:
+    """Master fast-path toggle. ORG_SEG_OPTIMIZED=1 (default) enables the
+    full GPU-pipelined + in-memory + GPU-paint path. Set to 0 to fall
+    back to the legacy defaults (single spawn worker, CPU paint, zarr
+    unstitched handoff, etc.). Individual ORG_SEG_* flags still override
+    the master on a case-by-case basis when explicitly set.
+    """
+    return os.environ.get("ORG_SEG_OPTIMIZED", "1") == "1"
+
+
+def _fast_default(optimized_value: str, legacy_value: str = "0") -> str:
+    """Resolve a default for a fast-path flag based on ORG_SEG_OPTIMIZED.
+    Used as the second arg to ``os.environ.get``: explicit env vars still
+    win via the normal get() precedence; this only shapes the fallback.
+    """
+    return optimized_value if _optimized_on() else legacy_value
+
+
 def _detailed_timing_enabled() -> bool:
     return os.environ.get("ORG_SEG_DETAILED_TIMING", "0") == "1"
 
@@ -1570,7 +1588,7 @@ def _run_pass1_gpu_pipelined(
     # Otherwise keep the old behavior (orchestrator routes blob to CPU
     # joblib) by signalling unsupported here.
     _is_blob = nucleoli_method == "blob" or vesicular_method == "blob"
-    _blob_disk_gpu = os.environ.get("ORG_SEG_BLOB_DISK_GPU", "0") == "1"
+    _blob_disk_gpu = os.environ.get("ORG_SEG_BLOB_DISK_GPU", _fast_default("1")) == "1"
     if _is_blob and not _blob_disk_gpu:
         raise NotImplementedError(
             "pipelined GPU driver for LoG blob requires ORG_SEG_BLOB_DISK_GPU=1"
@@ -1579,7 +1597,7 @@ def _run_pass1_gpu_pipelined(
     n_read = int(os.environ.get("ORG_SEG_READ_WORKERS", "4"))
     n_write = int(os.environ.get("ORG_SEG_WRITE_WORKERS", "2"))
     prefetch_depth = int(os.environ.get("ORG_SEG_PREFETCH_DEPTH", "8"))
-    batch_size = max(1, int(os.environ.get("ORG_SEG_GPU_BATCH", "1")))
+    batch_size = max(1, int(os.environ.get("ORG_SEG_GPU_BATCH", _fast_default("2", "1"))))
     # Prefetch must at least cover the batch; bump automatically if needed.
     if prefetch_depth < batch_size:
         prefetch_depth = batch_size
@@ -2679,7 +2697,7 @@ def _run_pass2_parallel(
     # requires use_gpu_lut. Opt-in via ORG_SEG_PASS2_TILE_CACHE=1.
     use_tile_cache = (
         use_gpu_lut
-        and os.environ.get("ORG_SEG_PASS2_TILE_CACHE", "0") == "1"
+        and os.environ.get("ORG_SEG_PASS2_TILE_CACHE", _fast_default("1")) == "1"
     )
     # In-memory Phase A source: when a pre-populated numpy buffer of shape
     # (n_ty, n_tx, step, step) int32 is passed in, skip zarr reads entirely.
@@ -3253,7 +3271,7 @@ def segment_position_frangi_tiled(
         # per-tile function run LoG+peaks+paint on GPU inside each joblib
         # worker, just with a new CUDA context per worker).
         _is_blob_method = (nucleoli_method == "blob") or (vesicular_method == "blob")
-        _blob_disk_gpu = os.environ.get("ORG_SEG_BLOB_DISK_GPU", "0") == "1"
+        _blob_disk_gpu = os.environ.get("ORG_SEG_BLOB_DISK_GPU", _fast_default("1")) == "1"
         if _is_blob_method and use_gpu and not _blob_disk_gpu:
             print("  [NOTE] blob detection method — routing to CPU joblib path "
                   "(per-tile blob_log runs on GPU if ORG_SEG_BLOB_GPU=1)")
@@ -3275,7 +3293,7 @@ def segment_position_frangi_tiled(
                 # contexts; the GPU driver truly interleaves their kernels
                 # (CuPy streams within one process are serialized by the memory
                 # pool lock, which is why this path exists instead of streams).
-                num_workers = max(1, int(os.environ.get("ORG_SEG_GPU_WORKERS", "1")))
+                num_workers = max(1, int(os.environ.get("ORG_SEG_GPU_WORKERS", _fast_default("2", "1"))))
         else:
             effective_use_gpu = False
             num_workers = get_optimal_workers(
@@ -3328,7 +3346,7 @@ def segment_position_frangi_tiled(
         required_bytes = tile_cache_bytes + 15 * (1024 ** 3)  # +15 GB headroom
         _vram_ok = True
         _total_vram_gb = None
-        if effective_use_gpu and os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1":
+        if effective_use_gpu and os.environ.get("ORG_SEG_INMEM_UNSTITCHED", _fast_default("1")) == "1":
             try:
                 import cupy as _cp_probe
                 free_bytes, total_bytes = _cp_probe.cuda.Device().mem_info
@@ -3346,14 +3364,14 @@ def segment_position_frangi_tiled(
                 _vram_ok = False
 
         use_inmem_unstitched = (
-            os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1"
+            os.environ.get("ORG_SEG_INMEM_UNSTITCHED", _fast_default("1")) == "1"
             and effective_use_gpu
             and num_workers > 1
             and not preview_mode
             and not input_mask_name  # Pass 3 mask erosion not wired for shm path
             and _vram_ok
         )
-        if os.environ.get("ORG_SEG_INMEM_UNSTITCHED", "0") == "1" and not use_inmem_unstitched:
+        if os.environ.get("ORG_SEG_INMEM_UNSTITCHED", _fast_default("1")) == "1" and not use_inmem_unstitched:
             reason_bits = []
             if not effective_use_gpu or num_workers <= 1:
                 reason_bits.append("requires GPU multi-worker")
@@ -3867,7 +3885,7 @@ def segment_position_frangi_tiled(
         # the per-tile read-offset-write cycle, uses scipy.sparse connected
         # components + parallel LUT apply). Falls back to the original
         # sequential CPU implementation by default or when GPU is unavailable.
-        _pass2_gpu = os.environ.get("ORG_SEG_PASS2_GPU", "0") == "1" and _GPU_AVAILABLE
+        _pass2_gpu = os.environ.get("ORG_SEG_PASS2_GPU", _fast_default("1")) == "1" and _GPU_AVAILABLE
         # The in-memory unstitched path requires the parallel/GPU Pass 2 —
         # the buffer kwarg only exists there.
         if use_inmem_unstitched:

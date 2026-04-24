@@ -402,9 +402,12 @@ def _segment_blob_log(
     # scale-space LoG + 3D peak-finder (4-13x faster per tile on ops0094,
     # IoU 0.94-0.96 vs skimage reference). Enabled via ORG_SEG_BLOB_GPU=1;
     # falls back to CPU silently if cupy is unavailable.
+    # Master toggle: ORG_SEG_OPTIMIZED=1 (default) turns on the fast
+    # path. Individual ORG_SEG_BLOB_GPU override still takes precedence.
+    _blob_gpu_default = "1" if os.environ.get("ORG_SEG_OPTIMIZED", "1") == "1" else "0"
     _use_gpu_blob = (
         _GPU_BLOB_AVAILABLE
-        and os.environ.get("ORG_SEG_BLOB_GPU", "0") == "1"
+        and os.environ.get("ORG_SEG_BLOB_GPU", _blob_gpu_default) == "1"
     )
     # ORG_SEG_BLOB_DISK_GPU=1 additionally moves the disk-painting loop to
     # GPU (atomicMin RawKernel), eliminating the per-tile CPU post-processing
