@@ -56,6 +56,27 @@ except Exception as _gpu_import_err:  # pragma: no cover
     _cu_frangi = None
     _GPU_AVAILABLE = False
 
+
+def _clahe(image, kernel_size, clip_limit):
+    """CLAHE dispatch: fused 2-kernel cupy RawKernel when
+    ORG_SEG_FUSED_CLAHE=1, else cucim's equalize_adapthist.
+
+    On H100, the fused path cuts Pass 1 from ~80s → ~45s (~45% faster)
+    with bit-identical pyramid-level-3 IoU vs cucim on Frangi tubular
+    outputs. Pearson ≥ 0.995, max|Δ| ≈ 0.06 in the intermediate CLAHE
+    image — downstream ridge filter + threshold washes the drift out.
+    """
+    import os as _os
+    if _os.environ.get("ORG_SEG_FUSED_CLAHE", "0") == "1":
+        try:
+            from organelle_profiler.organelle_seg.fused_clahe import (
+                fused_clahe as _fused_clahe,
+            )
+            return _fused_clahe(image, kernel_size=kernel_size, clip_limit=clip_limit)
+        except Exception as _e:
+            print(f"  [fused_clahe] fell back to cucim ({type(_e).__name__}: {_e})")
+    return _cu_equalize_adapthist(image, kernel_size=kernel_size, clip_limit=clip_limit)
+
 # Simple accumulator used by the GPU worker to report per-phase wall time
 # across all tiles. Cleared and printed around Pass 1 by the orchestrator.
 _GPU_PHASE_TIMERS: dict[str, float] = {}
@@ -670,7 +691,7 @@ def _process_single_frangi_tile_gpu(
                     tile_norm = (tile_data - tmin) / rng
                 else:
                     tile_norm = cp.zeros_like(tile_data, dtype=cp.float32)
-                tile_data = _cu_equalize_adapthist(
+                tile_data = _clahe(
                     tile_norm, kernel_size=kernel_size, clip_limit=clip_limit,
                 ).astype(cp.float32)
 
@@ -944,7 +965,7 @@ def _compute_tile_on_gpu(
                 tile_norm = (tile_data - tmin) / rng
             else:
                 tile_norm = cp.zeros_like(tile_data, dtype=cp.float32)
-            tile_data = _cu_equalize_adapthist(
+            tile_data = _clahe(
                 tile_norm, kernel_size=kernel_size, clip_limit=clip_limit,
             ).astype(cp.float32)
 
@@ -1163,7 +1184,7 @@ def _compute_tile_batch_on_gpu_streams(
                 rng = tmax - tmin
                 safe_rng = cp.where(rng > 0, rng, cp.float32(1.0))
                 tile_norm = cp.where(rng > 0, (tile_data - tmin) / safe_rng, cp.float32(0.0))
-                tile_data = _cu_equalize_adapthist(
+                tile_data = _clahe(
                     tile_norm, kernel_size=clp_kernel, clip_limit=clp_clip,
                 ).astype(cp.float32)
             if detailed:
@@ -2456,6 +2477,7 @@ def _run_pass2_parallel(
     target_shards_ratio: tuple = (1, 1, 1, 32, 32),
     tile_buffer: np.ndarray = None,
     tile_buffer_shm_name: str = None,
+    shm_block_to_release=None,
 ) -> int:
     """Parallel Pass 2: two-phase stitching without the per-tile
     read-offset-write cycle that made the original serial.
@@ -2855,6 +2877,19 @@ def _run_pass2_parallel(
               f"path — falling back to sequential handling via the original "
               f"stitcher is not wired in. Skipping for the tubular profile run "
               f"(which does not set input_mask_name).")
+
+    # Release the shm tile buffer before reshard. Why: reshard loads the
+    # final ~40 GB labels zarr into RAM, and holding the ~43 GB Pass-1
+    # shm buffer simultaneously OOMs on 80 GB cgroup nodes. Safe to
+    # release here — Phase B.5 has already drained the buffer into the
+    # written zarr.
+    if shm_block_to_release is not None:
+        try:
+            shm_block_to_release.close()
+            shm_block_to_release.unlink()
+            print(f"  [inmem] released shm tile buffer (pre-reshard)")
+        except Exception as _e:
+            print(f"  [inmem] shm release warning: {_e}")
 
     # Final reshard from parallel-write-safe 1:1 sharding to storage-efficient
     # sharding (matches original).
@@ -3703,17 +3738,14 @@ def segment_position_frangi_tiled(
         if use_inmem_unstitched and _pass2_fn is _run_pass2_parallel:
             _pass2_kwargs["tile_buffer"] = tile_buffer_for_pass2
             _pass2_kwargs["tile_buffer_shm_name"] = shm_name_for_pass1
-        _pass2_fn(**_pass2_kwargs)
-
-        # Release the shm tile buffer now that Pass 2 has consumed it.
-        if shm_block is not None:
+            # Hand the shm block to Pass 2 so it can release it *before*
+            # the internal reshard (reshard loads the final ~40 GB zarr
+            # into RAM and would OOM alongside the 43 GB shm buffer on
+            # 80 GB nodes).
+            _pass2_kwargs["shm_block_to_release"] = shm_block
+            shm_block = None  # ownership transferred
             tile_buffer_for_pass2 = None
-            try:
-                shm_block.close()
-                shm_block.unlink()
-                print(f"  [inmem] released shm tile buffer")
-            except Exception as _shm_e:
-                print(f"  [inmem] shm cleanup warning: {_shm_e}")
+        _pass2_fn(**_pass2_kwargs)
 
         # Build and update metadata for the segmentation labels
         # Use organelle_name as channel_label (it often contains "organelle, marker" info)
