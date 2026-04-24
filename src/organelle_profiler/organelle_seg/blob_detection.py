@@ -45,6 +45,142 @@ except Exception:
     _GPU_BLOB_AVAILABLE = False
 
 
+# -----------------------------------------------------------------------------
+# GPU disk painting — one CUDA thread per blob, atomicMin gives bit-exact
+# "lowest-index-wins" = CPU first-come-first-served semantics.
+# -----------------------------------------------------------------------------
+_PAINT_DISKS_KERNEL_SRC = r"""
+extern "C" __global__ void paint_disks(
+    const float * __restrict__ blobs_yxs,   // (N, 3) float32: (y, x, sigma)
+    const unsigned char * __restrict__ mask, // (H, W) uchar, non-zero = inside mask; may be nullptr
+    int * __restrict__ labels,               // (H, W) int32, init to INT_MAX sentinel
+    const int N, const int H, const int W,
+    const int use_mask)                      // 0 = ignore mask ptr, 1 = honor mask
+{
+    const int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi >= N) return;
+
+    const float by = blobs_yxs[bi * 3 + 0];
+    const float bx = blobs_yxs[bi * 3 + 1];
+    const float bs = blobs_yxs[bi * 3 + 2];
+
+    // radius = max(2, int(sigma * sqrt(2))) — matches the CPU path exactly
+    int r = (int)(bs * 1.41421356f);
+    if (r < 2) r = 2;
+    const int r2 = r * r;
+
+    const int cy = (int)by;
+    const int cx = (int)bx;
+    const int y0 = max(0, cy - r);
+    const int y1 = min(H - 1, cy + r);
+    const int x0 = max(0, cx - r);
+    const int x1 = min(W - 1, cx + r);
+
+    const int label = bi + 1;
+
+    for (int y = y0; y <= y1; ++y) {
+        const int dy = y - cy;
+        const int dy2 = dy * dy;
+        const int row = y * W;
+        for (int x = x0; x <= x1; ++x) {
+            const int dx = x - cx;
+            // Match skimage.draw.disk exactly: strict < (excludes boundary ring).
+            if (dx * dx + dy2 >= r2) continue;
+            const int idx = row + x;
+            if (use_mask && mask[idx] == 0) continue;
+            atomicMin(&labels[idx], label);
+        }
+    }
+}
+"""
+
+_paint_disks_kernel = None  # JIT-compiled lazily
+
+
+def _get_paint_disks_kernel():
+    global _paint_disks_kernel
+    if _paint_disks_kernel is None:
+        if _cp is None:
+            raise RuntimeError("cupy not available — paint_disks unusable")
+        _paint_disks_kernel = _cp.RawKernel(
+            _PAINT_DISKS_KERNEL_SRC, "paint_disks"
+        )
+    return _paint_disks_kernel
+
+
+def _blob_log_paint_gpu(
+    tile_norm: np.ndarray,
+    min_sigma: float,
+    max_sigma: float,
+    num_sigma: int,
+    threshold: float,
+    binary_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Full GPU blob pipeline: scale-space LoG → peak find → disk painting.
+
+    Matches ``_segment_blob_log`` + ``_blob_log_gpu`` + the CPU disk-painting
+    loop, but keeps everything on device. No per-blob D2H until the final
+    labels array is copied back.
+
+    The disk-painting kernel uses ``atomicMin(labels[y,x], blob_idx+1)`` with
+    an INT_MAX sentinel, which is bit-exact equivalent to the CPU loop's
+    "first blob wins" rule (lowest index wins under race).
+
+    Returns labeled int32 numpy array of shape ``tile_norm.shape``.
+    """
+    if _cp is None:
+        raise RuntimeError("cupy not available — GPU blob path unusable")
+    cp = _cp
+    sigmas = np.linspace(min_sigma, max_sigma, num_sigma).astype(np.float32)
+    H, W = tile_norm.shape
+
+    # 1. scale-space LoG + 3D peak finding on GPU
+    tile_gpu = cp.asarray(tile_norm, dtype=cp.float32)
+    log_slices = []
+    for s in sigmas:
+        log_slices.append(-(float(s) ** 2) * _cu_gaussian_laplace(tile_gpu, sigma=float(s)))
+    log_stack = cp.stack(log_slices, axis=0)
+    max_filt = _cu_maximum_filter(log_stack, size=3)
+    peaks_mask = (log_stack == max_filt) & (log_stack > float(threshold))
+    coords_gpu = cp.argwhere(peaks_mask)  # (N, 3) int: (sigma_idx, y, x)
+    del log_slices, log_stack, max_filt, peaks_mask
+
+    N = int(coords_gpu.shape[0])
+    if N == 0:
+        return np.zeros((H, W), dtype=np.int32)
+
+    # 2. pack peaks into (N, 3) float32 (y, x, sigma)
+    sigmas_gpu = cp.asarray(sigmas)
+    blobs_gpu = cp.empty((N, 3), dtype=cp.float32)
+    blobs_gpu[:, 0] = coords_gpu[:, 1].astype(cp.float32)
+    blobs_gpu[:, 1] = coords_gpu[:, 2].astype(cp.float32)
+    blobs_gpu[:, 2] = sigmas_gpu[coords_gpu[:, 0]]
+
+    # 3. paint disks on GPU with atomicMin
+    INT32_MAX = np.iinfo(np.int32).max
+    labels_gpu = cp.full((H, W), INT32_MAX, dtype=cp.int32)
+
+    use_mask_flag = 1 if binary_mask is not None else 0
+    if binary_mask is not None:
+        mask_gpu = cp.asarray(binary_mask.astype(np.uint8, copy=False))
+    else:
+        # pass a 1-byte dummy; kernel won't read when use_mask_flag=0
+        mask_gpu = cp.zeros(1, dtype=cp.uint8)
+
+    kernel = _get_paint_disks_kernel()
+    threads = 256
+    blocks = (N + threads - 1) // threads
+    kernel(
+        (blocks,), (threads,),
+        (blobs_gpu, mask_gpu, labels_gpu, np.int32(N), np.int32(H), np.int32(W),
+         np.int32(use_mask_flag)),
+    )
+
+    # 4. sentinel → 0 and D2H
+    labels_gpu = cp.where(labels_gpu == INT32_MAX, cp.int32(0), labels_gpu)
+    return cp.asnumpy(labels_gpu)
+
+
 def _blob_log_gpu(
     tile_norm: np.ndarray,
     min_sigma: float,
@@ -256,6 +392,29 @@ def _segment_blob_log(
         _GPU_BLOB_AVAILABLE
         and os.environ.get("ORG_SEG_BLOB_GPU", "0") == "1"
     )
+    # ORG_SEG_BLOB_DISK_GPU=1 additionally moves the disk-painting loop to
+    # GPU (atomicMin RawKernel), eliminating the per-tile CPU post-processing
+    # that currently dominates blob wall time. Requires BLOB_GPU=1; falls
+    # back to the CPU-painting path on any exception.
+    _use_gpu_disk = (
+        _use_gpu_blob
+        and os.environ.get("ORG_SEG_BLOB_DISK_GPU", "0") == "1"
+    )
+    if _use_gpu_disk:
+        try:
+            return _blob_log_paint_gpu(
+                tile_norm,
+                min_sigma=min_sigma,
+                max_sigma=max_sigma,
+                num_sigma=blob_params.get("num_sigma", 10),
+                threshold=blob_params.get("threshold", 0.02),
+                binary_mask=binary_mask,
+            )
+        except Exception as _e:
+            print(f"  [blob_paint_gpu] failed ({type(_e).__name__}: {_e}); "
+                  f"falling back to CPU disk painting")
+            # fall through into the CPU-paint path below
+
     if _use_gpu_blob:
         try:
             blobs = _blob_log_gpu(
