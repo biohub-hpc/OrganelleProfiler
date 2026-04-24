@@ -108,34 +108,28 @@ def _get_paint_disks_kernel():
     return _paint_disks_kernel
 
 
-def _blob_log_paint_gpu(
-    tile_norm: np.ndarray,
+def _blob_log_paint_gpu_core(
+    tile_gpu,               # cupy 2D float32 in [0, 1]
     min_sigma: float,
     max_sigma: float,
     num_sigma: int,
     threshold: float,
-    binary_mask: np.ndarray | None = None,
-) -> np.ndarray:
-    """Full GPU blob pipeline: scale-space LoG → peak find → disk painting.
+    mask_gpu_uint8=None,    # cupy 2D uint8 or None
+):
+    """On-device core: scale-space LoG → 3D peak find → paint_disks.
 
-    Matches ``_segment_blob_log`` + ``_blob_log_gpu`` + the CPU disk-painting
-    loop, but keeps everything on device. No per-blob D2H until the final
-    labels array is copied back.
-
-    The disk-painting kernel uses ``atomicMin(labels[y,x], blob_idx+1)`` with
-    an INT_MAX sentinel, which is bit-exact equivalent to the CPU loop's
-    "first blob wins" rule (lowest index wins under race).
-
-    Returns labeled int32 numpy array of shape ``tile_norm.shape``.
+    Accepts cupy arrays and returns a cupy int32 label array of shape
+    ``tile_gpu.shape``. Used by both the numpy-in/numpy-out wrapper
+    (``_blob_log_paint_gpu``) and the pipelined-driver tile compute path
+    (``_compute_tile_blob_on_gpu``) — the latter wants to avoid the extra
+    H2D/D2H hops.
     """
     if _cp is None:
         raise RuntimeError("cupy not available — GPU blob path unusable")
     cp = _cp
     sigmas = np.linspace(min_sigma, max_sigma, num_sigma).astype(np.float32)
-    H, W = tile_norm.shape
+    H, W = int(tile_gpu.shape[0]), int(tile_gpu.shape[1])
 
-    # 1. scale-space LoG + 3D peak finding on GPU
-    tile_gpu = cp.asarray(tile_norm, dtype=cp.float32)
     log_slices = []
     for s in sigmas:
         log_slices.append(-(float(s) ** 2) * _cu_gaussian_laplace(tile_gpu, sigma=float(s)))
@@ -147,37 +141,57 @@ def _blob_log_paint_gpu(
 
     N = int(coords_gpu.shape[0])
     if N == 0:
-        return np.zeros((H, W), dtype=np.int32)
+        return cp.zeros((H, W), dtype=cp.int32)
 
-    # 2. pack peaks into (N, 3) float32 (y, x, sigma)
     sigmas_gpu = cp.asarray(sigmas)
     blobs_gpu = cp.empty((N, 3), dtype=cp.float32)
     blobs_gpu[:, 0] = coords_gpu[:, 1].astype(cp.float32)
     blobs_gpu[:, 1] = coords_gpu[:, 2].astype(cp.float32)
     blobs_gpu[:, 2] = sigmas_gpu[coords_gpu[:, 0]]
 
-    # 3. paint disks on GPU with atomicMin
     INT32_MAX = np.iinfo(np.int32).max
     labels_gpu = cp.full((H, W), INT32_MAX, dtype=cp.int32)
 
-    use_mask_flag = 1 if binary_mask is not None else 0
-    if binary_mask is not None:
-        mask_gpu = cp.asarray(binary_mask.astype(np.uint8, copy=False))
-    else:
-        # pass a 1-byte dummy; kernel won't read when use_mask_flag=0
-        mask_gpu = cp.zeros(1, dtype=cp.uint8)
+    use_mask_flag = 1 if mask_gpu_uint8 is not None else 0
+    if mask_gpu_uint8 is None:
+        mask_gpu_uint8 = cp.zeros(1, dtype=cp.uint8)  # dummy; unread when flag=0
 
     kernel = _get_paint_disks_kernel()
     threads = 256
     blocks = (N + threads - 1) // threads
     kernel(
         (blocks,), (threads,),
-        (blobs_gpu, mask_gpu, labels_gpu, np.int32(N), np.int32(H), np.int32(W),
+        (blobs_gpu, mask_gpu_uint8, labels_gpu, np.int32(N), np.int32(H), np.int32(W),
          np.int32(use_mask_flag)),
     )
 
-    # 4. sentinel → 0 and D2H
-    labels_gpu = cp.where(labels_gpu == INT32_MAX, cp.int32(0), labels_gpu)
+    return cp.where(labels_gpu == INT32_MAX, cp.int32(0), labels_gpu)
+
+
+def _blob_log_paint_gpu(
+    tile_norm: np.ndarray,
+    min_sigma: float,
+    max_sigma: float,
+    num_sigma: int,
+    threshold: float,
+    binary_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Full GPU blob pipeline (numpy-in / numpy-out).
+
+    Thin wrapper around ``_blob_log_paint_gpu_core`` — kept for the
+    ``_segment_blob_log`` CPU-dispatched call site, which feeds a numpy
+    tile in and expects a numpy label array back.
+    """
+    if _cp is None:
+        raise RuntimeError("cupy not available — GPU blob path unusable")
+    cp = _cp
+    tile_gpu = cp.asarray(tile_norm, dtype=cp.float32)
+    mask_gpu_uint8 = None
+    if binary_mask is not None:
+        mask_gpu_uint8 = cp.asarray(binary_mask.astype(np.uint8, copy=False))
+    labels_gpu = _blob_log_paint_gpu_core(
+        tile_gpu, min_sigma, max_sigma, num_sigma, threshold, mask_gpu_uint8,
+    )
     return cp.asnumpy(labels_gpu)
 
 

@@ -1062,6 +1062,159 @@ def _compute_tile_on_gpu(
     return core_labels, core_vesselness, debug_labels, debug_vesselness
 
 
+def _compute_tile_blob_on_gpu(
+    tile_data_np: np.ndarray,
+    input_mask_np: np.ndarray | None,
+    tile_info: dict,
+    blob_params: dict,
+    pixel_resolution: dict,
+    use_clahe: bool,
+    clahe_params: dict | None,
+    post_clahe_smoothing_sigma: float,
+    tile_overlap: int,
+    invert: bool,
+) -> tuple[np.ndarray, None, np.ndarray | None, None]:
+    """GPU compute for a single blob tile (pipelined-driver entry point).
+
+    Mirrors ``_compute_tile_on_gpu`` but replaces the Frangi path with
+    scale-space LoG → peak-find → GPU disk painting
+    (``_blob_log_paint_gpu_core``). Returns
+    ``(core_labels_np, None, debug_labels_np_or_None, None)`` — no
+    vesselness output for blob methods.
+
+    The percentile-normalization step matches ``_segment_blob_log`` on
+    CPU: clip to [p1, p99] inside the mask, then scale to [0, 1]. This
+    preserves bit-identical binary-footprint output against the CPU-paint
+    path when the disk kernel is exercised via ``_segment_blob_log``.
+    """
+    if not _GPU_AVAILABLE:
+        raise RuntimeError("GPU compute called but cupy/cucim not importable")
+    cp = _cp
+    cp_ndi = _cp_ndi
+
+    from organelle_profiler.organelle_seg.blob_detection import (
+        _blob_log_paint_gpu_core,
+    )
+
+    ty, tx = tile_info["ty"], tile_info["tx"]
+
+    # 1) H2D + optional mask application
+    tile_data = cp.asarray(tile_data_np, dtype=cp.float32)
+    mask_gpu_bool = None
+    if input_mask_np is not None:
+        if input_mask_np.shape != tile_data.shape:
+            mh, mw = input_mask_np.shape
+            th, tw = tile_data.shape
+            new_mask = np.zeros(tile_data.shape, dtype=input_mask_np.dtype)
+            new_mask[: min(mh, th), : min(mw, tw)] = input_mask_np[: min(mh, th), : min(mw, tw)]
+            input_mask_np = new_mask
+        mask_gpu_bool = cp.asarray(input_mask_np) > 0
+        tile_data = cp.where(mask_gpu_bool, tile_data, cp.float32(0.0))
+
+    # 2) CLAHE
+    if use_clahe:
+        if clahe_params is None:
+            clahe_params = {"clip_limit": 0.03}
+        clip_limit = clahe_params.get("clip_limit", 0.03)
+        kernel_size = clahe_params.get("kernel_size", None)
+        tmin = cp.min(tile_data); tmax = cp.max(tile_data); rng = tmax - tmin
+        if float(rng) > 0:
+            tile_norm = (tile_data - tmin) / rng
+        else:
+            tile_norm = cp.zeros_like(tile_data, dtype=cp.float32)
+        tile_data = _cu_equalize_adapthist(
+            tile_norm, kernel_size=kernel_size, clip_limit=clip_limit,
+        ).astype(cp.float32)
+
+    # 3) Post-CLAHE smoothing
+    if post_clahe_smoothing_sigma and post_clahe_smoothing_sigma > 0:
+        tile_data = cp_ndi.gaussian_filter(tile_data, sigma=post_clahe_smoothing_sigma)
+
+    # 4) Percentile-based [p1,p99] normalization (matches CPU _segment_blob_log)
+    if mask_gpu_bool is not None:
+        vals = tile_data[mask_gpu_bool]
+    else:
+        vals = tile_data.ravel()
+    H, W = int(tile_data.shape[0]), int(tile_data.shape[1])
+    empty_labels = False
+    if vals.size == 0:
+        empty_labels = True
+    else:
+        vmin_s = cp.min(vals); vmax_s = cp.max(vals)
+        if float(vmax_s) <= float(vmin_s):
+            empty_labels = True
+        else:
+            p = cp.percentile(vals, cp.asarray([1.0, 99.0]))
+            vmin, vmax = p[0], p[1]
+            tile_data = cp.clip(
+                (tile_data - vmin) / (vmax - vmin + cp.float32(1e-8)),
+                cp.float32(0.0), cp.float32(1.0),
+            )
+
+    if empty_labels:
+        labeled_mask = cp.zeros((H, W), dtype=cp.int32)
+    else:
+        # 5) Invert for dark blobs (vesicular_dark)
+        if invert:
+            tile_data = cp.float32(1.0) - tile_data
+
+        # 6) Sigma range from blob_params. Use the same pixel-size lookup
+        # as the CPU blob dispatcher (_process_single_frangi_tile:304) —
+        # lowercase keys with a 0.108 default. The orchestrator populates
+        # `pixel_resolution` with uppercase "X"/"Y" today, so this falls
+        # through to 0.108 on both CPU and GPU paths, preserving
+        # blob-detection parity. Fixing the lookup convention globally is
+        # a separate, semantics-changing PR.
+        pixel_size_um = pixel_resolution.get("y", pixel_resolution.get("x", 0.108))
+        min_sigma = blob_params["min_radius_um"] / pixel_size_um / np.sqrt(2)
+        max_sigma = blob_params["max_radius_um"] / pixel_size_um / np.sqrt(2)
+        min_sigma = max(1.0, min_sigma)
+        max_sigma = max(min_sigma + 1, max_sigma)
+        num_sigma = blob_params.get("num_sigma", 10)
+        threshold = blob_params.get("threshold", 0.02)
+
+        # 7) LoG + peaks + GPU disk painting — all on device
+        mask_uint8 = None
+        if mask_gpu_bool is not None:
+            mask_uint8 = mask_gpu_bool.astype(cp.uint8)
+        labeled_mask = _blob_log_paint_gpu_core(
+            tile_data, min_sigma, max_sigma, num_sigma, float(threshold),
+            mask_gpu_uint8=mask_uint8,
+        )
+
+    # 8) Extract core region coordinates + D2H transfer
+    y_start = tile_info["y_start_tile"]; x_start = tile_info["x_start_tile"]
+    y_end = tile_info["y_end_tile"]; x_end = tile_info["x_end_tile"]
+    actual_height = y_end - y_start; actual_width = x_end - x_start
+    tile_size_full = tile_info["tile_size"]
+    step = tile_size_full - tile_overlap
+    core_y_start_global = ty * step
+    core_y_end_global = min((ty + 1) * step, actual_height + y_start)
+    core_x_start_global = tx * step
+    core_x_end_global = min((tx + 1) * step, actual_width + x_start)
+    core_y_start_local = max(0, core_y_start_global - y_start)
+    core_y_end_local = min(actual_height, core_y_end_global - y_start)
+    core_x_start_local = max(0, core_x_start_global - x_start)
+    core_x_end_local = min(actual_width, core_x_end_global - x_start)
+
+    is_center = tile_info.get("is_center", False)
+    core_labels = cp.asnumpy(
+        labeled_mask[core_y_start_local:core_y_end_local,
+                     core_x_start_local:core_x_end_local]
+    )
+    debug_labels = cp.asnumpy(labeled_mask).astype(np.int32) if is_center else None
+
+    del tile_data, labeled_mask
+    cp.get_default_memory_pool().free_all_blocks()
+
+    tile_info["_core_y_start_global"] = core_y_start_global
+    tile_info["_core_y_end_global"] = core_y_end_global
+    tile_info["_core_x_start_global"] = core_x_start_global
+    tile_info["_core_x_end_global"] = core_x_end_global
+
+    return core_labels, None, debug_labels, None
+
+
 def _compute_tile_batch_on_gpu_streams(
     bundles: list,
     frangi_params: dict,
@@ -1411,10 +1564,16 @@ def _run_pass1_gpu_pipelined(
     from concurrent.futures import ThreadPoolExecutor
     from collections import deque
 
-    # Fall back to serial CPU path if the LoG-blob path is active — no cucim blob_log.
-    if nucleoli_method == "blob" or vesicular_method == "blob":
+    # LoG-blob path: only supported in the pipelined driver when the
+    # GPU disk-painting kernel is enabled (ORG_SEG_BLOB_DISK_GPU=1). In
+    # that case we dispatch to _compute_tile_blob_on_gpu per tile below.
+    # Otherwise keep the old behavior (orchestrator routes blob to CPU
+    # joblib) by signalling unsupported here.
+    _is_blob = nucleoli_method == "blob" or vesicular_method == "blob"
+    _blob_disk_gpu = os.environ.get("ORG_SEG_BLOB_DISK_GPU", "0") == "1"
+    if _is_blob and not _blob_disk_gpu:
         raise NotImplementedError(
-            "pipelined GPU driver does not support LoG blob; use the CPU path"
+            "pipelined GPU driver for LoG blob requires ORG_SEG_BLOB_DISK_GPU=1"
         )
 
     n_read = int(os.environ.get("ORG_SEG_READ_WORKERS", "4"))
@@ -1529,7 +1688,28 @@ def _run_pass1_gpu_pipelined(
             use_single_tile_with_timers = (
                 os.environ.get("ORG_SEG_PHASE_TIMERS", "0") == "1" and batch_size == 1
             )
-            if use_single_tile_with_timers:
+            if _is_blob:
+                # Blob path: one tile at a time through the GPU disk-paint
+                # kernel. No batch streams yet — per-tile work varies with
+                # blob count, so the uniform-work assumption behind
+                # _compute_tile_batch_on_gpu_streams doesn't apply.
+                invert_blob = bool(frangi_params.get("black_ridges", False))
+                batch_results = []
+                for ti, td_np, mk_np in bundles:
+                    core_labels, _v, debug_labels, _dv = _compute_tile_blob_on_gpu(
+                        tile_data_np=td_np,
+                        input_mask_np=mk_np,
+                        tile_info=ti,
+                        blob_params=frangi_params,
+                        pixel_resolution=pixel_resolution,
+                        use_clahe=use_clahe,
+                        clahe_params=clahe_params,
+                        post_clahe_smoothing_sigma=post_clahe_smoothing_sigma,
+                        tile_overlap=tile_overlap,
+                        invert=invert_blob,
+                    )
+                    batch_results.append((ti, core_labels, None, debug_labels, None))
+            elif use_single_tile_with_timers:
                 ti, td_np, mk_np = bundles[0]
                 core_labels, core_vesselness, debug_labels, debug_vesselness = _compute_tile_on_gpu(
                     tile_data_np=td_np,
@@ -3065,16 +3245,22 @@ def segment_position_frangi_tiled(
         # - Eigenvalues/vectors: ~256 MB
         # - scipy intermediate arrays: ~500 MB
         # - Total peak per worker: ~2-3 GB
-        # LoG blob detection is not supported by the GPU-pipelined Pass 1
-        # driver (which is Frangi-only). Route blob methods to the CPU
-        # joblib path where `_process_single_frangi_tile` calls
-        # `_segment_blob_log` per tile. When ORG_SEG_BLOB_GPU=1, that
-        # per-tile function internally does the LoG on GPU via cupy.
+        # LoG blob detection: the pipelined GPU driver now has a blob tile
+        # compute path (_compute_tile_blob_on_gpu) gated on
+        # ORG_SEG_BLOB_DISK_GPU=1. When that flag is off, fall back to the
+        # legacy CPU joblib route so `_process_single_frangi_tile` calls
+        # `_segment_blob_log` per tile (ORG_SEG_BLOB_GPU=1 still makes the
+        # per-tile function run LoG+peaks+paint on GPU inside each joblib
+        # worker, just with a new CUDA context per worker).
         _is_blob_method = (nucleoli_method == "blob") or (vesicular_method == "blob")
-        if _is_blob_method and use_gpu:
+        _blob_disk_gpu = os.environ.get("ORG_SEG_BLOB_DISK_GPU", "0") == "1"
+        if _is_blob_method and use_gpu and not _blob_disk_gpu:
             print("  [NOTE] blob detection method — routing to CPU joblib path "
                   "(per-tile blob_log runs on GPU if ORG_SEG_BLOB_GPU=1)")
             use_gpu = False
+        elif _is_blob_method and use_gpu and _blob_disk_gpu:
+            print("  [blob_disk_gpu] routing blob to GPU-pipelined driver "
+                  "(ORG_SEG_BLOB_DISK_GPU=1)")
 
         if use_gpu:
             if not _GPU_AVAILABLE:
