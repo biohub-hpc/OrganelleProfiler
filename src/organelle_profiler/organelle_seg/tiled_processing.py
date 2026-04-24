@@ -57,26 +57,6 @@ except Exception as _gpu_import_err:  # pragma: no cover
     _GPU_AVAILABLE = False
 
 
-def _clahe(image, kernel_size, clip_limit):
-    """CLAHE dispatch: fused 2-kernel cupy RawKernel when
-    ORG_SEG_FUSED_CLAHE=1, else cucim's equalize_adapthist.
-
-    On H100, the fused path cuts Pass 1 from ~80s → ~45s (~45% faster)
-    with bit-identical pyramid-level-3 IoU vs cucim on Frangi tubular
-    outputs. Pearson ≥ 0.995, max|Δ| ≈ 0.06 in the intermediate CLAHE
-    image — downstream ridge filter + threshold washes the drift out.
-    """
-    import os as _os
-    if _os.environ.get("ORG_SEG_FUSED_CLAHE", "0") == "1":
-        try:
-            from organelle_profiler.organelle_seg.fused_clahe import (
-                fused_clahe as _fused_clahe,
-            )
-            return _fused_clahe(image, kernel_size=kernel_size, clip_limit=clip_limit)
-        except Exception as _e:
-            print(f"  [fused_clahe] fell back to cucim ({type(_e).__name__}: {_e})")
-    return _cu_equalize_adapthist(image, kernel_size=kernel_size, clip_limit=clip_limit)
-
 # Simple accumulator used by the GPU worker to report per-phase wall time
 # across all tiles. Cleared and printed around Pass 1 by the orchestrator.
 _GPU_PHASE_TIMERS: dict[str, float] = {}
@@ -691,7 +671,7 @@ def _process_single_frangi_tile_gpu(
                     tile_norm = (tile_data - tmin) / rng
                 else:
                     tile_norm = cp.zeros_like(tile_data, dtype=cp.float32)
-                tile_data = _clahe(
+                tile_data = _cu_equalize_adapthist(
                     tile_norm, kernel_size=kernel_size, clip_limit=clip_limit,
                 ).astype(cp.float32)
 
@@ -965,7 +945,7 @@ def _compute_tile_on_gpu(
                 tile_norm = (tile_data - tmin) / rng
             else:
                 tile_norm = cp.zeros_like(tile_data, dtype=cp.float32)
-            tile_data = _clahe(
+            tile_data = _cu_equalize_adapthist(
                 tile_norm, kernel_size=kernel_size, clip_limit=clip_limit,
             ).astype(cp.float32)
 
@@ -1184,7 +1164,7 @@ def _compute_tile_batch_on_gpu_streams(
                 rng = tmax - tmin
                 safe_rng = cp.where(rng > 0, rng, cp.float32(1.0))
                 tile_norm = cp.where(rng > 0, (tile_data - tmin) / safe_rng, cp.float32(0.0))
-                tile_data = _clahe(
+                tile_data = _cu_equalize_adapthist(
                     tile_norm, kernel_size=clp_kernel, clip_limit=clp_clip,
                 ).astype(cp.float32)
             if detailed:
