@@ -19,6 +19,7 @@ Key functions:
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -2265,48 +2266,51 @@ def _stitch_tiled_labels_pass2(
                 print(f"    Mask pixels: {mask_pixels_before:,} -> {mask_pixels_after:,} after erosion ({100*mask_pixels_after/max(1,mask_pixels_before):.1f}% retained)")
                 print(f"    Mask eroded, applying to labels...")
 
-                # Process tile by tile to avoid loading full labels into memory
+                # Process tile by tile to avoid loading full labels into memory.
+                # Each tile's read + mask + write is independent, so fan out
+                # across a thread pool. Zarr 1:1 chunk↔shard (Pass 1) means
+                # each tile writes to its own file — safe under threading.
+                def _process_tile(ty_tx):
+                    ty, tx = ty_tx
+                    y_start = ty * step
+                    x_start = tx * step
+                    y_end = min((ty + 1) * step, height)
+                    x_end = min((tx + 1) * step, width)
+
+                    tile_labels = np.asarray(
+                        labels_arr[0, 0, 0, y_start:y_end, x_start:x_end]
+                    ).copy()
+                    if tile_labels.max() == 0:
+                        return 0, 0
+
+                    before = int((tile_labels > 0).sum())
+                    eroded_mask_tile = eroded_full_mask[y_start:y_end, x_start:x_end]
+
+                    if eroded_mask_tile.shape != tile_labels.shape:
+                        print(f"    Warning: Dimension mismatch at tile ({ty}, {tx}): "
+                              f"mask {eroded_mask_tile.shape} vs labels {tile_labels.shape}, "
+                              f"skipping")
+                        return before, before
+
+                    tile_labels[~eroded_mask_tile] = 0
+                    after = int((tile_labels > 0).sum())
+                    labels_arr[0, 0, 0, y_start:y_end, x_start:x_end] = tile_labels
+                    return before, after
+
+                pass3_workers = int(os.environ.get("ORG_SEG_PASS3_WORKERS", "16"))
+                all_tile_coords = [
+                    (ty, tx) for ty in range(n_tiles_y) for tx in range(n_tiles_x)
+                ]
                 labels_before_total = 0
                 labels_after_total = 0
-                for ty in tqdm(range(n_tiles_y), desc="  Removing boundary labels"):
-                    for tx in range(n_tiles_x):
-                        # Use CORE region coordinates (matching Pass 1 and Pass 2)
-                        y_start = ty * step
-                        x_start = tx * step
-                        y_end = min((ty + 1) * step, height)
-                        x_end = min((tx + 1) * step, width)
-
-                        tile_labels = np.asarray(labels_arr[0, 0, 0, y_start:y_end, x_start:x_end]).copy()
-                        if tile_labels.max() == 0:
-                            continue
-
-                        labels_before_total += (tile_labels > 0).sum()
-
-                        # Get the corresponding eroded mask tile
-                        # IMPORTANT: Account for crop_bbox offset when slicing the mask
-                        if crop_bbox:
-                            crop_y_start_bbox, crop_y_end_bbox, crop_x_start_bbox, crop_x_end_bbox = crop_bbox
-                            mask_y_start = y_start
-                            mask_y_end = y_end
-                            mask_x_start = x_start
-                            mask_x_end = x_end
-                            eroded_mask_tile = eroded_full_mask[mask_y_start:mask_y_end, mask_x_start:mask_x_end]
-                        else:
-                            eroded_mask_tile = eroded_full_mask[y_start:y_end, x_start:x_end]
-
-                        # Verify dimensions match before applying boolean index
-                        if eroded_mask_tile.shape != tile_labels.shape:
-                            print(f"    Warning: Dimension mismatch at tile ({ty}, {tx}): "
-                                  f"mask {eroded_mask_tile.shape} vs labels {tile_labels.shape}, skipping")
-                            continue
-
-                        # Remove labels outside the eroded mask (i.e., near the boundary)
-                        tile_labels[~eroded_mask_tile] = 0
-
-                        labels_after_total += (tile_labels > 0).sum()
-
-                        # Write back
-                        labels_arr[0, 0, 0, y_start:y_end, x_start:x_end] = tile_labels
+                with ThreadPoolExecutor(max_workers=pass3_workers) as pool:
+                    for before, after in tqdm(
+                        pool.map(_process_tile, all_tile_coords),
+                        total=len(all_tile_coords),
+                        desc=f"  Removing boundary labels ({pass3_workers}w)",
+                    ):
+                        labels_before_total += before
+                        labels_after_total += after
 
                 print(f"  Pass 3 complete: Label pixels {labels_before_total:,} -> {labels_after_total:,} ({100*labels_after_total/max(1,labels_before_total):.1f}% retained)")
 
